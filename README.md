@@ -1,4 +1,4 @@
-## Testes de performance com o TPOT
+# Testes de performance com o TPOT
 
 
 O *TPOT* é uma biblioteca de AUTOML baseada principalmente no scikit-learn. Ele é treinado utilizando um algoritmo de programação genética, o que garante que diversos modelos com diversos parâmetros diferentes sejam treinados por diversas gerações até encontrar o modelo ótimo, isso é, aquele que seja menos complexo e possua a maior métrica de avaliação. Sua proposta é para que ele seja uma espécie de *assistente do cientista de dados*, automatizando processos repetitivos para que a performance analítica do profissional seja melhor aproveitada.
