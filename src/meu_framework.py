@@ -1,4 +1,4 @@
-# 0.0.1v Trailblazer
+# 0.0.2v Trailblazer
 # %pip install "autogluon>=1.0.0" "scikit-learn>=1.3.0" "pandas>=2.0.0" "scipy>=1.9.0" "matplotlib>=3.7.0" "seaborn>=0.12.0" "joblib>=1.3.0"
 
 
@@ -190,6 +190,19 @@ class AutoClassificationEngine:
         """
         to_drop = []
         target_series = df[self.target]
+
+        # -------------------------------------------------------------------
+        # [A CORREÇÃO DO NUMPY] 0. Filtro Rápido de Variáveis Constantes
+        # Se a coluna só tem 1 valor único (ex: tudo zero), a variância é zero.
+        # Cortamos aqui para não dar divisão por zero na correlação do Pandas!
+        # -------------------------------------------------------------------
+        const_cols = [c for c in df.columns if df[c].nunique(dropna=False) <= 1]
+        if const_cols:
+            self.eliminated_features.setdefault("constantes_pos_rare", []).extend(
+                const_cols
+            )
+            to_drop.extend(const_cols)
+            df = df.drop(columns=const_cols)
 
         # A. Leakage numérico — Pearson > 98%
         num_cols = df.select_dtypes(include=[np.number]).columns
@@ -638,24 +651,27 @@ class AutoClassificationEngine:
             "ag_args_ensemble", {"fold_fitting_strategy": "sequential_local"}
         )
 
+        # Monta os argumentos dinamicamente para não "engolir" o que você mandar
+        fit_kwargs = {
+            "time_limit": time_limit,
+            "presets": chosen_preset,
+            "num_cpus": self.params.get("num_cpus", 6),
+            "ag_args_ensemble": ag_args_ensemble,
+            "hyperparameters": hyperparams,
+        }
+
+        # Resgata os parâmetros que o framework estava ignorando!
+        if "dynamic_stacking" in self.params:
+            fit_kwargs["dynamic_stacking"] = self.params["dynamic_stacking"]
+        if "num_bag_folds" in self.params:
+            fit_kwargs["num_bag_folds"] = self.params["num_bag_folds"]
+        if "num_bag_sets" in self.params:
+            fit_kwargs["num_bag_sets"] = self.params["num_bag_sets"]
+
+        # Treina o modelo passando tudo
         self.predictor = TabularPredictor(
             label=self.target, eval_metric=chosen_metric
-        ).fit(
-            train_final,
-            time_limit=time_limit,
-            presets=chosen_preset,
-            num_cpus=self.params.get("num_cpus", 6),
-            ag_args_ensemble=ag_args_ensemble,
-            hyperparameters=hyperparams,
-        )
-
-        try:
-            self.feature_importance = self.predictor.feature_importance(train_final)
-        except Exception:
-            print("⚠️ Feature importance indisponível.")
-
-        print("\n✅ Modelo Treinado com Sucesso.")
-        return self.predictor.leaderboard(train_final, silent=True)
+        ).fit(train_final, **fit_kwargs)
 
     # -----------------------------------------------------------------------
     # 5b. CROSS-VALIDATION EXTERNO
