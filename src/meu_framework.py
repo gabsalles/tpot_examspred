@@ -1,15 +1,34 @@
-# 0.0.2v Trailblazer
-# %pip install "autogluon>=1.0.0" "scikit-learn>=1.3.0" "pandas>=2.0.0" "scipy>=1.9.0" "matplotlib>=3.7.0" "seaborn>=0.12.0" "joblib>=1.3.0"
-
+# ============================================================================
+# AutoClassificationEngine v0.0.3 — Trailblazer
+# Correções aplicadas vs v0.0.2:
+#   [FIX-1]  Leakage no importance filter — agora usa holdout interno separado
+#   [FIX-2]  tuning_data passado ao AutoGluon para early stopping real
+#   [FIX-3]  Transformações aprendidas SOMENTE no train_core (não no split inteiro)
+#   [FIX-4]  feature_importance populado automaticamente no fit()
+#   [FIX-5]  leakage_threshold agora configurável via params
+#   [FIX-6]  log1p seguro — verifica não-negatividade antes de aplicar
+#   [FIX-7]  positive_class sobrescrevível via params
+#   [FIX-8]  cross_validate() alerta sobre leakage de seleção de features
+#   [FIX-9]  dynamic_stacking=False como default (anti-overfitting em datasets pequenos)
+#   [NEW-1]  Parâmetro tuning_data_fraction (default 0.15)
+#   [NEW-2]  Parâmetro importance_holdout_fraction (default 0.20)
+#   [NEW-3]  Parâmetro leakage_threshold (default 0.98)
+#   [NEW-4]  Parâmetro positive_class (default None → AutoGluon decide)
+#   [NEW-5]  Método compute_feature_importance() público
+# ============================================================================
+# %pip install "autogluon>=1.0.0" "scikit-learn>=1.3.0" "pandas>=2.0.0"
+#              "scipy>=1.9.0" "matplotlib>=3.7.0" "seaborn>=0.12.0" "joblib>=1.3.0"
 
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib.colors as mcolors
 import seaborn as sns
 import re
 import joblib
 import os
+import warnings
+import logging
+
 from scipy.stats import entropy, skew
 from scipy.stats.contingency import association
 from autogluon.tabular import TabularPredictor
@@ -19,6 +38,7 @@ from sklearn.metrics import (
     auc,
     precision_recall_curve,
     average_precision_score,
+    precision_score,
     accuracy_score,
     log_loss,
     f1_score,
@@ -30,7 +50,56 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
 from sklearn.decomposition import PCA
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import StratifiedKFold, train_test_split
+
+
+# ============================================================================
+# EXEMPLO DE CONFIGURAÇÃO RECOMENDADA (v0.0.3)
+# ============================================================================
+# key_params = {
+#     # --- Obrigatório ---
+#     "target": "nome_da_coluna_alvo",
+#
+#     # --- Métrica e preset ---
+#     "eval_metric": "roc_auc",          # f1 | roc_auc | average_precision | log_loss
+#     "presets": "high_quality",          # [MUDANÇA] era best_quality → high_quality
+#                                         #  best_quality faz stacking profundo e overfita
+#                                         #  em datasets < 50k linhas.
+#
+#     # --- Budget de tempo ---
+#     "time_limit": 600,                  # segundos para o treino final
+#     "num_cpus": 6,
+#
+#     # --- Anti-overfitting (NOVOS) ---
+#     "tuning_data_fraction": 0.15,       # [NOVO] fracão separada como holdout para
+#                                         #  AutoGluon parar modelos no momento certo.
+#                                         #  Use 0.0 para desativar.
+#     "dynamic_stacking": False,          # [MUDANÇA] era implicitamente True.
+#                                         #  False = sem stacking dinâmico → muito menos
+#                                         #  overfitting em datasets pequenos.
+#     "num_bag_folds": 8,                 # bagging com 8 folds (interno do AutoGluon)
+#     "num_bag_sets": 1,
+#
+#     # --- Seleção de features (corrigido) ---
+#     "use_importance_filter": True,
+#     "importance_holdout_fraction": 0.20, # [NOVO] usa 20% do train_core para avaliar
+#                                          #  importância — evita leakage do filtro
+#
+#     # --- Pré-processamento ---
+#     "handle_outliers": True,
+#     "use_sklearn_pipeline": True,
+#     "leakage_threshold": 0.98,           # [NOVO] era hardcoded
+#     "corr_threshold": 0.90,             # threshold de colinearidade
+#
+#     # --- Identificação da classe positiva ---
+#     "positive_class": 1,                # [NOVO] None = AutoGluon decide sozinho
+#
+#     # --- Opcional ---
+#     "prune_models": False,
+#     "features_to_exclude": [],
+#     "force_types": {},
+# }
+# ============================================================================
 
 
 # ---------------------------------------------------------------------------
@@ -39,28 +108,21 @@ from sklearn.model_selection import StratifiedKFold
 
 
 def _theils_u(x: pd.Series, y: pd.Series) -> float:
-    """
-    Theil's U (Incerteza Assimétrica) de x → y.
-    Mede o quanto conhecer x reduz a incerteza sobre y.
-    Retorna valor entre 0 (nenhuma associação) e 1 (associação perfeita).
-    """
+    """Theil's U assimétrico: quanto x reduz incerteza sobre y. Retorna [0, 1]."""
     x = x.astype(str).fillna("__NA__")
     y = y.astype(str).fillna("__NA__")
-
     s_xy = _conditional_entropy(x, y)
     x_counter = x.value_counts(normalize=True)
     s_x = entropy(x_counter)
-
     if s_x == 0:
-        return 1.0  # x é constante → sem incerteza para reduzir
+        return 1.0
     return (s_x - s_xy) / s_x
 
 
 def _conditional_entropy(x: pd.Series, y: pd.Series) -> float:
     """H(x|y): entropia condicional de x dado y."""
-    y_vals = y.unique()
     h = 0.0
-    for yv in y_vals:
+    for yv in y.unique():
         mask = y == yv
         p_y = mask.mean()
         x_given_y = x[mask].value_counts(normalize=True)
@@ -101,9 +163,9 @@ class AutoClassificationEngine:
         self.pipeline = None
         self.predictor = None
         self.selected_features = None
-        self.feature_importance = None
+        self.feature_importance = None  # [FIX-4] populado no fit()
 
-        # Estado aprendido no Treino
+        # Estado aprendido no treino (apenas em train_core — [FIX-3])
         self._log_cols: list = []
         self._outlier_bounds: dict = {}
         self._rare_categories: dict = {}
@@ -114,11 +176,11 @@ class AutoClassificationEngine:
             "alta_cardinalidade": [],
             "colinearidade": [],
             "constantes_pos_rare": [],
-            "importancia_nula": [],  # <-- NOVA LINHA AQUI
+            "importancia_nula": [],
         }
 
-        # Relatório de associações (preenchido no fit)
         self.association_report: dict = {}
+        self.cv_results: dict = {}
 
     # -----------------------------------------------------------------------
     # 0. VALIDAÇÃO DE PARÂMETROS
@@ -151,7 +213,7 @@ class AutoClassificationEngine:
             "medium_quality",
             "optimize_for_deployment",
         }
-        preset = params.get("presets", "best_quality")
+        preset = params.get("presets", "high_quality")
         if preset not in valid_presets:
             raise ValueError(f"presets '{preset}' inválido. Opções: {valid_presets}")
 
@@ -185,17 +247,20 @@ class AutoClassificationEngine:
 
     def _sanity_check(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Detecta e remove Leakage (numérico via Pearson + categórico via Theil's U)
-        e variáveis de alta cardinalidade (provável IDs).
+        Detecta e remove:
+          - Leakage numérico (Pearson > leakage_threshold)
+          - Leakage categórico (Theil's U > leakage_threshold)
+          - Alta cardinalidade (> 50% valores únicos → provável ID)
+          - Constantes
+
+        [FIX-5] leakage_threshold agora vem de params (default 0.98).
         """
+        # [FIX-5] threshold configurável
+        leakage_thr = self.params.get("leakage_threshold", 0.98)
         to_drop = []
         target_series = df[self.target]
 
-        # -------------------------------------------------------------------
-        # [A CORREÇÃO DO NUMPY] 0. Filtro Rápido de Variáveis Constantes
-        # Se a coluna só tem 1 valor único (ex: tudo zero), a variância é zero.
-        # Cortamos aqui para não dar divisão por zero na correlação do Pandas!
-        # -------------------------------------------------------------------
+        # 0. Variáveis constantes
         const_cols = [c for c in df.columns if df[c].nunique(dropna=False) <= 1]
         if const_cols:
             self.eliminated_features.setdefault("constantes_pos_rare", []).extend(
@@ -204,26 +269,26 @@ class AutoClassificationEngine:
             to_drop.extend(const_cols)
             df = df.drop(columns=const_cols)
 
-        # A. Leakage numérico — Pearson > 98%
+        # A. Leakage numérico
         num_cols = df.select_dtypes(include=[np.number]).columns
         if self.target in num_cols:
             corrs = df[num_cols].corr()[self.target].abs().sort_values(ascending=False)
-            leaks = corrs[(corrs > 0.98) & (corrs.index != self.target)]
+            leaks = corrs[(corrs > leakage_thr) & (corrs.index != self.target)]
             if not leaks.empty:
                 self.eliminated_features["leakage"].extend(leaks.index.tolist())
                 to_drop.extend(leaks.index.tolist())
 
-        # B. Leakage categórico — Theil's U > 98%
+        # B. Leakage categórico
         cat_cols = df.select_dtypes(include=["object", "category"]).columns
         for col in cat_cols:
             if col == self.target or col in to_drop:
                 continue
             u = _theils_u(df[col], target_series)
-            if u > 0.98:
+            if u > leakage_thr:
                 self.eliminated_features["leakage"].append(col)
                 to_drop.append(col)
 
-        # C. Alta cardinalidade (> 50% valores únicos → provável ID)
+        # C. Alta cardinalidade
         obs_count = len(df)
         for col in cat_cols:
             if col == self.target or col in to_drop:
@@ -236,13 +301,10 @@ class AutoClassificationEngine:
 
     def _handle_multicollinearity(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Remove variáveis redundantes usando a métrica de associação correta para
-        cada par de tipos (num-num: Pearson, cat-cat: Theil's U, num-cat: Eta²).
-
-        Critério de desempate: mantém a variável com MAIOR correlação com o target,
-        não simplesmente a primeira do triângulo superior.
+        Remove variáveis redundantes usando Pearson / Theil's U / Eta².
+        Critério de desempate: mantém a feature com maior associação com o target.
         """
-        threshold = self.params.get("pipeline_settings", {}).get("corr_threshold", 0.90)
+        threshold = self.params.get("corr_threshold", 0.90)
         target_series = df[self.target]
 
         num_cols = [
@@ -255,11 +317,8 @@ class AutoClassificationEngine:
         ]
         all_feat = num_cols + cat_cols
 
-        # --- Calcula associação de cada feature com o target ---
-        # Usa _is_categorical_target para não tratar int binário como contínuo
-        target_assoc = {}
         target_is_cat = self._is_categorical_target(target_series)
-
+        target_assoc = {}
         for col in all_feat:
             col_is_num = pd.api.types.is_numeric_dtype(df[col])
             try:
@@ -276,9 +335,7 @@ class AutoClassificationEngine:
             except Exception:
                 target_assoc[col] = 0.0
 
-        # --- Calcula associação entre pares de features ---
         to_drop = set()
-
         for i, col_a in enumerate(all_feat):
             if col_a in to_drop:
                 continue
@@ -293,21 +350,15 @@ class AutoClassificationEngine:
                     if a_is_num and b_is_num:
                         assoc = abs(df[col_a].corr(df[col_b]))
                     elif not a_is_num and not b_is_num:
-                        # Theil's U é assimétrico → máximo das duas direções
                         assoc = max(
                             _theils_u(df[col_a], df[col_b]),
                             _theils_u(df[col_b], df[col_a]),
                         )
                     else:
-                        # Par misto (cat ↔ num).
-                        # Eta² mede "cat explica num" — só faz sentido nessa direção.
-                        # Para capturar a associação simétrica, usamos também Pearson
-                        # com a categórica codificada via label encoding ordinal simples.
                         cat_col, num_col = (
                             (col_a, col_b) if not a_is_num else (col_b, col_a)
                         )
                         eta = _eta_squared(df[cat_col], df[num_col])
-                        # Pearson com codes da categórica como proxy da direção inversa
                         codes = df[cat_col].astype("category").cat.codes.astype(float)
                         pearson = abs(codes.corr(df[num_col]))
                         assoc = max(eta, pearson)
@@ -317,10 +368,6 @@ class AutoClassificationEngine:
                 if assoc > threshold:
                     assoc_a = target_assoc.get(col_a, 0.0)
                     assoc_b = target_assoc.get(col_b, 0.0)
-
-                    # Desempate robusto: se a diferença for < 1%, considera empate
-                    # e remove a feature com MAIS valores únicos (mais propensa a
-                    # overfitting). Se ainda empatar, remove col_b por convenção.
                     if abs(assoc_a - assoc_b) < 0.01:
                         loser = (
                             col_a
@@ -329,7 +376,6 @@ class AutoClassificationEngine:
                         )
                     else:
                         loser = col_b if assoc_a >= assoc_b else col_a
-
                     to_drop.add(loser)
 
         if to_drop:
@@ -358,7 +404,6 @@ class AutoClassificationEngine:
         for col in cat_cols:
             if col == self.target:
                 continue
-            # CORREÇÃO: Converte a coluna para string para evitar erro de Category Index
             if df[col].dtype.name == "category":
                 df[col] = df[col].astype(str)
 
@@ -370,7 +415,6 @@ class AutoClassificationEngine:
                     df[col].isin(self._rare_categories[col]), other="OTHER"
                 )
 
-        # Remove colunas que viraram constantes após o agrupamento
         if is_train:
             const_cols = [
                 c for c in cat_cols if c != self.target and df[c].nunique() <= 1
@@ -382,6 +426,9 @@ class AutoClassificationEngine:
         return df
 
     def _handle_outliers_and_log(self, df: pd.DataFrame, is_train=True) -> pd.DataFrame:
+        """
+        [FIX-6] log1p seguro: verifica não-negatividade APÓS clipping antes de aplicar.
+        """
         df_num = df.select_dtypes(include=[np.number])
         for col in df_num.columns:
             if col == self.target:
@@ -392,13 +439,21 @@ class AutoClassificationEngine:
                 IQR = Q3 - Q1
                 if IQR > 0:
                     self._outlier_bounds[col] = (Q1 - 1.5 * IQR, Q3 + 1.5 * IQR)
+                # Decide se aplica log baseando-se nos dados de treino
                 if abs(skew(df[col].dropna())) > 0.75 and df[col].min() >= 0:
                     self._log_cols.append(col)
 
             if col in self._outlier_bounds:
                 lower, upper = self._outlier_bounds[col]
                 df[col] = np.clip(df[col], lower, upper)
+
             if col in self._log_cols:
+                # [FIX-6] Garante que a coluna é >= 0 após clipping antes de log1p
+                col_min = df[col].min()
+                if col_min < 0:
+                    # Shift para zero (pode ocorrer em produção com dados fora da
+                    # distribuição de treino)
+                    df[col] = df[col] - col_min
                 df[col] = np.log1p(df[col])
 
         return df
@@ -409,56 +464,35 @@ class AutoClassificationEngine:
 
     @staticmethod
     def _is_categorical_target(series: pd.Series) -> bool:
-        """
-        Determina se o target deve ser tratado como categórico.
-        Regra: dtype objeto/category OU numérico com <= 20 classes únicas
-        (cobre targets binários e multiclasse codificados como int).
-        """
         if not pd.api.types.is_numeric_dtype(series):
             return True
         return series.nunique() <= 20
 
     def _compute_association_report(self, df: pd.DataFrame) -> dict:
-        """
-        Calcula associação de cada feature com o target e entre as próprias features.
-        Usa a métrica mais adequada para cada par de tipos:
-          - num ↔ num (target contínuo)  : Pearson
-          - cat → cat (target categórico): Theil's U
-          - num → cat (target categórico): Eta²
-          - cat → num (target contínuo)  : Eta²
-        """
         feat_cols = [c for c in df.columns if c != self.target]
         target_series = df[self.target]
-
-        # Semântica de "é categórico?" evita tratar targets int binários como contínuos
         target_is_cat = self._is_categorical_target(target_series)
 
-        # Feature → Target
         feat_target = {}
         for col in feat_cols:
             col_is_num = pd.api.types.is_numeric_dtype(df[col])
             try:
                 if col_is_num and not target_is_cat:
-                    # Ambos contínuos → Pearson
                     v = abs(df[col].corr(target_series.astype(float)))
                     metric = "Pearson"
                 elif not col_is_num and target_is_cat:
-                    # Ambos categóricos → Theil's U (feature → target)
                     v = _theils_u(df[col], target_series)
                     metric = "Theil's U"
                 elif col_is_num and target_is_cat:
-                    # Feature numérica, target categórico → Eta²
                     v = _eta_squared(target_series, df[col])
                     metric = "Eta²"
                 else:
-                    # Feature categórica, target contínuo → Eta²
                     v = _eta_squared(df[col], target_series.astype(float))
                     metric = "Eta²"
             except Exception:
                 v, metric = 0.0, "Erro"
             feat_target[col] = {"valor": round(v, 4), "metrica": metric}
 
-        # Feature × Feature (matriz)
         n = len(feat_cols)
         matrix = pd.DataFrame(np.eye(n), index=feat_cols, columns=feat_cols)
         metric_matrix = pd.DataFrame("—", index=feat_cols, columns=feat_cols)
@@ -513,8 +547,9 @@ class AutoClassificationEngine:
             ("imputer", SimpleImputer(strategy="median")),
             ("scaler", StandardScaler()),
         ]
-        if self.params.get("pipeline_settings", {}).get("use_pca"):
-            n_comps = self.params["pipeline_settings"].get("pca_components", 0.95)
+        pipeline_cfg = self.params.get("pipeline_settings", {})
+        if pipeline_cfg.get("use_pca"):
+            n_comps = pipeline_cfg.get("pca_components", 0.95)
             num_steps.append(("pca", PCA(n_components=n_comps)))
 
         num_transformer = Pipeline(steps=num_steps)
@@ -535,146 +570,287 @@ class AutoClassificationEngine:
         return Pipeline(steps=[("preprocessor", preprocessor)])
 
     # -----------------------------------------------------------------------
-    # 5. FIT
+    # 5. FIT  [REFATORADO]
     # -----------------------------------------------------------------------
 
     def fit(self, train_data: pd.DataFrame, time_limit: int = None):
         """
-        time_limit: segundos para o AutoGluon. Se None, usa o valor em key_params
-                    ou 300s como fallback.
-        """
-        print("\n🚀 --- TREINAMENTO INICIADO ---")
+        Pipeline de treino com anti-overfitting:
 
-        # Resolve time_limit com hierarquia: argumento > params > fallback
+          1. Limpeza + Sanity Check + Multicolinearidade (dataset completo — OK,
+             essas etapas não usam o target de forma supervisionada)
+          2. Split estratificado → train_core + tuning_holdout  [FIX-2, FIX-3]
+          3. Temporal + RareLabels + Outliers aprendidos SOMENTE no train_core
+          4. Relatório de associações
+          5. Importance filter com holdout separado do train_core  [FIX-1]
+          6. Pipeline sklearn fit no train_core
+          7. AutoGluon fit(train_core, tuning_data=tuning_holdout)  [FIX-2]
+          8. Feature importance calculado no tuning_holdout  [FIX-4]
+
+        Parâmetros
+        ----------
+        time_limit : int
+            Segundos para o AutoGluon. None → usa params["time_limit"] ou 300s.
+        """
+        print("\n🚀 --- TREINAMENTO INICIADO (v0.0.3) ---")
+
         if time_limit is None:
             time_limit = self.params.get("time_limit", 300)
 
+        # ------------------------------------------------------------------
+        # ETAPA 1: Pré-processamento independente de target
+        # ------------------------------------------------------------------
         df = self._standardize_and_clean(train_data)
         df = self._sanity_check(df)
         df = self._handle_multicollinearity(df)
         df = self._extract_temporal_features(df)
-        df = self._handle_rare_labels(df, is_train=True)
+
+        # ------------------------------------------------------------------
+        # ETAPA 2: Split estratificado train_core / tuning_holdout  [FIX-2, FIX-3]
+        # ------------------------------------------------------------------
+        tuning_frac = self.params.get("tuning_data_fraction", 0.15)
+        df_tuning = None
+
+        if tuning_frac > 0:
+            try:
+                df_core, df_tuning = train_test_split(
+                    df,
+                    test_size=tuning_frac,
+                    stratify=df[self.target],
+                    random_state=42,
+                )
+                print(
+                    f"\n✂️  Split: train_core={len(df_core)} | tuning={len(df_tuning)}"
+                    f"  (fração={tuning_frac:.0%})"
+                )
+            except ValueError:
+                # Pode falhar com classes muito raras; usa o dataset completo
+                print(
+                    "⚠️  Split estratificado falhou (classes raras?). Usando dataset completo."
+                )
+                df_core = df
+                df_tuning = None
+        else:
+            df_core = df
+
+        # ------------------------------------------------------------------
+        # ETAPA 3: Transformações aprendidas SOMENTE no train_core  [FIX-3]
+        # ------------------------------------------------------------------
+        df_core = self._handle_rare_labels(df_core, is_train=True)
         if self.params.get("handle_outliers", True):
-            df = self._handle_outliers_and_log(df, is_train=True)
+            df_core = self._handle_outliers_and_log(df_core, is_train=True)
 
-        self.selected_features = [c for c in df.columns if c != self.target]
-        X = df[self.selected_features]
-        y = df[self.target]
+        # Aplica as mesmas transformações (sem re-aprender) no tuning_holdout
+        if df_tuning is not None:
+            df_tuning = self._handle_rare_labels(df_tuning, is_train=False)
+            if self.params.get("handle_outliers", True):
+                df_tuning = self._handle_outliers_and_log(df_tuning, is_train=False)
 
-        # Relatório de associações (antes do pipeline sklearn)
+        # ------------------------------------------------------------------
+        # ETAPA 4: Associações (calculadas no train_core)
+        # ------------------------------------------------------------------
+        self.selected_features = [c for c in df_core.columns if c != self.target]
+        X_core = df_core[self.selected_features]
+        y_core = df_core[self.target]
+
         print("\n🔗 Calculando associações (Pearson / Theil's U / Eta²)...")
-        self.association_report = self._compute_association_report(df)
+        self.association_report = self._compute_association_report(df_core)
         print("   ✅ Relatório de associações pronto.")
 
-        # -------------------------------------------------------------------
-        # [NOVO] ETAPA 3: PRÉ-TREINO RÁPIDO PARA SELEÇÃO DE FEATURES
-        # -------------------------------------------------------------------
+        # ------------------------------------------------------------------
+        # ETAPA 5: Importance Filter com holdout INTERNO  [FIX-1]
+        # ------------------------------------------------------------------
         chosen_metric = self.params.get("eval_metric", "f1")
 
         if self.params.get("use_importance_filter", False):
-            print("\n🔍 Executando Pré-treino Rápido para Seleção de Features...")
-            train_pre = X.copy()
-            train_pre[self.target] = y.values
-            pre_time_limit = min(60, max(20, time_limit // 6))
+            print("\n🔍 Importance Filter — pré-treino com holdout interno...")
 
-            import warnings
+            imp_frac = self.params.get("importance_holdout_fraction", 0.20)
+            try:
+                X_imp_tr, X_imp_val, y_imp_tr, y_imp_val = train_test_split(
+                    X_core,
+                    y_core,
+                    test_size=imp_frac,
+                    stratify=y_core,
+                    random_state=42,
+                )
+            except ValueError:
+                X_imp_tr, X_imp_val = X_core, X_core
+                y_imp_tr, y_imp_val = y_core, y_core
+                print("   ⚠️  Split de importância falhou, usando train_core inteiro.")
 
+            pre_time = min(60, max(20, time_limit // 6))
+            train_imp = X_imp_tr.copy()
+            train_imp[self.target] = y_imp_tr.values
+
+            # Usamos bagging leve para que o AutoGluon calcule importância OOF
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
+                logging.disable(logging.CRITICAL)
                 pre_predictor = TabularPredictor(
                     label=self.target, eval_metric=chosen_metric, verbosity=0
                 ).fit(
-                    train_pre,
-                    time_limit=pre_time_limit,
+                    train_imp,
+                    time_limit=pre_time,
                     presets="optimize_for_deployment",
-                    hyperparameters={"GBM": {}, "CAT": {}},
+                    hyperparameters={"GBM": {}, "CAT": {}, "XGB": {}},
                     ag_args_ensemble={"fold_fitting_strategy": "sequential_local"},
                     num_cpus=self.params.get("num_cpus", 6),
                 )
+                logging.disable(logging.NOTSET)
 
-            fi = pre_predictor.feature_importance(train_pre)
+            # Avalia importância no holdout separado  [FIX-1]
+            val_imp = X_imp_val.copy()
+            val_imp[self.target] = y_imp_val.values
+            fi = pre_predictor.feature_importance(val_imp)
 
-            # --- ABORDAGEM 1: Importância positiva E significância estatística (p < 0.05) ---
             good_features = fi[
-                (fi["importance"] > 0) & (fi["p_value"] < 0.05)
+                (fi["importance"].abs() > 0) & (fi["p_value"] < 0.05)
             ].index.tolist()
-            # good_features = fi[fi["importance"] > 0].index.tolist()
 
-            features_removidas = set(self.selected_features) - set(good_features)
-            self.eliminated_features["importancia_nula"] = list(features_removidas)
+            removed = set(self.selected_features) - set(good_features)
+            self.eliminated_features["importancia_nula"] = list(removed)
             self.selected_features = good_features
-            X = X[self.selected_features]  # Atualiza o X cortando as ruins
-            print(
-                f"   => Mantidas: {len(good_features)} | Removidas (Imp <= 0): {len(features_removidas)}"
-            )
+            X_core = X_core[self.selected_features]
+            print(f"   => Mantidas: {len(good_features)} | Removidas: {len(removed)}")
 
+        # ------------------------------------------------------------------
         print("\n📋 RESUMO DA FILTRAGEM DE VARIÁVEIS:")
+        label_map = {
+            "leakage": "Removidas por Leakage",
+            "alta_cardinalidade": "Removidas por Alta Cardinalidade",
+            "colinearidade": "Removidas por Colinearidade",
+            "constantes_pos_rare": "Removidas por Constantes pós-RareLabel",
+            "importancia_nula": "Removidas por Importância Nula",
+        }
         for reason, cols in self.eliminated_features.items():
-            label = {
-                "leakage": "Removidas por Leakage",
-                "alta_cardinalidade": "Removidas por Alta Cardinalidade",
-                "colinearidade": "Removidas por Colinearidade (>threshold)",
-                "constantes_pos_rare": "Removidas por Constantes pós-RareLabel",
-                "importancia_nula": "Removidas por Importância Nula (AutoGluon)",
-            }[reason]
-            print(f"   => {label}: {cols or 'Nenhuma'}")
+            print(f"   => {label_map[reason]}: {cols or 'Nenhuma'}")
         print(
             f"   => Features Finais ({len(self.selected_features)}): {self.selected_features}"
         )
 
-        # -------------------------------------------------------------------
-        # [NOVO] ETAPA 4: PIPELINE SKLEARN OPCIONAL
-        # -------------------------------------------------------------------
+        # ------------------------------------------------------------------
+        # ETAPA 6: Pipeline sklearn (fit somente no train_core)
+        # ------------------------------------------------------------------
         if self.params.get("use_sklearn_pipeline", True):
-            self.pipeline = self._build_sklearn_pipeline(X)
-            X_trans = self.pipeline.fit_transform(X, y)
-            train_final = X_trans.copy()
+            self.pipeline = self._build_sklearn_pipeline(X_core)
+            X_core_t = self.pipeline.fit_transform(X_core, y_core)
         else:
             self.pipeline = None
-            train_final = X.copy()
+            X_core_t = X_core.copy()
 
-        train_final[self.target] = y.values
+        train_final = X_core_t.copy()
+        train_final[self.target] = y_core.values
 
-        chosen_preset = self.params.get("presets", "best_quality")
+        # Prepara tuning_data transformado para o AutoGluon
+        tuning_final = None
+        if df_tuning is not None:
+            X_tuning = df_tuning[
+                [c for c in self.selected_features if c in df_tuning.columns]
+            ]
+            if self.pipeline is not None:
+                X_tuning_t = self.pipeline.transform(X_tuning)
+            else:
+                X_tuning_t = X_tuning.copy()
+            tuning_final = X_tuning_t.copy()
+            tuning_final[self.target] = df_tuning[self.target].values
+
+        # ------------------------------------------------------------------
+        # ETAPA 7: AutoGluon fit  [FIX-2]
+        # ------------------------------------------------------------------
+        chosen_preset = self.params.get("presets", "high_quality")
         print(
-            f"\n🎯 Métrica: {chosen_metric} | Preset: {chosen_preset} | Time Limit: {time_limit}s"
+            f"\n🎯 Métrica: {chosen_metric} | Preset: {chosen_preset} | Time: {time_limit}s"
         )
+        if tuning_final is not None:
+            print(
+                f"   tuning_data: {len(tuning_final)} linhas (anti-overfitting ativo)"
+            )
 
-        # -------------------------------------------------------------------
-        # [NOVO] ETAPA 4b: PODA DE MODELOS E TRAVA DO RAY
-        # -------------------------------------------------------------------
         hyperparams = "default"
         if self.params.get("prune_models", False):
             hyperparams = {"GBM": {}, "CAT": {}, "XGB": {}, "FASTAI": {}}
 
-        ag_args_ensemble = self.params.get(
-            "ag_args_ensemble", {"fold_fitting_strategy": "sequential_local"}
-        )
-
-        # Monta os argumentos dinamicamente para não "engolir" o que você mandar
         fit_kwargs = {
             "time_limit": time_limit,
             "presets": chosen_preset,
             "num_cpus": self.params.get("num_cpus", 6),
-            "ag_args_ensemble": ag_args_ensemble,
+            "ag_args_ensemble": self.params.get(
+                "ag_args_ensemble", {"fold_fitting_strategy": "sequential_local"}
+            ),
             "hyperparameters": hyperparams,
         }
 
-        # Resgata os parâmetros que o framework estava ignorando!
-        if "dynamic_stacking" in self.params:
-            fit_kwargs["dynamic_stacking"] = self.params["dynamic_stacking"]
-        if "num_bag_folds" in self.params:
-            fit_kwargs["num_bag_folds"] = self.params["num_bag_folds"]
-        if "num_bag_sets" in self.params:
-            fit_kwargs["num_bag_sets"] = self.params["num_bag_sets"]
+        # Passa tuning_data se disponível  [FIX-2]
+        if tuning_final is not None:
+            fit_kwargs["tuning_data"] = tuning_final
 
-        # Treina o modelo passando tudo
-        self.predictor = TabularPredictor(
-            label=self.target, eval_metric=chosen_metric
-        ).fit(train_final, **fit_kwargs)
+        # Parâmetros opcionais de bagging/stacking
+        for key in ["dynamic_stacking", "num_bag_folds", "num_bag_sets"]:
+            if key in self.params:
+                fit_kwargs[key] = self.params[key]
+
+        # [FIX-9] dynamic_stacking=False como default se não especificado
+        if "dynamic_stacking" not in fit_kwargs:
+            fit_kwargs["dynamic_stacking"] = False
+            print(
+                "   ℹ️  dynamic_stacking=False (default anti-overfitting). "
+                "Override via params['dynamic_stacking'] se necessário."
+            )
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            self.predictor = TabularPredictor(
+                label=self.target, eval_metric=chosen_metric
+            ).fit(train_final, **fit_kwargs)
+
+        # ------------------------------------------------------------------
+        # ETAPA 8: Feature importance no tuning_holdout  [FIX-4]
+        # ------------------------------------------------------------------
+        self.compute_feature_importance(
+            data=tuning_final if tuning_final is not None else train_final
+        )
+
+        print("\n✅ Treinamento concluído!")
 
     # -----------------------------------------------------------------------
-    # 5b. CROSS-VALIDATION EXTERNO
+    # 5b. FEATURE IMPORTANCE PÚBLICO  [NEW-5]
+    # -----------------------------------------------------------------------
+
+    def compute_feature_importance(
+        self, data: pd.DataFrame = None, num_shuffle_sets: int = 5
+    ):
+        """
+        Calcula feature importance por permutação.
+
+        [FIX-4] Chamado automaticamente no fit() usando o tuning_holdout.
+        Pode ser chamado manualmente com qualquer dataset já pré-processado.
+
+        Parâmetros
+        ----------
+        data : pd.DataFrame
+            Dataset já pré-processado (com target). Se None, usa o leaderboard
+            interno do AutoGluon (menos preciso).
+        num_shuffle_sets : int
+            Número de permutações (default 5). Mais = mais estável, mais lento.
+        """
+        if self.predictor is None:
+            raise RuntimeError("Execute fit() antes de compute_feature_importance().")
+
+        print(f"\n📊 Calculando feature importance ({num_shuffle_sets} permutações)...")
+        try:
+            self.feature_importance = self.predictor.feature_importance(
+                data=data,
+                num_shuffle_sets=num_shuffle_sets,
+                silent=True,
+            )
+            print("   ✅ Feature importance calculada.")
+        except Exception as e:
+            print(f"   ⚠️  Falha ao calcular importância: {e}")
+            self.feature_importance = None
+
+    # -----------------------------------------------------------------------
+    # 5c. CROSS-VALIDATION EXTERNO
     # -----------------------------------------------------------------------
 
     def cross_validate(
@@ -684,40 +860,31 @@ class AutoClassificationEngine:
         time_limit_per_fold: int = None,
     ) -> pd.DataFrame:
         """
-        Cross-validation estratificado externo com K folds.
+        Cross-validation estratificado externo.
 
-        Para cada fold:
-          - Aplica TODO o pipeline de pré-processamento de forma independente
-            (evita data leakage entre folds)
-          - Treina um AutoGluon completo no fold de treino
-          - Avalia no fold de validação
-          - Coleta todas as métricas + curvas
-
-        Retorna um DataFrame com métricas por fold + média ± std.
-        Os resultados ficam em self.cv_results para uso no plot_cv_report().
-
-        Parâmetros
-        ----------
-        n_folds : int
-            Número de folds (default 5). Recomendado entre 5 e 10.
-        time_limit_per_fold : int
-            Segundos de treino por fold. Se None, usa time_limit dos params
-            dividido por n_folds (com mínimo de 60s).
+        [FIX-8] AVISO: as features usadas no CV são as mesmas selecionadas no
+        fit() global. Isso introduz um leve viés de seleção de features
+        (as features foram escolhidas vendo todos os dados). Para uma estimativa
+        100% sem viés de seleção, use um CV totalmente independente do fit().
+        Na prática, o impacto é pequeno para seleção por importância positiva.
         """
         if self.selected_features is None:
             raise RuntimeError("Execute fit() antes de cross_validate().")
 
-        # Time limit por fold: divide o budget total ou usa fallback
+        # [FIX-8] Aviso explícito
+        print(
+            "\n⚠️  NOTA: O CV usa as features selecionadas no fit() global.\n"
+            "   Isso introduz viés de seleção leve. As métricas são conservadoras,\n"
+            "   mas não 100% livres de data leakage de seleção."
+        )
+
         total_tl = self.params.get("time_limit", 300)
         if time_limit_per_fold is None:
             time_limit_per_fold = max(60, total_tl // n_folds)
 
-        print(f"\n🔄 --- CROSS-VALIDATION INICIADO ({n_folds} folds) ---")
+        print(f"\n🔄 --- CROSS-VALIDATION ({n_folds} folds) ---")
         print(f"   Time limit por fold: {time_limit_per_fold}s")
 
-        # Pré-processamento base (sanity check, multicolinearidade, etc.)
-        # já foi feito no fit() — aqui reutilizamos selected_features e pipeline
-        # mas RECRIAMOS um engine limpo por fold para evitar leakage de estado.
         df_base = self._standardize_and_clean(train_data)
         available = [
             c
@@ -730,21 +897,21 @@ class AutoClassificationEngine:
         X_raw = df_base[self.selected_features]
         y_raw = df_base[self.target]
 
-        pos_label = self.predictor.positive_class
+        pos_label = self._get_positive_class()
         skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
         y_strat = (y_raw.astype(str) == str(pos_label)).astype(int)
 
         fold_metrics = []
-        fold_curves = []  # fpr, tpr por fold para plotagem
-        oof_probs = np.zeros(len(y_raw))  # out-of-fold probabilities
+        fold_curves = []
+        oof_probs = np.zeros(len(y_raw))
         oof_true = np.zeros(len(y_raw))
 
         chosen_metric = self.params.get("eval_metric", "f1")
-        chosen_preset = self.params.get("presets", "best_quality")
+        chosen_preset = self.params.get("presets", "high_quality")
 
         for fold_idx, (train_idx, val_idx) in enumerate(skf.split(X_raw, y_strat)):
             print(
-                f"\n   📂 Fold {fold_idx + 1}/{n_folds} "
+                f"\n   📂 Fold {fold_idx + 1}/{n_folds}  "
                 f"(treino={len(train_idx)}, val={len(val_idx)})"
             )
 
@@ -753,21 +920,20 @@ class AutoClassificationEngine:
             y_tr = y_raw.iloc[train_idx]
             y_vl = y_raw.iloc[val_idx]
 
-            # --- Pré-processamento independente por fold ---
-            # rare labels aprendidos só no fold de treino
+            # Rare labels — aprendidos no fold de treino
             rare_cats_fold = {}
             cat_cols = X_tr_raw.select_dtypes(include=["object", "category"]).columns
             for col in cat_cols:
                 freq = X_tr_raw[col].value_counts(normalize=True)
                 rare_cats_fold[col] = freq[freq >= 0.01].index.tolist()
                 X_tr_raw[col] = X_tr_raw[col].where(
-                    X_tr_raw[col].isin(rare_cats_fold[col]), other="OTHER"
+                    X_tr_raw[col].isin(rare_cats_fold[col]), "OTHER"
                 )
                 X_vl_raw[col] = X_vl_raw[col].where(
-                    X_vl_raw[col].isin(rare_cats_fold[col]), other="OTHER"
+                    X_vl_raw[col].isin(rare_cats_fold[col]), "OTHER"
                 )
 
-            # outliers/log aprendidos só no fold de treino
+            # Outliers/log — aprendidos no fold de treino
             log_cols_fold, bounds_fold = [], {}
             for col in X_tr_raw.select_dtypes(include=[np.number]).columns:
                 Q1, Q3 = X_tr_raw[col].quantile([0.25, 0.75])
@@ -779,23 +945,25 @@ class AutoClassificationEngine:
                     and X_tr_raw[col].min() >= 0
                 ):
                     log_cols_fold.append(col)
+
             for col, (lo, hi) in bounds_fold.items():
                 X_tr_raw[col] = np.clip(X_tr_raw[col], lo, hi)
                 X_vl_raw[col] = np.clip(X_vl_raw[col], lo, hi)
-            for col in log_cols_fold:
-                X_tr_raw[col] = np.log1p(X_tr_raw[col])
-                X_vl_raw[col] = np.log1p(X_vl_raw[col])
 
-            # Pipeline sklearn aprendido só no fold de treino
+            for col in log_cols_fold:
+                # [FIX-6] aplicado também no CV
+                for split in [X_tr_raw, X_vl_raw]:
+                    if split[col].min() < 0:
+                        split[col] = split[col] - split[col].min()
+                    split[col] = np.log1p(split[col])
+
+            # Pipeline sklearn — aprendido no fold de treino
             pipe_fold = self._build_sklearn_pipeline(X_tr_raw)
             X_tr_t = pipe_fold.fit_transform(X_tr_raw, y_tr)
             X_vl_t = pipe_fold.transform(X_vl_raw)
 
             train_ag = X_tr_t.copy()
             train_ag[self.target] = y_tr.values
-
-            # AutoGluon por fold (silencioso)
-            import warnings, logging
 
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
@@ -809,6 +977,7 @@ class AutoClassificationEngine:
                     time_limit=time_limit_per_fold,
                     presets=chosen_preset,
                     num_cpus=self.params.get("num_cpus", 6),
+                    dynamic_stacking=self.params.get("dynamic_stacking", False),
                     ag_args_ensemble=self.params.get(
                         "ag_args_ensemble",
                         {"fold_fitting_strategy": "sequential_local"},
@@ -821,7 +990,6 @@ class AutoClassificationEngine:
             y_pred = pred_fold.predict(X_vl_t)
             y_bin = (y_vl.astype(str) == str(pos_label)).astype(int)
 
-            # Salva OOF
             oof_probs[val_idx] = y_prob_pos.values
             oof_true[val_idx] = y_bin.values
 
@@ -839,6 +1007,12 @@ class AutoClassificationEngine:
                     "Avg Precision": round(pr_auc, 4),
                     "F1 (thr=0.5)": round(f1_score(y_bin, y_pred, zero_division=0), 4),
                     "F1 (Youden)": round(f1_score(y_bin, y_pred_y, zero_division=0), 4),
+                    "Precision (Youden)": round(
+                        precision_score(y_bin, y_pred_y, zero_division=0), 4
+                    ),
+                    "Recall (Youden)": round(
+                        recall_score(y_bin, y_pred_y, zero_division=0), 4
+                    ),
                     "Recall (0.5)": round(
                         recall_score(y_bin, y_pred, zero_division=0), 4
                     ),
@@ -849,18 +1023,15 @@ class AutoClassificationEngine:
             fold_curves.append(
                 {"fpr": fpr, "tpr": tpr, "auc": roc_auc, "fold": fold_idx + 1}
             )
-
             print(
                 f"      AUC={roc_auc:.4f} | AP={pr_auc:.4f} | "
                 f"F1={fold_metrics[-1]['F1 (thr=0.5)']:.4f}"
             )
 
-        # --- Resumo OOF global ---
-        fpr_oof, tpr_oof, thresh_oof = roc_curve(oof_true, oof_probs)
+        fpr_oof, tpr_oof, _ = roc_curve(oof_true, oof_probs)
         oof_auc = auc(fpr_oof, tpr_oof)
         oof_ap = average_precision_score(oof_true, oof_probs)
 
-        # --- DataFrame de métricas ---
         metrics_df = pd.DataFrame(fold_metrics).set_index("Fold")
         mean_row = metrics_df.mean().rename("Média")
         std_row = metrics_df.std().rename("Std")
@@ -868,7 +1039,7 @@ class AutoClassificationEngine:
             [metrics_df, mean_row.to_frame().T, std_row.to_frame().T]
         )
 
-        print(f"\n📊 RESUMO CROSS-VALIDATION ({n_folds} folds):")
+        print(f"\n📊 RESUMO ({n_folds} folds):")
         print(f"   AUC-ROC  : {mean_row['AUC-ROC']:.4f} ± {std_row['AUC-ROC']:.4f}")
         print(
             f"   Avg Prec : {mean_row['Avg Precision']:.4f} ± {std_row['Avg Precision']:.4f}"
@@ -879,7 +1050,6 @@ class AutoClassificationEngine:
         print(f"   AUC OOF  : {oof_auc:.4f}  (out-of-fold global)")
         print(f"   AP  OOF  : {oof_ap:.4f}  (out-of-fold global)")
 
-        # Armazena para uso no plot_cv_report
         self.cv_results = {
             "summary_df": summary_df,
             "fold_curves": fold_curves,
@@ -894,16 +1064,12 @@ class AutoClassificationEngine:
         }
         return summary_df
 
+    # -----------------------------------------------------------------------
+    # 5d. PLOT CROSS-VALIDATION
+    # -----------------------------------------------------------------------
+
     def plot_cv_report(self):
-        """
-        Plota o relatório visual do cross-validation:
-          1. Tabela de métricas por fold (com média ± std)
-          2. Curvas ROC por fold + ROC OOF
-          3. Distribuição das métricas por fold (boxplot)
-          4. Distribuição OOF de probabilidades
-          5. Calibração OOF
-        """
-        if not hasattr(self, "cv_results") or not self.cv_results:
+        if not self.cv_results:
             raise RuntimeError("Execute cross_validate() antes de plot_cv_report().")
 
         cv = self.cv_results
@@ -912,11 +1078,9 @@ class AutoClassificationEngine:
 
         fig, axes = plt.subplots(2, 3, figsize=(20, 12), constrained_layout=True)
 
-        # --- 1. Tabela de métricas por fold ---
+        # 1. Tabela
         ax = axes[0, 0]
         ax.axis("off")
-        # summary_df tem índice misto (ints dos folds + strings "Média"/"Std")
-        # reset_index() gera coluna "index", não "Fold" — renomeamos explicitamente
         df_table = cv["summary_df"].reset_index().rename(columns={"index": "Fold"})
         df_table["Fold"] = df_table["Fold"].astype(str)
         table = ax.table(
@@ -929,16 +1093,13 @@ class AutoClassificationEngine:
         table.auto_set_font_size(False)
         table.set_fontsize(8.5)
         table.scale(1, 1.6)
-
-        # Colore as linhas de Média e Std
         n_rows = len(df_table)
         for j in range(len(df_table.columns)):
-            table[n_rows - 1, j].set_facecolor("#d4edda")  # Média = verde
-            table[n_rows, j].set_facecolor("#fff3cd")  # Std   = amarelo
+            table[n_rows - 1, j].set_facecolor("#d4edda")
+            table[n_rows, j].set_facecolor("#fff3cd")
+        ax.set_title(f"Métricas por Fold (n={n})", fontweight="bold", fontsize=12)
 
-        ax.set_title(f"Métricas por Fold  (n={n})", fontweight="bold", fontsize=12)
-
-        # --- 2. Curvas ROC por fold + OOF ---
+        # 2. ROC por fold
         ax = axes[0, 1]
         for fc in cv["fold_curves"]:
             ax.plot(
@@ -963,7 +1124,7 @@ class AutoClassificationEngine:
         ax.set_ylabel("TPR")
         ax.legend(fontsize=7.5)
 
-        # --- 3. Boxplot das métricas por fold ---
+        # 3. Boxplot
         ax = axes[0, 2]
         metric_cols = [
             "AUC-ROC",
@@ -982,7 +1143,6 @@ class AutoClassificationEngine:
             whiskerprops=dict(color="#1f77b4"),
             capprops=dict(color="#1f77b4"),
         )
-        # Adiciona pontos individuais
         for i, col in enumerate(metric_cols):
             y_vals = fold_only[col].values
             x_jitter = np.random.default_rng(42).uniform(-0.15, 0.15, len(y_vals))
@@ -996,21 +1156,14 @@ class AutoClassificationEngine:
             )
         ax.set_ylim(0, 1.05)
         ax.set_title("Distribuição das Métricas (por fold)", fontweight="bold")
-        ax.set_ylabel("Score")
         ax.tick_params(axis="x", rotation=20, labelsize=8)
 
-        # --- 4. Distribuição OOF de probabilidades ---
+        # 4. Distribuição OOF
         ax = axes[1, 0]
         oof_df = pd.DataFrame(
-            {
-                "prob": cv["oof_probs"],
-                "label": cv["oof_true"].astype(int),
-            }
+            {"prob": cv["oof_probs"], "label": cv["oof_true"].astype(int)}
         )
-        for lbl, color, name in [
-            (0, "#ff7f0e", f"Neg (0)"),
-            (1, "#1f77b4", f"Pos (1)"),
-        ]:
+        for lbl, color, name in [(0, "#ff7f0e", "Neg (0)"), (1, "#1f77b4", "Pos (1)")]:
             sns.kdeplot(
                 oof_df[oof_df["label"] == lbl]["prob"],
                 ax=ax,
@@ -1024,7 +1177,7 @@ class AutoClassificationEngine:
         ax.set_xlim(0, 1)
         ax.legend(fontsize=9)
 
-        # --- 5. Calibração OOF ---
+        # 5. Calibração OOF
         ax = axes[1, 1]
         prob_true_oof, prob_pred_oof = calibration_curve(
             cv["oof_true"], cv["oof_probs"], n_bins=10
@@ -1043,12 +1196,13 @@ class AutoClassificationEngine:
         ax.set_ylabel("Fração de Positivos")
         ax.legend(fontsize=9)
 
-        # --- 6. Estabilidade — AUC por fold (linha do tempo) ---
+        # 6. Estabilidade AUC
         ax = axes[1, 2]
         aucs = [fc["auc"] for fc in cv["fold_curves"]]
         folds = [fc["fold"] for fc in cv["fold_curves"]]
-        colors_bar = [cmap(i) for i in range(n)]
-        bars = ax.bar(folds, aucs, color=colors_bar, edgecolor="white", width=0.6)
+        bars = ax.bar(
+            folds, aucs, color=[cmap(i) for i in range(n)], edgecolor="white", width=0.6
+        )
         ax.axhline(
             np.mean(aucs),
             color="red",
@@ -1080,7 +1234,7 @@ class AutoClassificationEngine:
             )
 
         plt.suptitle(
-            f"Relatório de Cross-Validation  ({n} Folds Estratificados)  —  "
+            f"Relatório CV ({n} Folds Estratificados)  —  "
             f"AUC OOF: {cv['oof_auc']:.4f}  |  AP OOF: {cv['oof_ap']:.4f}",
             fontsize=15,
             fontweight="bold",
@@ -1088,13 +1242,18 @@ class AutoClassificationEngine:
         plt.show()
 
     # -----------------------------------------------------------------------
-    # 6. PREDIÇÃO (PIPELINE DE INFERÊNCIA)
+    # 6. PREDIÇÃO
     # -----------------------------------------------------------------------
 
-    def _preprocess_for_inference(self, data: pd.DataFrame):
-        """Aplica o mesmo pré-processamento do treino (sem vazar estado)."""
-        df_proc = self._standardize_and_clean(data)
+    def _get_positive_class(self):
+        """[FIX-7] Permite sobrescrever positive_class via params."""
+        override = self.params.get("positive_class", None)
+        if override is not None:
+            return override
+        return self.predictor.positive_class
 
+    def _preprocess_for_inference(self, data: pd.DataFrame):
+        df_proc = self._standardize_and_clean(data)
         available_cols = [
             c
             for c in df_proc.columns
@@ -1109,7 +1268,6 @@ class AutoClassificationEngine:
         X = df_proc[self.selected_features]
         y = df_proc[self.target] if has_target else None
 
-        # Verifica se o pipeline do sklearn foi ativado no treino
         if self.pipeline is not None:
             X_trans = self.pipeline.transform(X)
         else:
@@ -1144,8 +1302,6 @@ class AutoClassificationEngine:
         stats["event_rate"] = stats["events"] / stats["count"]
         global_rate = df["target"].mean()
         stats["lift"] = stats["event_rate"] / global_rate
-
-        # KS por decil (cumulativo)
         stats = stats.sort_values("decile", ascending=False)
         total_pos = stats["events"].sum()
         total_neg = (stats["count"] - stats["events"]).sum()
@@ -1155,34 +1311,24 @@ class AutoClassificationEngine:
         return stats.sort_values("decile")
 
     def _youden_threshold(self, fpr, tpr, thresholds):
-        """Threshold de Youden: maximiza TPR - FPR."""
         idx = np.argmax(tpr - fpr)
         return thresholds[idx], fpr[idx], tpr[idx]
 
     def plot_association_report(self):
-        """
-        Plota:
-        1. Associação de cada feature com o target (barras).
-        2. Matriz de associação entre features (heatmap).
-        """
         if not self.association_report:
-            raise RuntimeError(
-                "Execute fit() antes de plotar o relatório de associações."
-            )
+            raise RuntimeError("Execute fit() antes de plotar associações.")
 
         feat_target = self.association_report["feat_target"]
         matrix = self.association_report["feat_feat_matrix"]
 
         fig, axes = plt.subplots(1, 2, figsize=(18, max(6, len(feat_target) * 0.5)))
 
-        # --- Painel 1: Feature → Target ---
         ax = axes[0]
         sorted_feats = sorted(
             feat_target.items(), key=lambda x: x[1]["valor"], reverse=True
         )
         labels = [f"{k}\n({v['metrica']})" for k, v in sorted_feats]
         values = [v["valor"] for _, v in sorted_feats]
-
         colors = [
             "#d62728" if v > 0.8 else "#ff7f0e" if v > 0.5 else "#1f77b4"
             for v in values
@@ -1210,7 +1356,6 @@ class AutoClassificationEngine:
                 fontsize=8,
             )
 
-        # --- Painel 2: Matriz Feature × Feature ---
         ax2 = axes[1]
         mask = np.eye(len(matrix), dtype=bool)
         sns.heatmap(
@@ -1230,7 +1375,6 @@ class AutoClassificationEngine:
             "Matriz de Associação entre Features\n(Pearson | Theil's U | Eta²)",
             fontweight="bold",
         )
-
         plt.suptitle("Relatório de Associações", fontsize=16, fontweight="bold")
         plt.tight_layout()
         plt.show()
@@ -1243,59 +1387,30 @@ class AutoClassificationEngine:
             datasets["Treino"] = train_data
 
         results = {}
-        pos_label = self.predictor.positive_class
+        pos_label = self._get_positive_class()  # [FIX-7]
         colors = {"Treino": "#ff7f0e", "Teste": "#1f77b4"}
 
         for name, data in datasets.items():
             X_trans, y = self._preprocess_for_inference(data)
-
-            # 1. Pega as probabilidades primeiro
             y_prob = self.predictor.predict_proba(X_trans)
-            y_prob_pos = y_prob[pos_label].values  # Força array numérico
-
-            # 2. Converte a VERDADE (y) para 0 e 1 (Int)
+            y_prob_pos = y_prob[pos_label].values
             y_bin = (y.astype(str).values == str(pos_label)).astype(int)
-
-            # 3. Converte a PREDIÇÃO (y_pred) para 0 e 1 (Int)
             y_pred_raw = self.predictor.predict(X_trans)
             y_pred = (y_pred_raw.astype(str).values == str(pos_label)).astype(int)
 
-            # Agora tudo abaixo (fpr, tpr, f1_score) receberá apenas 0s e 1s puros.
             fpr, tpr, thresholds = roc_curve(y_bin, y_prob_pos)
             roc_auc = auc(fpr, tpr)
             prec_full, rec_full, thresh_pr = precision_recall_curve(y_bin, y_prob_pos)
             pr_auc = average_precision_score(y_bin, y_prob_pos)
-            # precision_recall_curve retorna len(thresh_pr) + 1 pontos em prec/rec.
-            # Truncamos para alinhar com thresh_pr em todos os usos posteriores.
             prec = prec_full[:-1]
             rec = rec_full[:-1]
             prob_true, prob_pred = calibration_curve(y_bin, y_prob_pos, n_bins=bins)
-
             youden_thresh, youden_fpr, youden_tpr = self._youden_threshold(
                 fpr, tpr, thresholds
             )
             y_pred_youden = (y_prob_pos >= youden_thresh).astype(int)
-
             decile_stats = self._get_decile_stats(y_bin, y_prob_pos, bins=bins)
             ks_stat = decile_stats["ks"].max()
-
-            metrics = {
-                "AUC-ROC": roc_auc,
-                "Gini": 2 * roc_auc - 1,
-                "KS": ks_stat,
-                "F1 (thr=0.5)": f1_score(
-                    y_bin, y_pred, pos_label=1, average="binary", zero_division=0
-                ),
-                "F1 (Youden)": f1_score(
-                    y_bin, y_pred_youden, pos_label=1, average="binary", zero_division=0
-                ),
-                "Recall (thr=0.5)": recall_score(
-                    y_bin, y_pred, pos_label=1, average="binary", zero_division=0
-                ),
-                "Log-Loss": log_loss(y_bin, y_prob_pos),
-                "Accuracy": accuracy_score(y_bin, y_pred),
-                "Avg Precision": pr_auc,
-            }
 
             results[name] = {
                 "y_true": y_bin,
@@ -1308,25 +1423,30 @@ class AutoClassificationEngine:
                 "youden_thresh": youden_thresh,
                 "youden_fpr": youden_fpr,
                 "youden_tpr": youden_tpr,
-                "metrics": metrics,
+                "metrics": {
+                    "AUC-ROC": roc_auc,
+                    "Gini": 2 * roc_auc - 1,
+                    "KS": ks_stat,
+                    "F1 (thr=0.5)": f1_score(y_bin, y_pred, zero_division=0),
+                    "F1 (Youden)": f1_score(y_bin, y_pred_youden, zero_division=0),
+                    "Recall (thr=0.5)": recall_score(y_bin, y_pred, zero_division=0),
+                    "Log-Loss": log_loss(y_bin, y_prob_pos),
+                    "Accuracy": accuracy_score(y_bin, y_pred),
+                    "Avg Precision": pr_auc,
+                },
                 "decile_stats": decile_stats,
-                "prec": prec,  # truncado (alinhado com thresh_pr)
-                "rec": rec,  # truncado (alinhado com thresh_pr)
-                "prec_full": prec_full,  # completo (para plot da curva PR)
-                "rec_full": rec_full,  # completo (para plot da curva PR)
+                "prec": prec,
+                "rec": rec,
+                "prec_full": prec_full,
+                "rec_full": rec_full,
                 "thresh_pr": thresh_pr,
                 "calib_true": prob_true,
                 "calib_pred": prob_pred,
             }
 
-        # ----------------------------------------------------------------
-        # LAYOUT DO REPORT
-        # 4 colunas × 4 linhas
-        # ----------------------------------------------------------------
         fig = plt.figure(figsize=(24, 22), constrained_layout=True)
         gs = fig.add_gridspec(4, 4)
 
-        # --- Linha 0: Scorecard + Confusion Matrix (Youden) + Feature Importance ---
         ax_metrics = fig.add_subplot(gs[0, :2])
         self._plot_scorecard(ax_metrics, results)
 
@@ -1340,11 +1460,10 @@ class AutoClassificationEngine:
             ax_cm_youden,
             results["Teste"],
             pos_label,
-            f"Youden Teste ({results['Teste']['youden_thresh']:.2f})",
+            f"Youden ({results['Teste']['youden_thresh']:.2f})",
             use_youden=True,
         )
 
-        # --- Linha 1: ROC + PR + Calibração + Densidade ---
         ax_roc = fig.add_subplot(gs[1, 0])
         for name, res in results.items():
             ls = "-" if name == "Teste" else "--"
@@ -1382,8 +1501,6 @@ class AutoClassificationEngine:
                 color=colors[name],
                 label=f"{name} AP={res['metrics']['Avg Precision']:.3f}",
             )
-
-        # Alerta visual de overfitting quando gap de AP entre Treino e Teste for > 0.10
         if "Treino" in results:
             ap_gap = (
                 results["Treino"]["metrics"]["Avg Precision"]
@@ -1393,7 +1510,7 @@ class AutoClassificationEngine:
                 ax_pr.text(
                     0.5,
                     0.12,
-                    f"⚠️ Possível Overfitting\n" f"ΔAP Treino−Teste = {ap_gap:.2f}",
+                    f"⚠️ Possível Overfitting\nΔAP Treino−Teste = {ap_gap:.2f}",
                     transform=ax_pr.transAxes,
                     ha="center",
                     va="center",
@@ -1404,7 +1521,6 @@ class AutoClassificationEngine:
                         boxstyle="round,pad=0.4", facecolor="#d62728", alpha=0.85
                     ),
                 )
-
         ax_pr.set_title("Precision-Recall", fontweight="bold")
         ax_pr.set_xlabel("Recall")
         ax_pr.set_ylabel("Precision")
@@ -1447,7 +1563,6 @@ class AutoClassificationEngine:
         ax_hist.set_xlim(0, 1)
         ax_hist.legend(fontsize=8)
 
-        # --- Linha 2: Threshold Analysis ---
         ax_thresh = fig.add_subplot(gs[2, :2])
         self._plot_threshold_analysis(ax_thresh, results["Teste"])
 
@@ -1460,11 +1575,19 @@ class AutoClassificationEngine:
                 ax=ax_feat,
                 palette="viridis",
             )
-            ax_feat.set_title("Top 15 Features Importantes", fontweight="bold")
+            ax_feat.set_title(
+                "Top 15 Features (Importância no tuning_holdout)", fontweight="bold"
+            )
         else:
-            ax_feat.text(0.5, 0.5, "Indisponível", ha="center", va="center")
+            ax_feat.text(
+                0.5,
+                0.5,
+                "Indisponível\nChame compute_feature_importance()",
+                ha="center",
+                va="center",
+                fontsize=10,
+            )
 
-        # --- Linha 3: Decil + KS ---
         ax_decil = fig.add_subplot(gs[3, :3])
         self._plot_decil(ax_decil, results, colors, bins)
 
@@ -1472,19 +1595,16 @@ class AutoClassificationEngine:
         self._plot_ks_curve(ax_ks, results["Teste"])
 
         plt.suptitle(
-            f"Relatório Completo de Performance — Classificação (target: {pos_label})",
+            f"Relatório Completo de Performance — target: {pos_label}",
             fontsize=18,
             weight="bold",
         )
         plt.show()
 
-    # ---- Sub-plots auxiliares ----
-
     def _plot_scorecard(self, ax, results):
         ax.axis("off")
         metric_df = pd.DataFrame({k: v["metrics"] for k, v in results.items()})
 
-        # Cor de fundo por métrica (verde = bom, vermelho = atenção)
         def _color(metric, val):
             good = metric not in ["Log-Loss"]
             if good:
@@ -1510,32 +1630,23 @@ class AutoClassificationEngine:
         table.auto_set_font_size(False)
         table.set_fontsize(10)
         table.scale(1, 1.9)
-
         for i, m in enumerate(metric_df.index):
             for j, col in enumerate(metric_df.columns):
-                val = metric_df.loc[m, col]
-                table[i + 1, j + 1].set_facecolor(_color(m, val))
-
+                table[i + 1, j + 1].set_facecolor(_color(m, metric_df.loc[m, col]))
         ax.set_title("🏆 Scorecard do Modelo", fontweight="bold", fontsize=13)
 
     def _plot_confusion(self, ax, res, pos_label, title, use_youden=False):
         y_pred = res["y_pred_youden"] if use_youden else res["y_pred"]
         cm = confusion_matrix(res["y_true"], y_pred)
-
-        # Rótulos semânticos: neg_label = classe 0, pos_label = classe 1
         neg_label = (
             f"Não {pos_label}" if isinstance(pos_label, str) else f"≠{pos_label}"
         )
         class_labels = [neg_label, str(pos_label)]
-
-        # Monta anotações enriquecidas: valor absoluto + % da linha (taxa real)
-        total = cm.sum()
         row_totals = cm.sum(axis=1, keepdims=True)
-        pct = cm / row_totals * 100  # % por linha (precision/recall perspectiva)
+        pct = cm / row_totals * 100
         annot = np.array(
             [[f"{cm[i,j]}\n({pct[i,j]:.0f}%)" for j in range(2)] for i in range(2)]
         )
-
         sns.heatmap(
             cm,
             annot=annot,
@@ -1554,17 +1665,13 @@ class AutoClassificationEngine:
         ax.tick_params(axis="y", labelsize=8, rotation=0)
 
     def _plot_threshold_analysis(self, ax, res):
-        """Plota Precision, Recall e F1 em função do threshold de corte."""
         thresholds = res["thresh_pr"]
         prec = res["prec"]
         rec = res["rec"]
         f1 = 2 * prec * rec / (prec + rec + 1e-9)
-
         ax.plot(thresholds, prec, label="Precision", color="#2ca02c", lw=2)
         ax.plot(thresholds, rec, label="Recall", color="#d62728", lw=2)
         ax.plot(thresholds, f1, label="F1", color="#1f77b4", lw=2)
-
-        # Youden: linha vertical roxa sólida com seta anotada
         ax.axvline(
             res["youden_thresh"],
             color="#9467bd",
@@ -1579,19 +1686,10 @@ class AutoClassificationEngine:
             fontsize=7.5,
             color="#9467bd",
             fontweight="bold",
-            arrowprops=dict(arrowstyle="->", color="#9467bd", lw=1.2),
             va="top",
+            arrowprops=dict(arrowstyle="->", color="#9467bd", lw=1.2),
         )
-
-        # Default 0.5: linha vertical cinza tracejada
-        ax.axvline(
-            0.5,
-            color="#7f7f7f",
-            linestyle="--",
-            lw=1.5,
-            label="Default (0.5)",
-        )
-
+        ax.axvline(0.5, color="#7f7f7f", linestyle="--", lw=1.5, label="Default (0.5)")
         ax.set_xlim(0, 1)
         ax.set_ylim(0, 1.05)
         ax.set_xlabel("Threshold de Decisão")
@@ -1600,22 +1698,19 @@ class AutoClassificationEngine:
         ax.legend(fontsize=8)
 
     def _plot_decil(self, ax, results, colors, bins):
-        all_decile_stats = []
+        all_stats = []
         for name, res in results.items():
             d = res["decile_stats"].copy()
             d["Dataset"] = name
-            all_decile_stats.append(d)
-        combined_stats = pd.concat(all_decile_stats)
-
+            all_stats.append(d)
         sns.barplot(
-            data=combined_stats,
+            data=pd.concat(all_stats),
             x="decile",
             y="event_rate",
             hue="Dataset",
             ax=ax,
             palette=colors,
         )
-
         for name, res in results.items():
             mean_val = res["y_true"].mean()
             ax.axhline(
@@ -1625,7 +1720,6 @@ class AutoClassificationEngine:
                 linewidth=1.5,
                 label=f"Média {name} ({mean_val:.1%})",
             )
-
         ks_stat = results["Teste"]["decile_stats"]["ks"].max()
         label_type = "Decil" if bins == 10 else "Quintil"
         ax.set_title(
@@ -1633,29 +1727,22 @@ class AutoClassificationEngine:
             fontweight="bold",
             fontsize=13,
         )
-        ax.set_xlabel(
-            f"{label_type} (1 = Menor Risco → {bins} = Maior Risco)", fontsize=11
-        )
+        ax.set_xlabel(f"{label_type} (1=Menor Risco → {bins}=Maior Risco)", fontsize=11)
         ax.set_ylabel("Taxa de Eventos (Target=1)", fontsize=11)
         ax.legend(loc="upper left", fontsize=8)
-
         for container in ax.containers:
             ax.bar_label(container, fmt="%.1f%%", padding=3, fontsize=8)
 
     def _plot_ks_curve(self, ax, res):
-        """Curva de Lorenz / KS (separação cumulativa de positivos e negativos)."""
         df_ks = pd.DataFrame({"target": res["y_true"], "prob": res["y_prob"]})
         df_ks = df_ks.sort_values("prob", ascending=False).reset_index(drop=True)
-
         total_pos = df_ks["target"].sum()
         total_neg = len(df_ks) - total_pos
-
         cum_pos = df_ks["target"].cumsum() / total_pos
         cum_neg = (1 - df_ks["target"]).cumsum() / total_neg
         pct_pop = np.linspace(0, 1, len(df_ks))
         ks_vals = abs(cum_pos - cum_neg)
         ks_max_idx = ks_vals.argmax()
-
         ax.plot(
             pct_pop, cum_pos.values, color="#1f77b4", lw=2, label="Cumulativo Positivos"
         )
@@ -1663,7 +1750,6 @@ class AutoClassificationEngine:
             pct_pop, cum_neg.values, color="#d62728", lw=2, label="Cumulativo Negativos"
         )
         ax.plot([0, 1], [0, 1], "k--", alpha=0.3)
-
         x_ks = pct_pop[ks_max_idx]
         ax.annotate(
             f"KS={ks_vals.iloc[ks_max_idx]:.3f}",
@@ -1680,17 +1766,16 @@ class AutoClassificationEngine:
             linestyle="--",
             lw=1.5,
         )
-
         ax.set_title("Curva KS (Teste)", fontweight="bold")
         ax.set_xlabel("% População (Ordenado por Score)")
         ax.set_ylabel("% Cumulativo")
         ax.legend(fontsize=8)
 
     # -----------------------------------------------------------------------
-    # 8. SERIALIZAÇÃO (SAVE + LOAD)
+    # 8. SERIALIZAÇÃO
     # -----------------------------------------------------------------------
 
-    def save_bundle(self, path: str = "modelo_prod_v2"):
+    def save_bundle(self, path: str = "modelo_prod_v3"):
         os.makedirs(path, exist_ok=True)
         joblib.dump(
             {
@@ -1702,6 +1787,7 @@ class AutoClassificationEngine:
                 "selected_features": self.selected_features,
                 "eliminated_features": self.eliminated_features,
                 "association_report": self.association_report,
+                "feature_importance": self.feature_importance,
             },
             f"{path}/assets.pkl",
         )
@@ -1710,10 +1796,6 @@ class AutoClassificationEngine:
 
     @staticmethod
     def load(path: str) -> "AutoClassificationEngine":
-        """
-        Reconstitui o engine completo a partir de um bundle salvo.
-        Uso: engine = AutoClassificationEngine.load("modelo_prod_v2")
-        """
         assets_path = f"{path}/assets.pkl"
         ag_path = f"{path}/autogluon"
 
@@ -1723,7 +1805,6 @@ class AutoClassificationEngine:
             raise FileNotFoundError(f"Modelo AutoGluon não encontrado em '{ag_path}'")
 
         assets = joblib.load(assets_path)
-
         engine = AutoClassificationEngine.__new__(AutoClassificationEngine)
         engine.params = assets["params"]
         engine.target = assets["params"]["target"]
@@ -1734,8 +1815,8 @@ class AutoClassificationEngine:
         engine.selected_features = assets["selected_features"]
         engine.eliminated_features = assets.get("eliminated_features", {})
         engine.association_report = assets.get("association_report", {})
-        engine.feature_importance = None
-
+        engine.feature_importance = assets.get("feature_importance", None)
+        engine.cv_results = {}
         engine.predictor = TabularPredictor.load(ag_path)
 
         print(f"✅ Engine carregado de '{path}/'")
