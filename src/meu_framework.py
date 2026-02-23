@@ -1,20 +1,26 @@
 # ============================================================================
-# AutoClassificationEngine v0.0.3 — Trailblazer
-# Correções aplicadas vs v0.0.2:
-#   [FIX-1]  Leakage no importance filter — agora usa holdout interno separado
+# AutoClassificationEngine v0.0.4 — Trailblazer
+# Correções aplicadas vs v0.0.3:
+#   [FIX-10] Split movido para ANTES do _sanity_check e _handle_multicollinearity.
+#            Ambos usam o target para calcular associações (Theil's U, Pearson,
+#            Eta²) — logo só podem rodar no df_core. O df_tuning recebe apenas
+#            o drop das colunas eliminadas pelo df_core, sem influenciar as
+#            decisões de seleção.
+#   [FIX-11] Importance filter reutiliza tuning_final como holdout em vez de
+#            fatiar df_core novamente. Elimina o segundo split consecutivo que
+#            reduzia o treino de importância a ~68% do dataset e tornava o filtro
+#            instável em datasets pequenos. importance_holdout_fraction removido.
+#
+# Correções herdadas da v0.0.3:
+#   [FIX-1]  Leakage no importance filter — holdout separado do treino
 #   [FIX-2]  tuning_data passado ao AutoGluon para early stopping real
-#   [FIX-3]  Transformações aprendidas SOMENTE no train_core (não no split inteiro)
+#   [FIX-3]  Transformações aprendidas SOMENTE no train_core
 #   [FIX-4]  feature_importance populado automaticamente no fit()
-#   [FIX-5]  leakage_threshold agora configurável via params
-#   [FIX-6]  log1p seguro — verifica não-negatividade antes de aplicar
+#   [FIX-5]  leakage_threshold configurável via params
+#   [FIX-6]  log1p seguro — shift antes de aplicar se coluna ficar negativa
 #   [FIX-7]  positive_class sobrescrevível via params
-#   [FIX-8]  cross_validate() alerta sobre leakage de seleção de features
-#   [FIX-9]  dynamic_stacking=False como default (anti-overfitting em datasets pequenos)
-#   [NEW-1]  Parâmetro tuning_data_fraction (default 0.15)
-#   [NEW-2]  Parâmetro importance_holdout_fraction (default 0.20)
-#   [NEW-3]  Parâmetro leakage_threshold (default 0.98)
-#   [NEW-4]  Parâmetro positive_class (default None → AutoGluon decide)
-#   [NEW-5]  Método compute_feature_importance() público
+#   [FIX-8]  cross_validate() alerta sobre viés de seleção de features
+#   [FIX-9]  dynamic_stacking=False como default anti-overfitting
 # ============================================================================
 # %pip install "autogluon>=1.0.0" "scikit-learn>=1.3.0" "pandas>=2.0.0"
 #              "scipy>=1.9.0" "matplotlib>=3.7.0" "seaborn>=0.12.0" "joblib>=1.3.0"
@@ -54,7 +60,7 @@ from sklearn.model_selection import StratifiedKFold, train_test_split
 
 
 # ============================================================================
-# EXEMPLO DE CONFIGURAÇÃO RECOMENDADA (v0.0.3)
+# EXEMPLO DE CONFIGURAÇÃO RECOMENDADA (v0.0.4)
 # ============================================================================
 # key_params = {
 #     # --- Obrigatório ---
@@ -62,37 +68,34 @@ from sklearn.model_selection import StratifiedKFold, train_test_split
 #
 #     # --- Métrica e preset ---
 #     "eval_metric": "roc_auc",          # f1 | roc_auc | average_precision | log_loss
-#     "presets": "high_quality",          # [MUDANÇA] era best_quality → high_quality
-#                                         #  best_quality faz stacking profundo e overfita
-#                                         #  em datasets < 50k linhas.
+#     "presets": "high_quality",          # best_quality faz stacking profundo e overfita
+#                                         # em datasets < 50k linhas. Use high_quality.
 #
 #     # --- Budget de tempo ---
-#     "time_limit": 600,                  # segundos para o treino final
+#     "time_limit": 600,
 #     "num_cpus": 6,
 #
-#     # --- Anti-overfitting (NOVOS) ---
-#     "tuning_data_fraction": 0.15,       # [NOVO] fracão separada como holdout para
-#                                         #  AutoGluon parar modelos no momento certo.
-#                                         #  Use 0.0 para desativar.
-#     "dynamic_stacking": False,          # [MUDANÇA] era implicitamente True.
-#                                         #  False = sem stacking dinâmico → muito menos
-#                                         #  overfitting em datasets pequenos.
-#     "num_bag_folds": 8,                 # bagging com 8 folds (interno do AutoGluon)
+#     # --- Anti-overfitting ---
+#     "tuning_data_fraction": 0.15,       # Separa 15% como holdout para early stopping
+#                                         # do AutoGluon. Use 0.0 para desativar.
+#     "dynamic_stacking": False,          # False = sem stacking dinâmico. Muito menos
+#                                         # overfitting em datasets pequenos.
+#     "num_bag_folds": 8,
 #     "num_bag_sets": 1,
 #
-#     # --- Seleção de features (corrigido) ---
-#     "use_importance_filter": True,
-#     "importance_holdout_fraction": 0.20, # [NOVO] usa 20% do train_core para avaliar
-#                                          #  importância — evita leakage do filtro
+#     # --- Seleção de features ---
+#     "use_importance_filter": True,      # Treina no df_core, avalia no df_tuning.
+#                                         # Não há mais importance_holdout_fraction —
+#                                         # o tuning holdout é reutilizado. [FIX-11]
 #
 #     # --- Pré-processamento ---
 #     "handle_outliers": True,
 #     "use_sklearn_pipeline": True,
-#     "leakage_threshold": 0.98,           # [NOVO] era hardcoded
-#     "corr_threshold": 0.90,             # threshold de colinearidade
+#     "leakage_threshold": 0.98,
+#     "corr_threshold": 0.90,
 #
 #     # --- Identificação da classe positiva ---
-#     "positive_class": 1,                # [NOVO] None = AutoGluon decide sozinho
+#     "positive_class": 1,                # None = AutoGluon decide sozinho
 #
 #     # --- Opcional ---
 #     "prune_models": False,
@@ -577,36 +580,42 @@ class AutoClassificationEngine:
         """
         Pipeline de treino com anti-overfitting:
 
-          1. Limpeza + Sanity Check + Multicolinearidade (dataset completo — OK,
-             essas etapas não usam o target de forma supervisionada)
-          2. Split estratificado → train_core + tuning_holdout  [FIX-2, FIX-3]
-          3. Temporal + RareLabels + Outliers aprendidos SOMENTE no train_core
-          4. Relatório de associações
-          5. Importance filter com holdout separado do train_core  [FIX-1]
-          6. Pipeline sklearn fit no train_core
-          7. AutoGluon fit(train_core, tuning_data=tuning_holdout)  [FIX-2]
-          8. Feature importance calculado no tuning_holdout  [FIX-4]
+          1. Limpeza básica + features temporais (dataset completo — sem uso de target)
+          2. Split estratificado → df_core + df_tuning  [FIX-10]
+          3. Sanity check + multicolinearidade SOMENTE no df_core  [FIX-10]
+             df_tuning recebe apenas o drop das colunas eliminadas
+          4. RareLabels + Outliers aprendidos no df_core, aplicados em ambos
+          5. Relatório de associações (no df_core)
+          6. Importance filter — pré-treino no df_core, avaliação no tuning_final  [FIX-11]
+          7. Pipeline sklearn fit no df_core
+          8. AutoGluon fit(df_core, tuning_data=tuning_final)  [FIX-2]
+          9. Feature importance calculado no tuning_final  [FIX-4]
 
         Parâmetros
         ----------
         time_limit : int
             Segundos para o AutoGluon. None → usa params["time_limit"] ou 300s.
         """
-        print("\n🚀 --- TREINAMENTO INICIADO (v0.0.3) ---")
+        print("\n🚀 --- TREINAMENTO INICIADO (v0.0.4) ---")
 
         if time_limit is None:
             time_limit = self.params.get("time_limit", 300)
 
         # ------------------------------------------------------------------
-        # ETAPA 1: Pré-processamento independente de target
+        # ETAPA 1: Limpeza básica — sem uso do target, safe no dataset completo
         # ------------------------------------------------------------------
         df = self._standardize_and_clean(train_data)
-        df = self._sanity_check(df)
-        df = self._handle_multicollinearity(df)
         df = self._extract_temporal_features(df)
 
         # ------------------------------------------------------------------
-        # ETAPA 2: Split estratificado train_core / tuning_holdout  [FIX-2, FIX-3]
+        # ETAPA 2: Split estratificado ANTES do sanity check  [FIX-10]
+        #
+        # _sanity_check e _handle_multicollinearity calculam associações com
+        # o target (Theil's U, Pearson, Eta²). Rodar no dataset completo
+        # faria o df_tuning influenciar quais features existem — contaminando
+        # o holdout que o AutoGluon usa para early stopping.
+        # Solução: split primeiro; sanity/multicolinearidade só no df_core.
+        # O df_tuning apenas recebe o drop das colunas eliminadas.
         # ------------------------------------------------------------------
         tuning_frac = self.params.get("tuning_data_fraction", 0.15)
         df_tuning = None
@@ -624,7 +633,6 @@ class AutoClassificationEngine:
                     f"  (fração={tuning_frac:.0%})"
                 )
             except ValueError:
-                # Pode falhar com classes muito raras; usa o dataset completo
                 print(
                     "⚠️  Split estratificado falhou (classes raras?). Usando dataset completo."
                 )
@@ -634,7 +642,18 @@ class AutoClassificationEngine:
             df_core = df
 
         # ------------------------------------------------------------------
-        # ETAPA 3: Transformações aprendidas SOMENTE no train_core  [FIX-3]
+        # ETAPA 3: Sanity check e multicolinearidade — SOMENTE no df_core  [FIX-10]
+        # ------------------------------------------------------------------
+        df_core = self._sanity_check(df_core)
+        df_core = self._handle_multicollinearity(df_core)
+
+        # df_tuning recebe apenas o drop das colunas eliminadas (sem recalcular)
+        if df_tuning is not None:
+            cols_to_keep = [c for c in df_tuning.columns if c in df_core.columns]
+            df_tuning = df_tuning[cols_to_keep]
+
+        # ------------------------------------------------------------------
+        # ETAPA 4: Transformações aprendidas SOMENTE no train_core  [FIX-3]
         # ------------------------------------------------------------------
         df_core = self._handle_rare_labels(df_core, is_train=True)
         if self.params.get("handle_outliers", True):
@@ -647,7 +666,7 @@ class AutoClassificationEngine:
                 df_tuning = self._handle_outliers_and_log(df_tuning, is_train=False)
 
         # ------------------------------------------------------------------
-        # ETAPA 4: Associações (calculadas no train_core)
+        # ETAPA 5: Associações (calculadas no df_core)
         # ------------------------------------------------------------------
         self.selected_features = [c for c in df_core.columns if c != self.target]
         X_core = df_core[self.selected_features]
@@ -658,32 +677,32 @@ class AutoClassificationEngine:
         print("   ✅ Relatório de associações pronto.")
 
         # ------------------------------------------------------------------
-        # ETAPA 5: Importance Filter com holdout INTERNO  [FIX-1]
+        # ETAPA 6: Importance Filter — treina no df_core, avalia no df_tuning  [FIX-11]
+        #
+        # v0.0.3 fazia um segundo train_test_split dentro do df_core, reduzindo
+        # o treino de importância para ~68% do dataset original (com splits de
+        # 15% + 20%). Agora reutilizamos o df_tuning que já existe: é um holdout
+        # limpo, estratificado, e não gasta nem uma linha a mais do df_core.
+        #
+        # IMPORTANTE: usamos df_tuning e não tuning_final porque o pre_predictor
+        # é treinado em X_core (antes do sklearn pipeline). O holdout de avaliação
+        # precisa estar no mesmo formato — df_tuning já passou por rare_labels e
+        # outliers, mas ainda não pelo sklearn pipeline. Formatos consistentes.
+        #
+        # Se df_tuning não existir (tuning_frac=0), usa df_core inteiro como
+        # fallback (menos ideal, mas evita o duplo corte da v0.0.3).
         # ------------------------------------------------------------------
         chosen_metric = self.params.get("eval_metric", "f1")
 
         if self.params.get("use_importance_filter", False):
-            print("\n🔍 Importance Filter — pré-treino com holdout interno...")
-
-            imp_frac = self.params.get("importance_holdout_fraction", 0.20)
-            try:
-                X_imp_tr, X_imp_val, y_imp_tr, y_imp_val = train_test_split(
-                    X_core,
-                    y_core,
-                    test_size=imp_frac,
-                    stratify=y_core,
-                    random_state=42,
-                )
-            except ValueError:
-                X_imp_tr, X_imp_val = X_core, X_core
-                y_imp_tr, y_imp_val = y_core, y_core
-                print("   ⚠️  Split de importância falhou, usando train_core inteiro.")
+            print(
+                "\n🔍 Importance Filter — pré-treino no df_core, avaliação no df_tuning..."
+            )
 
             pre_time = min(60, max(20, time_limit // 6))
-            train_imp = X_imp_tr.copy()
-            train_imp[self.target] = y_imp_tr.values
+            train_imp = X_core.copy()
+            train_imp[self.target] = y_core.values
 
-            # Usamos bagging leve para que o AutoGluon calcule importância OOF
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
                 logging.disable(logging.CRITICAL)
@@ -699,10 +718,20 @@ class AutoClassificationEngine:
                 )
                 logging.disable(logging.NOTSET)
 
-            # Avalia importância no holdout separado  [FIX-1]
-            val_imp = X_imp_val.copy()
-            val_imp[self.target] = y_imp_val.values
-            fi = pre_predictor.feature_importance(val_imp)
+            # Monta holdout de avaliação a partir do df_tuning (pré-pipeline)  [FIX-11]
+            if df_tuning is not None:
+                fi_eval_data = df_tuning[
+                    [c for c in self.selected_features if c in df_tuning.columns]
+                    + [self.target]
+                ].copy()
+                print(
+                    "   ✅ Avaliando importância no df_tuning (holdout limpo, pré-pipeline)."
+                )
+            else:
+                fi_eval_data = train_imp
+                print("   ⚠️  df_tuning indisponível — avaliando no df_core (fallback).")
+
+            fi = pre_predictor.feature_importance(fi_eval_data)
 
             good_features = fi[
                 (fi["importance"].abs() > 0) & (fi["p_value"] < 0.05)
@@ -730,7 +759,7 @@ class AutoClassificationEngine:
         )
 
         # ------------------------------------------------------------------
-        # ETAPA 6: Pipeline sklearn (fit somente no train_core)
+        # ETAPA 7: Pipeline sklearn (fit somente no df_core)
         # ------------------------------------------------------------------
         if self.params.get("use_sklearn_pipeline", True):
             self.pipeline = self._build_sklearn_pipeline(X_core)
@@ -782,8 +811,11 @@ class AutoClassificationEngine:
         }
 
         # Passa tuning_data se disponível  [FIX-2]
+        # use_bag_holdout=True é obrigatório quando bagged mode está ativo
+        # (high_quality / num_bag_folds > 0) — sem ele o AutoGluon rejeita o split.
         if tuning_final is not None:
             fit_kwargs["tuning_data"] = tuning_final
+            fit_kwargs["use_bag_holdout"] = True
 
         # Parâmetros opcionais de bagging/stacking
         for key in ["dynamic_stacking", "num_bag_folds", "num_bag_sets"]:
