@@ -84,9 +84,42 @@ from sklearn.model_selection import StratifiedKFold, train_test_split
 #     "num_bag_sets": 1,
 #
 #     # --- Seleção de features ---
-#     "use_importance_filter": True,      # Treina no df_core, avalia no df_tuning.
-#                                         # Não há mais importance_holdout_fraction —
-#                                         # o tuning holdout é reutilizado. [FIX-11]
+#     "use_importance_filter": True,
+#     #
+#     # importance_pvalue_threshold — quão exigente o filtro de features deve ser.
+#     #
+#     # O AutoGluon mede a importância de cada feature por permutação e calcula
+#     # um p-value: a probabilidade de que a importância observada seja apenas
+#     # ruído aleatório. Quanto menor o p-value, mais confiante que a feature
+#     # é genuinamente útil.
+#     #
+#     # Valores e quando usar cada um:
+#     #
+#     #   0.05 → Exigente. Só mantém features com sinal forte e estatisticamente
+#     #          significativo. Ideal para datasets grandes (> 10k linhas).
+#     #          ⚠️ Em datasets pequenos, features reais como 'fare' no Titanic
+#     #          podem ser cortadas simplesmente por falta de amostras para
+#     #          estimar a importância com confiança. Não use abaixo de ~2k linhas.
+#     #
+#     #   0.10 → Moderado. Bom ponto de partida para datasets médios (2k–10k).
+#     #          Equilibra remoção de ruído e retenção de features fracas-mas-reais.
+#     #
+#     #   0.20 → Relaxado. Recomendado para datasets pequenos (< 2k linhas).
+#     #          Aceita features com sinal fraco, desde que a importância seja
+#     #          positiva. Evita o problema do Titanic (fare/title removidos
+#     #          incorretamente com threshold 0.05).
+#     #
+#     #   None → Desativa o critério de p-value. Mantém qualquer feature com
+#     #          importância > 0, sem exigir significância estatística.
+#     #          Use quando o dataset for muito pequeno (< 500 linhas) ou quando
+#     #          você quiser a intervenção mínima possível do filtro.
+#     #
+#     # Regra prática rápida:
+#     #   < 1k linhas  →  None  ou  0.20
+#     #   1k – 10k     →  0.10  ou  0.20
+#     #   > 10k        →  0.05  ou  0.10
+#     #
+#     "importance_pvalue_threshold": 0.20,  # ← ajuste aqui conforme o tamanho do dataset
 #
 #     # --- Pré-processamento ---
 #     "handle_outliers": True,
@@ -733,9 +766,23 @@ class AutoClassificationEngine:
 
             fi = pre_predictor.feature_importance(fi_eval_data)
 
-            good_features = fi[
-                (fi["importance"].abs() > 0) & (fi["p_value"] < 0.05)
-            ].index.tolist()
+            # Lê o threshold configurado pelo usuário
+            pvalue_thr = self.params.get("importance_pvalue_threshold", 0.05)
+
+            if pvalue_thr is None:
+                # Modo permissivo: mantém qualquer feature com importância > 0,
+                # sem exigir significância estatística. Recomendado para datasets
+                # muito pequenos (< 500 linhas) onde o p-value é completamente instável.
+                good_features = fi[fi["importance"] > 0].index.tolist()
+                print(f"   📌 Critério: importância > 0  (p-value desativado via None)")
+            else:
+                # Modo padrão: importância positiva E p-value abaixo do threshold.
+                # Threshold maior → mais permissivo → mais features retidas.
+                # Threshold menor → mais exigente  → menos features retidas.
+                good_features = fi[
+                    (fi["importance"] > 0) & (fi["p_value"] < pvalue_thr)
+                ].index.tolist()
+                print(f"   📌 Critério: importância > 0  AND  p_value < {pvalue_thr}")
 
             removed = set(self.selected_features) - set(good_features)
             self.eliminated_features["importancia_nula"] = list(removed)
