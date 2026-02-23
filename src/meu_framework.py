@@ -134,6 +134,36 @@ from sklearn.model_selection import StratifiedKFold, train_test_split
 #     "prune_models": False,
 #     "features_to_exclude": [],
 #     "force_types": {},
+#
+#     # --- Controle de disco (útil em Databricks / ambientes com espaço limitado) ---
+#
+#     "save_space": True,
+#     # Remove artefatos intermediários dos modelos após o treino para economizar
+#     # espaço em disco. Desvantagem: alguns métodos como refit_full e
+#     # feature_importance podem ficar indisponíveis após salvar o bundle.
+#     # Default: False
+#
+#     "keep_only_best": True,
+#     # Mantém em disco apenas o melhor modelo do ensemble, descartando todos
+#     # os outros. Reduz muito o espaço usado. Combine com save_space=True para
+#     # máxima economia. Desvantagem: perde a capacidade de inspecionar modelos
+#     # individuais depois do treino.
+#     # Default: False
+#
+#     # --- Feature engineering customizado ---
+#
+#     "feature_generator": custom_feature_generator,
+#     # Substitui o pipeline de geração de features padrão do AutoGluon.
+#     # Útil para desativar n-grams de texto ou features especiais automáticas.
+#     # Crie o gerador antes de instanciar o engine:
+#     #
+#     #   from autogluon.features.generators import AutoMLPipelineFeatureGenerator
+#     #   custom_feature_generator = AutoMLPipelineFeatureGenerator(
+#     #       enable_text_ngram_features=False,
+#     #       enable_text_special_features=False,  # desativa char_count, word_count, etc.
+#     #   )
+#     #
+#     # Default: None (usa o pipeline padrão do AutoGluon)
 # }
 # ============================================================================
 
@@ -877,10 +907,61 @@ class AutoClassificationEngine:
                 "Override via params['dynamic_stacking'] se necessário."
             )
 
+        # ------------------------------------------------------------------
+        # Parâmetros opcionais de controle de disco e memória
+        #
+        # "save_space" (bool, default False)
+        #   Remove artefatos intermediários dos modelos após o treino para
+        #   economizar espaço em disco. Útil em ambientes com pouco espaço
+        #   (ex: Databricks com volume limitado). Desvantagem: alguns métodos
+        #   como refit_full e feature_importance podem ficar indisponíveis.
+        #
+        # "keep_only_best" (bool, default False)
+        #   Mantém em disco apenas o melhor modelo do ensemble, descartando
+        #   todos os outros. Reduz drasticamente o espaço usado, mas elimina
+        #   a possibilidade de inspecionar ou comparar modelos individuais
+        #   depois. Combine com save_space=True para máxima economia.
+        # ------------------------------------------------------------------
+        for key in ["save_space", "keep_only_best"]:
+            if key in self.params:
+                fit_kwargs[key] = self.params[key]
+
+        if self.params.get("save_space") or self.params.get("keep_only_best"):
+            print(
+                f"   💾 save_space={self.params.get('save_space', False)} | "
+                f"keep_only_best={self.params.get('keep_only_best', False)}"
+            )
+
+        # ------------------------------------------------------------------
+        # Parâmetro opcional de feature engineering customizado
+        #
+        # "feature_generator" (AutoMLPipelineFeatureGenerator ou similar)
+        #   Substitui o pipeline de geração de features padrão do AutoGluon.
+        #   Use quando quiser desativar n-grams de texto, features especiais,
+        #   ou qualquer outra transformação automática que o AutoGluon faria.
+        #
+        #   Exemplo de uso:
+        #     from autogluon.features.generators import AutoMLPipelineFeatureGenerator
+        #     custom_fg = AutoMLPipelineFeatureGenerator(
+        #         enable_text_ngram_features=False,
+        #         enable_text_special_features=False,
+        #     )
+        #     params["feature_generator"] = custom_fg
+        #
+        #   Passa direto para TabularPredictor(feature_generator=...) na
+        #   inicialização — não vai para o fit(), que é o lugar correto.
+        # ------------------------------------------------------------------
+        predictor_kwargs = {}
+        if "feature_generator" in self.params:
+            predictor_kwargs["feature_generator"] = self.params["feature_generator"]
+            print("   🔧 feature_generator customizado ativo.")
+
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             self.predictor = TabularPredictor(
-                label=self.target, eval_metric=chosen_metric
+                label=self.target,
+                eval_metric=chosen_metric,
+                **predictor_kwargs,
             ).fit(train_final, **fit_kwargs)
 
         # ------------------------------------------------------------------
