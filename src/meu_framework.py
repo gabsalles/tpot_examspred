@@ -951,9 +951,22 @@ class AutoClassificationEngine:
         #   Passa direto para TabularPredictor(feature_generator=...) na
         #   inicialização — não vai para o fit(), que é o lugar correto.
         # ------------------------------------------------------------------
-        predictor_kwargs = {}
+        # predictor_kwargs = {}
+        # if "feature_generator" in self.params:
+        #     predictor_kwargs["feature_generator"] = self.params["feature_generator"]
+        #     print("   🔧 feature_generator customizado ativo.")
+
+        # with warnings.catch_warnings():
+        #     warnings.simplefilter("ignore")
+        #     self.predictor = TabularPredictor(
+        #         label=self.target,
+        #         eval_metric=chosen_metric,
+        #         **predictor_kwargs,
+        #     ).fit(train_final, **fit_kwargs)
+
+        # Adiciona o feature generator aos parâmetros do fit() em vez do construtor
         if "feature_generator" in self.params:
-            predictor_kwargs["feature_generator"] = self.params["feature_generator"]
+            fit_kwargs["feature_generator"] = self.params["feature_generator"]
             print("   🔧 feature_generator customizado ativo.")
 
         with warnings.catch_warnings():
@@ -961,8 +974,9 @@ class AutoClassificationEngine:
             self.predictor = TabularPredictor(
                 label=self.target,
                 eval_metric=chosen_metric,
-                **predictor_kwargs,
-            ).fit(train_final, **fit_kwargs)
+            ).fit(
+                train_final, **fit_kwargs
+            )  # <--- AGORA VAI ENTRAR AQUI
 
         # ------------------------------------------------------------------
         # ETAPA 8: Feature importance no tuning_holdout  [FIX-4]
