@@ -197,31 +197,53 @@ def _build_rule_defs(
     df: DataFrame,
     columns: dict,
     skip_rules: dict,
+    column_groups: list,
 ) -> tuple[list[dict], dict]:
     """
     Constrói a lista flat de rule_defs combinando:
-    - Colunas declaradas explicitamente → tipo declarado
-    - Colunas não declaradas → inferência pelo tipo Spark
-    - texto_opcional → pula a coluna
-    - skip_rules → remove regras específicas
+    - column_groups  → regras em lote para listas de colunas
+    - columns        → declarações individuais (sobrescreve grupos e inferência)
+    - não declaradas → inferência pelo tipo Spark
+    - texto_opcional → opta a coluna pra fora
+    - skip_rules     → remove regras específicas de uma coluna
 
     Retorna (rule_defs, col_type_map)
     """
     rule_defs = []
     col_type_map = {}
     skip = skip_rules or {}
-    declared = set(columns.keys())
 
     # Schema do DataFrame: col_name → spark_type
     schema_map = {field.name: field.dataType for field in df.schema.fields}
 
-    all_columns = list(schema_map.keys())
+    # Expande column_groups em um dicionário coluna → config
+    # (mesma estrutura do `columns` individual)
+    groups_expanded = {}
+    for group in column_groups or []:
+        col_type = group.get("type")
+        if col_type not in COLUMN_TYPES:
+            raise ValueError(
+                f"Tipo desconhecido no group: '{col_type}'. "
+                f"Disponíveis: {list(COLUMN_TYPES.keys())}"
+            )
+        # Configurações extras do grupo (ex: max_value, freshness_days, accepted_values)
+        group_cfg = {k: v for k, v in group.items() if k != "columns"}
+        for col_name in group["columns"]:
+            if col_name not in schema_map:
+                raise ValueError(
+                    f"Coluna '{col_name}' declarada no column_group "
+                    f"não existe no DataFrame."
+                )
+            groups_expanded[col_name] = group_cfg
 
-    for col_name in all_columns:
+    # columns individual tem prioridade sobre groups_expanded
+    declared = {**groups_expanded, **columns}
+
+    for col_name in schema_map.keys():
         skipped = skip.get(col_name, [])
 
         if col_name in declared:
-            col_cfg = columns[col_name]
+            col_cfg = declared[col_name]
             col_type = col_cfg.get("type")
 
             if col_type not in COLUMN_TYPES:
@@ -510,6 +532,7 @@ def run_dq_checks(spark: SparkSession, checks: list[dict]) -> DataFrame:
         columns = check.get("columns", {})
         extra_rules = check.get("extra_rules", [])
         skip_rules = check.get("skip_rules", {})
+        column_groups = check.get("column_groups", [])
 
         total_rows = df.count()
         n_declared = len(columns)
@@ -523,7 +546,9 @@ def run_dq_checks(spark: SparkSession, checks: list[dict]) -> DataFrame:
             f"{len(df.columns) - n_declared} inferidas automaticamente"
         )
 
-        rule_defs, col_type_map = _build_rule_defs(df, columns, skip_rules)
+        rule_defs, col_type_map = _build_rule_defs(
+            df, columns, skip_rules, column_groups
+        )
         rule_defs += extra_rules
 
         for rule_def in rule_defs:
@@ -598,27 +623,27 @@ if __name__ == "__main__":
             "table_name": "clientes",
             "df": df_clientes,
         },
-        # ── Declarando só as exceções e tipos especiais ───────────
+        # ── Usando column_groups para aplicar regras em lote ──────
         {
             "table_name": "pedidos",
             "df": df_pedidos,
+            "column_groups": [
+                # Todas as colunas da lista recebem o mesmo tipo
+                {"columns": ["pedido_id"], "type": "id"},
+                {"columns": ["valor"], "type": "monetario", "max_value": 10000},
+                {"columns": ["dt_pedido"], "type": "data_evento", "freshness_days": 30},
+            ],
+            # Declarações individuais sobrescrevem o grupo quando necessário
             "columns": {
-                # Garante unique (não inferido automaticamente)
-                "pedido_id": {"type": "id"},
-                # Referential — precisa de params, não dá pra inferir
                 "cliente_id": {
                     "type": "chave_estrangeira",
                     "ref_df": df_clientes,
                     "ref_column": "id",
                 },
-                # Lista de valores válidos — precisa ser declarado
                 "status": {
                     "type": "categoria",
                     "accepted_values": ["PAGO", "PENDENTE", "CANCELADO"],
                 },
-                # Monetário com teto — não quero not_negative genérico, quero max_value
-                "valor": {"type": "monetario", "max_value": 10000},
-                # dt_pedido não declarado → inferido como data → not_null + freshness_days(30)
             },
             # Regra de negócio extra
             "extra_rules": [
