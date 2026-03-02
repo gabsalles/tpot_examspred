@@ -230,10 +230,9 @@ def _build_rule_defs(
         group_cfg = {k: v for k, v in group.items() if k != "columns"}
         for col_name in group["columns"]:
             if col_name not in schema_map:
-                raise ValueError(
-                    f"Coluna '{col_name}' declarada no column_group "
-                    f"não existe no DataFrame."
-                )
+                # O DataFrame não possui esta coluna.
+                # Ignoramos silenciosamente para permitir regras globais genéricas.
+                continue
             groups_expanded[col_name] = group_cfg
 
     # columns individual tem prioridade sobre groups_expanded
