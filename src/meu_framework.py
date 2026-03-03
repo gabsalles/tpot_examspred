@@ -748,11 +748,17 @@ class AutoClassificationEngine:
 
                 # SimpleImputer — valores de imputação por coluna
                 if hasattr(step, "statistics_") and step.statistics_ is not None:
-                    imputed = {
-                        c: round(float(v), 4)
-                        for c, v in zip(cols, step.statistics_)
-                        if not np.isnan(float(v))
-                    }
+                    imputed = {}
+                    for c, v in zip(cols, step.statistics_):
+                        try:
+                            # Tenta tratar como número
+                            f_val = float(v)
+                            if not np.isnan(f_val):
+                                imputed[c] = round(f_val, 4)
+                        except (ValueError, TypeError):
+                            # Se for uma string (como 'MISSING'), apenas guarda o valor
+                            imputed[c] = v
+
                     if imputed:
                         print(f"        strategy={step.strategy}")
                         for c, v in list(imputed.items())[:5]:
