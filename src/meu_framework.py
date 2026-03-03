@@ -1,3 +1,5 @@
+# v0.0.7
+
 import hashlib
 import pandas as pd
 import numpy as np
