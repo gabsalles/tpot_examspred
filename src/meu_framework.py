@@ -1,4 +1,5 @@
-# v0.0.7
+# v0.0.8 Gemini
+from __future__ import annotations
 
 import hashlib
 import pandas as pd
@@ -52,6 +53,15 @@ try:
     _HAS_SMOTE = True
 except ImportError:
     _HAS_SMOTE = False
+
+import re
+import builtins as _b
+from math import ceil
+from typing import Dict, List, Optional, Union
+
+import numpy as np
+import pandas as pd
+from sklearn.feature_extraction.text import TfidfVectorizer
 
 
 # ---------------------------------------------------------------------------
@@ -2449,6 +2459,66 @@ class AutoClassificationEngine:
         ax.legend(fontsize=8)
 
     # -----------------------------------------------------------------------
+    # 8. ANÁLISE DE PERFIL (PROFILING)
+    # -----------------------------------------------------------------------
+
+    def profile_predictions(
+        self,
+        data: pd.DataFrame,
+        group_mode: str = "quantile",  # <-- Alterado o padrão para evitar conflito
+        n_quantiles: int = 10,
+        analyze_top_only: bool = True,
+        topn: int = 15,
+        min_lift: float = 1.5,
+    ):
+        if self.predictor is None:
+            raise RuntimeError(
+                "O modelo precisa ser treinado com .fit() antes de gerar o perfil."
+            )
+
+        print("\n🔍 Iniciando Análise de Perfil de Predições...")
+
+        probs = self.predict_proba(data)
+        pos_label = self._get_positive_class()
+        score_col = f"prob_{pos_label}"
+
+        df_scored = data.copy()
+        df_scored[score_col] = probs[pos_label].values
+
+        exclude = [self.target] if self.target in df_scored.columns else []
+
+        # Instancia o Analyzer sem forçar labels (deixando retornar os intervalos reais de probabilidade)
+        pa = ProfileAnalyzer(
+            df=df_scored,
+            group_mode=group_mode,
+            score_col=score_col,
+            n_quantiles=n_quantiles,
+            group_labels=None,  # <-- Segredo para não quebrar com decis vazios
+            exclude_cols=exclude,
+            add_k=0.1,
+        )
+
+        pa.fit(verbose=False)
+
+        if analyze_top_only:
+            # Pega dinamicamente o último grupo real que sobreviveu ao corte
+            top_group = pa.groups_[-1]
+            print(
+                f"\n🏆 Perfil Predominante do Grupo de Maior Risco/Probabilidade (Faixa {top_group}):"
+            )
+            perfil = pa.profile_group(
+                group_value=top_group, topn=topn, min_lift=min_lift, one_per_col=True
+            )
+            (
+                display(perfil)
+                if "display" in globals()
+                else print(perfil.to_string(index=False))
+            )
+            return perfil
+        else:
+            return pa.profile_all(topn=topn, min_lift=min_lift, one_per_col=True)
+
+    # -----------------------------------------------------------------------
     # 8. SERIALIZAÇÃO
     # -----------------------------------------------------------------------
 
@@ -2512,3 +2582,738 @@ class AutoClassificationEngine:
         if engine._train_schema:
             print(f"   📐 Schema: {len(engine._train_schema)} features esperadas")
         return engine
+
+
+"""
+ProfileAnalyzer — Perfil de Segmento Generalizado
+==================================================
+Autoria: adaptado e corrigido a partir de código de análise por decis.
+
+Suporta qualquer tipo de agrupamento:
+  - Decis de modelo (padrão)
+  - Clusters (K-Means, DBSCAN, etc.)
+  - Segmentos de negócio (RFM, canal, região)
+  - Colunas categóricas de interesse
+  - Grupos de A/B test
+
+Correções em relação ao código original:
+  1. Lift calculado em registros (não tokens) → comparável ao suporte mínimo
+  2. TF-IDF normalizado por comprimento de documento (sem viés de volume)
+  3. one_per_col usa separador correto (aplicado ANTES da limpeza visual)
+  4. Suporte expresso tanto em contagens quanto em percentual de registros
+  5. API limpa: separação clara entre pré-processamento e análise
+
+Dependências: pandas, numpy, scikit-learn
+"""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Utilitários de pré-processamento
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def make_group_column(
+    df: pd.DataFrame,
+    mode: str = "decile",
+    score_col: Optional[str] = None,
+    group_col: Optional[str] = None,
+    n_quantiles: int = 10,
+    labels: Optional[List] = None,
+) -> pd.Series:
+    """
+    Cria / valida a coluna de grupo que será analisada.
+
+    Parâmetros
+    ----------
+    mode : {"decile", "quantile", "existing", "raw"}
+        - "decile"   : qcut em score_col com n_quantiles=10
+        - "quantile" : qcut em score_col com n_quantiles customizável
+        - "existing" : usa group_col já existente no df (sem transformação)
+        - "raw"      : retorna group_col sem cast (clusters, segmentos, etc.)
+    score_col  : coluna de score para modos decile/quantile
+    group_col  : coluna já existente para modo existing/raw
+    n_quantiles: nº de quantis (modo "quantile")
+    labels     : rótulos customizados (len == n_quantiles)
+    """
+    if mode in ("existing", "raw"):
+        if group_col is None or group_col not in df.columns:
+            raise ValueError(f"group_col='{group_col}' não encontrado no DataFrame.")
+        return df[group_col].copy()
+
+    if score_col is None or score_col not in df.columns:
+        raise ValueError(f"score_col='{score_col}' não encontrado no DataFrame.")
+
+    # Se passar 'decile', fixa em 10. Se não, usa n_quantiles
+    q = 10 if mode == "decile" else n_quantiles
+
+    try:
+        return pd.qcut(df[score_col], q, labels=labels, duplicates="drop")
+    except ValueError:
+        # Se deu erro, faixas foram engolidas por terem valores idênticos.
+        # Cortamos sem labels para pegar os índices sobreviventes reais
+        s_cut = pd.qcut(df[score_col], q, labels=False, duplicates="drop")
+        return s_cut + 1
+
+
+def remove_high_cardinality(
+    df: pd.DataFrame,
+    cols: List[str],
+    max_unique_ratio: float = 0.05,
+    min_unique_abs: int = 100,
+    suspicious_keywords: Optional[List[str]] = None,
+    whitelist: Optional[List[str]] = None,
+    blacklist: Optional[List[str]] = None,
+) -> tuple[List[str], List[str], pd.DataFrame]:
+    """
+    Separa colunas úteis de colunas com alta cardinalidade ou keywords de PII.
+
+    Retorna
+    -------
+    cols_keep, cols_drop, stats_df
+    """
+    _kw = suspicious_keywords or [
+        "id",
+        "cpf",
+        "cnpj",
+        "doc",
+        "matric",
+        "registro",
+        "hash",
+        "uuid",
+        "chave",
+        "token",
+        "telefone",
+        "cel",
+        "email",
+        "rg",
+        "nome",
+        "sobrenome",
+        "advog",
+        "oab",
+    ]
+    _white = set(whitelist or [])
+    _black = set(blacklist or [])
+    n = len(df)
+
+    cols_keep, cols_drop, rows = [], [], []
+    for c in cols:
+        u = df[c].astype("string").nunique(dropna=True)
+        ratio = u / n if n > 0 else 0.0
+        kw = any(k in c.lower() for k in _kw)
+
+        if c in _black:
+            drop = True
+        elif c in _white:
+            drop = False
+        else:
+            drop = (u >= min_unique_abs and ratio >= max_unique_ratio) or kw
+
+        (cols_drop if drop else cols_keep).append(c)
+        rows.append((c, u, round(ratio, 4), kw, drop))
+
+    stats = pd.DataFrame(
+        rows, columns=["coluna", "n_unique", "unique_ratio", "kw_match", "drop"]
+    ).sort_values(["drop", "unique_ratio"], ascending=[False, False])
+    return cols_keep, cols_drop, stats
+
+
+def cap_top_k(
+    df: pd.DataFrame,
+    col: str,
+    k: int = 50,
+    other_label: str = "OUTROS",
+) -> None:
+    """Agrupa a cauda longa de uma coluna nas top-k categorias. Inplace."""
+    top = set(df[col].astype("string").value_counts(dropna=True).nlargest(k).index)
+    df[col] = df[col].where(df[col].isin(top), other_label)
+
+
+def binarize_numerics(
+    df: pd.DataFrame,
+    cols: Optional[List[str]] = None,
+    quantiles: List[float] = None,
+    exclude: Optional[List[str]] = None,
+) -> pd.DataFrame:
+    """
+    Binariza colunas numéricas em bins por quantis.
+
+    Parâmetros
+    ----------
+    cols      : lista de colunas numéricas a binarizar (None = todas)
+    quantiles : limites (padrão: [0, .25, .50, .75, 1.0] = quartis)
+    exclude   : colunas a nunca binarizar (ex.: group_col, label)
+
+    Retorna
+    -------
+    df com colunas *_bin adicionadas e originais removidas.
+    """
+    if quantiles is None:
+        quantiles = [0, 0.25, 0.50, 0.75, 1.0]
+
+    _excl = set(exclude or [])
+    _cols = (
+        cols
+        if cols is not None
+        else df.select_dtypes(include="number").columns.tolist()
+    )
+    _cols = [c for c in _cols if c not in _excl]
+
+    new_bins: Dict[str, pd.Series] = {}
+    to_drop: List[str] = []
+
+    for col in _cols:
+        try:
+            limits = np.unique(df[col].quantile(quantiles).to_numpy())
+            if len(limits) < 2:
+                continue
+            bins = pd.cut(df[col], bins=limits, include_lowest=True)
+            new_bins[f"{col}_bin"] = bins.map(
+                lambda x: f"{x.left}a{x.right}" if pd.notnull(x) else "nulo"
+            )
+            to_drop.append(col)
+        except Exception as e:
+            print(f"[binarize] Aviso: não foi possível binarizar '{col}': {e}")
+
+    result = pd.concat([df, pd.DataFrame(new_bins, index=df.index)], axis=1)
+    if to_drop:
+        result = result.drop(columns=to_drop)
+    return result
+
+
+def _to_token(series: pd.Series) -> pd.Series:
+    """Normaliza uma Series para tokens seguros (sem espaços, ponto vira _DOT_)."""
+    s = series.astype("string").fillna("nulo").str.strip()
+    s = s.str.replace(r"^(nan|none|na|null|<na>)$", "nulo", flags=re.I, regex=True)
+    s = s.str.replace(r"[\s\-]+", "_", regex=True)
+    s = s.str.replace(".", "_DOT_", regex=False)
+    return s
+
+
+def build_token_df(
+    df: pd.DataFrame,
+    feature_cols: List[str],
+) -> pd.DataFrame:
+    """
+    Transforma cada célula em 'coluna___valor' para preservar semântica da coluna.
+
+    Retorna cópia do df com apenas feature_cols convertidos para tokens.
+    """
+    out = df[feature_cols].copy()
+    for col in feature_cols:
+        out[col] = col + "___" + _to_token(out[col])
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Núcleo: cálculo de métricas POR REGISTRO (correção principal)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _compute_record_level_metrics(
+    df_tokens: pd.DataFrame,
+    group_col: pd.Series,
+    feature_cols: List[str],
+    group_value,
+    add_k: float = 0.1,
+) -> pd.DataFrame:
+    """
+    Calcula, para cada token único nas feature_cols:
+      - suporte (nº de REGISTROS distintos que possuem o token no grupo)
+      - lift em REGISTROS (não em tokens)
+      - TF-IDF do grupo vs. outros grupos (para desempate)
+
+    Isso corrige o bug original onde cnt_in somava tokens, não registros.
+    """
+    df_work = df_tokens.copy()
+    df_work["__group__"] = group_col.values
+
+    mask_in = df_work["__group__"] == group_value
+    df_in = df_work[mask_in]
+    df_out = df_work[~mask_in]
+
+    n_in = len(df_in)
+    n_out = len(df_out)
+
+    # Para cada token, conta registros únicos que o possuem
+    records: Dict[str, Dict] = {}
+    for col in feature_cols:
+        for grp_df, is_in in [(df_in, True), (df_out, False)]:
+            vc = grp_df[col].value_counts(dropna=True)
+            for token, cnt in vc.items():
+                if token not in records:
+                    records[token] = {"cnt_in": 0, "cnt_out": 0}
+                if is_in:
+                    records[token]["cnt_in"] += int(cnt)
+                else:
+                    records[token]["cnt_out"] += int(cnt)
+
+    if not records:
+        return pd.DataFrame()
+
+    df_m = pd.DataFrame.from_dict(records, orient="index").reset_index()
+    df_m.columns = ["Token_raw", "cnt_in", "cnt_out"]
+
+    V = len(df_m)
+    p_in = (df_m["cnt_in"] + add_k) / (n_in + add_k * V)
+    p_out = (df_m["cnt_out"] + add_k) / (n_out + add_k * V)
+
+    df_m["n_regs_in"] = n_in
+    df_m["n_regs_out"] = n_out
+    df_m["Pct_in"] = df_m["cnt_in"] / _b.max(n_in, 1)
+    df_m["Pct_out"] = df_m["cnt_out"] / _b.max(n_out, 1)
+    df_m["Lift"] = p_in / p_out
+
+    return df_m
+
+
+def _tfidf_group_scores(
+    df_tokens: pd.DataFrame,
+    group_col: pd.Series,
+    feature_cols: List[str],
+    group_value,
+    min_df: int = 1,
+    max_df: float = 0.95,
+) -> Dict[str, float]:
+    """
+    Calcula TF-IDF normalizado para o grupo_value vs. todos os outros grupos.
+    Cada grupo = um documento (concatenação de tokens).
+    Normalização L2 remove o viés de tamanho de documento.
+    """
+    df_work = df_tokens.copy()
+    df_work["__group__"] = group_col.values
+
+    docs = (
+        df_work.groupby("__group__")[feature_cols]
+        .apply(lambda x: " ".join(x.values.flatten().astype(str)))
+        .sort_index()
+    )
+    groups = docs.index.tolist()
+    if group_value not in groups:
+        return {}
+
+    i = groups.index(group_value)
+
+    tv = TfidfVectorizer(
+        token_pattern=r"[^ ]+",
+        lowercase=False,
+        norm="l2",  # ← normalização L2: corrige viés de volume
+        sublinear_tf=True,
+        min_df=min_df,
+        max_df=max_df,
+    )
+    Xt = tv.fit_transform(docs)
+    vocab = tv.get_feature_names_out()
+    row = Xt[i].toarray()[0]
+    return dict(zip(vocab, row))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Interface Principal
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class ProfileAnalyzer:
+    """
+    Analisa o perfil predominante de segmentos em um DataFrame.
+
+    Exemplo de uso
+    --------------
+    >>> pa = ProfileAnalyzer(
+    ...     df=df_scored,
+    ...     group_mode="decile",
+    ...     score_col="prob_churn",
+    ...     label_col="churn",
+    ...     exclude_cols=["cliente_id"],
+    ... )
+    >>> pa.fit()
+    >>> perfil = pa.profile_group(group_value=9, topn=20)  # decil 9 (maior score)
+    >>> pa.profile_all(topn=15, min_lift=2.0)
+    """
+
+    def __init__(
+        self,
+        df: pd.DataFrame,
+        # ── Agrupamento ──────────────────────────────────────────────
+        group_mode: str = "decile",  # "decile" | "quantile" | "existing" | "raw"
+        score_col: Optional[str] = None,
+        group_col: Optional[str] = None,
+        n_quantiles: int = 10,
+        group_labels: Optional[List] = None,
+        # ── Filtro de instâncias ──────────────────────────────────────
+        filter_col: Optional[str] = None,  # ex.: "tempo_ativo_4y"
+        filter_value=None,  # ex.: 1
+        # ── Colunas ──────────────────────────────────────────────────
+        label_col: Optional[str] = None,
+        exclude_cols: Optional[List[str]] = None,
+        cols_as_text: Optional[List[str]] = None,  # numéricas → tratar como cat.
+        whitelist: Optional[List[str]] = None,
+        blacklist: Optional[List[str]] = None,
+        # ── Binarização numérica ─────────────────────────────────────
+        binarize: bool = True,
+        quantile_bins: Optional[List[float]] = None,
+        # ── Cardinalidade ────────────────────────────────────────────
+        max_unique_ratio: float = 0.05,
+        min_unique_abs: int = 100,
+        cap_topk: Optional[Dict[str, int]] = None,  # {"cargo": 60}
+        # ── Parâmetros de análise ─────────────────────────────────────
+        add_k: float = 0.1,
+        min_df: int = 1,
+        max_df: float = 0.95,
+    ):
+        self.df_raw = df.copy()
+        self.group_mode = group_mode
+        self.score_col = score_col
+        self.group_col = group_col
+        self.n_quantiles = n_quantiles
+        self.group_labels = group_labels
+        self.filter_col = filter_col
+        self.filter_value = filter_value
+        self.label_col = label_col
+        self.exclude_cols = list(exclude_cols or [])
+        self.cols_as_text = list(cols_as_text or [])
+        self.whitelist = whitelist
+        self.blacklist = blacklist
+        self.binarize = binarize
+        self.quantile_bins = quantile_bins
+        self.max_unique_ratio = max_unique_ratio
+        self.min_unique_abs = min_unique_abs
+        self.cap_topk = cap_topk or {}
+        self.add_k = add_k
+        self.min_df = min_df
+        self.max_df = max_df
+
+        # Preenchidos em fit()
+        self.df_ = None
+        self.group_series_ = None
+        self.feature_cols_ = None
+        self.df_tokens_ = None
+        self.groups_ = None
+
+    # ── Pré-processamento ─────────────────────────────────────────────────────
+
+    def fit(self, verbose: bool = True) -> "ProfileAnalyzer":
+        """Prepara o DataFrame interno: filtra, binariza, tokeniza, remove alta cardinalidade."""
+        df = self.df_raw.copy()
+
+        # 1) Filtro de instâncias
+        if self.filter_col and self.filter_value is not None:
+            df = df[df[self.filter_col] == self.filter_value].copy()
+            if verbose:
+                print(
+                    f"[fit] Filtro '{self.filter_col}=={self.filter_value}': {len(df)} registros."
+                )
+
+        # 2) Coluna de grupo
+        group = make_group_column(
+            df,
+            mode=self.group_mode,
+            score_col=self.score_col,
+            group_col=self.group_col,
+            n_quantiles=self.n_quantiles,
+            labels=self.group_labels,
+        )
+
+        # 3) Cols a excluir da análise
+        _excl = set(self.exclude_cols)
+        if self.label_col:
+            _excl.add(self.label_col)
+        if self.score_col:
+            _excl.add(self.score_col)
+        if self.group_col:
+            _excl.add(self.group_col)
+
+        # 4) Colunas numéricas → texto (não binarizar)
+        for col in self.cols_as_text:
+            if col in df.columns:
+                df[col] = df[col].astype("string")
+
+        # 5) Binarização numérica
+        if self.binarize:
+            numeric_to_bin = [
+                c
+                for c in df.select_dtypes(include="number").columns
+                if c not in _excl and c not in self.cols_as_text
+            ]
+            df = binarize_numerics(
+                df,
+                cols=numeric_to_bin,
+                quantiles=self.quantile_bins,
+                exclude=_excl,
+            )
+
+        # 6) Cap top-K categorias
+        for col, k in self.cap_topk.items():
+            if col in df.columns:
+                cap_top_k(df, col, k=k)
+
+        # 7) Colunas candidatas ao perfil
+        candidates = [c for c in df.columns if c not in _excl]
+
+        # 8) Filtro de alta cardinalidade
+        cols_keep, cols_drop, _ = remove_high_cardinality(
+            df,
+            candidates,
+            max_unique_ratio=self.max_unique_ratio,
+            min_unique_abs=self.min_unique_abs,
+            whitelist=self.whitelist,
+            blacklist=self.blacklist,
+        )
+        if verbose:
+            print(
+                f"[fit] Colunas descartadas (alta cardinalidade/PII): {len(cols_drop)}"
+            )
+            print(f"[fit] Colunas para análise: {len(cols_keep)}")
+
+        # 9) Tokenização
+        df_tok = build_token_df(df, cols_keep)
+
+        self.df_ = df
+        self.group_series_ = group.reset_index(drop=True)
+        self.feature_cols_ = cols_keep
+        self.df_tokens_ = df_tok.reset_index(drop=True)
+        self.groups_ = sorted(self.group_series_.dropna().unique())
+
+        if verbose:
+            print(f"[fit] Grupos encontrados: {self.groups_}")
+
+        return self
+
+    # ── Análise por grupo ─────────────────────────────────────────────────────
+
+    def profile_group(
+        self,
+        group_value,
+        topn: int = 20,
+        min_lift: float = 2.0,
+        min_support_pct: float = 0.01,
+        one_per_col: bool = False,
+    ) -> pd.DataFrame:
+        """
+        Retorna os topn tokens mais distintivos do grupo_value.
+
+        Parâmetros
+        ----------
+        group_value     : valor do grupo a analisar (ex.: 9 para o 10º decil)
+        topn            : máximo de linhas no resultado
+        min_lift        : lift mínimo para inclusão primária
+        min_support_pct : percentual mínimo de registros do grupo que possuem o token
+        one_per_col     : se True, retorna no máx. 1 token por coluna original
+        """
+        self._check_fitted()
+
+        # Métricas em registros (CORREÇÃO principal)
+        df_m = _compute_record_level_metrics(
+            self.df_tokens_,
+            self.group_series_,
+            self.feature_cols_,
+            group_value,
+            add_k=self.add_k,
+        )
+        if df_m.empty:
+            return df_m
+
+        # TF-IDF normalizado para desempate
+        tfidf_map = _tfidf_group_scores(
+            self.df_tokens_,
+            self.group_series_,
+            self.feature_cols_,
+            group_value,
+            min_df=self.min_df,
+            max_df=self.max_df,
+        )
+        df_m["TFIDF"] = df_m["Token_raw"].map(tfidf_map).fillna(0.0)
+
+        n_in = int(df_m["n_regs_in"].iloc[0]) if not df_m.empty else 1
+        piso = 5 if n_in <= 200 else 10
+        min_sup = _b.max(piso, ceil(min_support_pct * n_in))
+
+        # Filtro principal
+        df_filt = df_m.query("cnt_in >= @min_sup and Lift >= @min_lift").copy()
+
+        # Fallback por TF-IDF (sem abaixar suporte)
+        if len(df_filt) < topn:
+            falta = topn - len(df_filt)
+            df_fill = (
+                df_m[~df_m["Token_raw"].isin(df_filt["Token_raw"])]
+                .sort_values(["TFIDF", "cnt_in"], ascending=[False, False])
+                .head(falta)
+            )
+            df_filt = pd.concat([df_filt, df_fill], ignore_index=True)
+
+        # one_per_col: aplicado ANTES da limpeza visual (usa '___' como separador)
+        if one_per_col and not df_filt.empty:
+            df_filt[["__col__", "__val__"]] = df_filt["Token_raw"].str.split(
+                "___", n=1, expand=True
+            )
+            df_filt = (
+                df_filt.sort_values(
+                    ["__col__", "Lift", "cnt_in", "TFIDF"],
+                    ascending=[True, False, False, False],
+                )
+                .groupby("__col__", as_index=False)
+                .head(1)
+                .drop(columns=["__col__", "__val__"])
+            )
+
+        # Ordenação final
+        if not df_filt.empty:
+            df_filt = df_filt.sort_values(
+                ["Lift", "cnt_in", "TFIDF"], ascending=[False, False, False]
+            ).head(topn)
+
+        # Limpeza visual dos tokens (DEPOIS de one_per_col)
+        df_filt = df_filt.copy()
+        df_filt["Atributo"] = (
+            df_filt["Token_raw"]
+            .str.replace("___", ": ", regex=False)
+            .str.replace("_DOT_", ".", regex=False)
+            .str.replace(r"(?<=\d)a(?=\d)", "–", regex=True)
+            .str.replace(r"__+", "_", regex=True)
+        )
+
+        cols_out = ["Atributo", "cnt_in", "Pct_in", "Pct_out", "Lift", "TFIDF"]
+        return df_filt[[c for c in cols_out if c in df_filt.columns]].reset_index(
+            drop=True
+        )
+
+    def profile_all(
+        self,
+        topn: int = 20,
+        min_lift: float = 2.0,
+        min_support_pct: float = 0.01,
+        one_per_col: bool = False,
+        display_fn=None,
+    ) -> Dict:
+        """
+        Perfil de todos os grupos. Imprime ou passa para display_fn.
+
+        Retorna dict {group_value: DataFrame}.
+        """
+        self._check_fitted()
+        results = {}
+        for g in self.groups_:
+            label = (
+                f"Grupo {g}"
+                if not str(g).isdigit()
+                else f"Faixa {int(g)+1} (grupo {g})"
+            )
+            print(f"\n{'='*60}")
+            print(f"  PERFIL PREDOMINANTE — {label}")
+            print(f"{'='*60}")
+            df_p = self.profile_group(
+                g,
+                topn=topn,
+                min_lift=min_lift,
+                min_support_pct=min_support_pct,
+                one_per_col=one_per_col,
+            )
+            results[g] = df_p
+            if display_fn:
+                display_fn(df_p)
+            else:
+                print(df_p.to_string(index=False))
+        return results
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _check_fitted(self):
+        if self.df_tokens_ is None:
+            raise RuntimeError(
+                "Chame .fit() antes de .profile_group() ou .profile_all()."
+            )
+
+    def feature_importance_summary(self) -> pd.DataFrame:
+        """
+        Retorna um DataFrame com o lift médio de cada token através de todos os grupos.
+        Útil para entender quais variáveis mais diferenciam os grupos em geral.
+        """
+        self._check_fitted()
+        rows = []
+        for g in self.groups_:
+            df_m = _compute_record_level_metrics(
+                self.df_tokens_, self.group_series_, self.feature_cols_, g, self.add_k
+            )
+            if not df_m.empty:
+                df_m["grupo"] = g
+                rows.append(df_m[["Token_raw", "Lift", "cnt_in", "grupo"]])
+
+        if not rows:
+            return pd.DataFrame()
+
+        all_m = pd.concat(rows, ignore_index=True)
+        summary = (
+            all_m.groupby("Token_raw")
+            .agg(
+                lift_max=("Lift", "max"),
+                lift_mean=("Lift", "mean"),
+                grupos_top=("grupo", lambda x: list(x[all_m.loc[x.index, "Lift"] > 2])),
+            )
+            .sort_values("lift_max", ascending=False)
+            .reset_index()
+        )
+        summary["Atributo"] = (
+            summary["Token_raw"]
+            .str.replace("___", ": ", regex=False)
+            .str.replace("_DOT_", ".", regex=False)
+        )
+        return summary[["Atributo", "lift_max", "lift_mean", "grupos_top"]]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Exemplo de uso
+# ─────────────────────────────────────────────────────────────────────────────
+"""
+# ── Caso 1: Decis de modelo (reproduz o comportamento original, com correções) ──
+pa = ProfileAnalyzer(
+    df=df_scored,
+    group_mode="decile",
+    score_col="prob_target",
+    filter_col="tempo_ativo_4y",
+    filter_value=1,
+    label_col="tempo_ativo_4y",
+    exclude_cols=["cliente_id"],
+    cols_as_text=["cfunc_lider", "cfunc_sindz"],
+    blacklist=["cescri_cont", "cescri_contt"],
+    whitelist=["cargo", "cargo_raiz"],
+    cap_topk={"cargo": 60},
+)
+pa.fit()
+pa.profile_all(topn=20, min_lift=2.0, one_per_col=False)
+
+# ── Caso 2: Clusters K-Means ──
+from sklearn.cluster import KMeans
+km = KMeans(n_clusters=5, random_state=42).fit(X_scaled)
+df["cluster"] = km.labels_
+
+pa2 = ProfileAnalyzer(
+    df=df,
+    group_mode="existing",
+    group_col="cluster",
+    exclude_cols=["cliente_id"],
+)
+pa2.fit()
+pa2.profile_all(topn=15, min_lift=1.5)
+
+# ── Caso 3: Segmento de negócio já existente ──
+pa3 = ProfileAnalyzer(
+    df=df,
+    group_mode="raw",
+    group_col="segmento_rfm",   # ex.: "Campeão", "Em risco", "Hibernando"
+    exclude_cols=["cliente_id"],
+)
+pa3.fit()
+perfil_campeao = pa3.profile_group("Campeão", topn=20)
+
+# ── Caso 4: Quantis customizados (quintis) ──
+pa4 = ProfileAnalyzer(
+    df=df_scored,
+    group_mode="quantile",
+    score_col="prob_churn",
+    n_quantiles=5,
+)
+pa4.fit()
+pa4.profile_all()
+
+# ── Resumo de features que mais diferenciam grupos ──
+summary = pa.feature_importance_summary()
+"""
