@@ -742,6 +742,16 @@ class AutoClassificationEngine:
             print(f"\n📦 Transformador: '{name}' → {len(cols)} coluna(s)")
             print(f"   Colunas: {cols}")
 
+            # --- NOVO BLOCO DE VERIFICAÇÃO ---
+            # Se for uma string (ex: 'drop') ou não tiver steps, a gente avisa e pula
+            if isinstance(transformer, str):
+                print(f"   └── Ação: {transformer}")
+                continue
+            if not hasattr(transformer, "steps"):
+                print(f"   └── {transformer.__class__.__name__}")
+                continue
+            # ---------------------------------
+
             for step_name, step in transformer.steps:
                 cls_name = step.__class__.__name__
                 print(f"   └── {step_name}: {cls_name}")
