@@ -11,7 +11,7 @@ import os
 import warnings
 import logging
 
-from scipy.stats import entropy, skew, spearmanr
+from scipy.stats import entropy, skew, spearmanr, kurtosis
 from scipy.stats.contingency import association
 from autogluon.tabular import TabularPredictor
 from sklearn.metrics import (
@@ -28,9 +28,14 @@ from sklearn.metrics import (
 )
 from sklearn.calibration import calibration_curve
 from sklearn.compose import ColumnTransformer
-from sklearn.preprocessing import StandardScaler, OrdinalEncoder
+from sklearn.preprocessing import (
+    StandardScaler,
+    OrdinalEncoder,
+    MinMaxScaler,
+    RobustScaler,
+)
 from sklearn.pipeline import Pipeline
-from sklearn.impute import SimpleImputer
+from sklearn.impute import SimpleImputer, KNNImputer
 from sklearn.decomposition import PCA
 from sklearn.model_selection import StratifiedKFold, train_test_split
 
@@ -552,7 +557,12 @@ class AutoClassificationEngine:
                 IQR = Q3 - Q1
                 if IQR > 0:
                     self._outlier_bounds[col] = (Q1 - 1.5 * IQR, Q3 + 1.5 * IQR)
-                if abs(skew(df[col].dropna())) > 0.75 and df[col].min() >= 0:
+
+                # if abs(skew(df[col].dropna())) > 0.75 and df[col].min() >= 0:
+                #     self._log_cols.append(col)
+
+                # CORREÇÃO: Removemos a trava do min() >= 0
+                if abs(skew(df[col].dropna())) > 0.75:
                     self._log_cols.append(col)
 
             if col in self._outlier_bounds:
@@ -658,65 +668,142 @@ class AutoClassificationEngine:
     # -----------------------------------------------------------------------
 
     def _build_sklearn_pipeline(self, X: pd.DataFrame, y: pd.Series = None) -> Pipeline:
-        numeric_features = X.select_dtypes(include=["int64", "float64"]).columns
-        categorical_features = X.select_dtypes(include=["object", "category"]).columns
+        numeric_features = X.select_dtypes(
+            include=["int64", "float64"]
+        ).columns.tolist()
+        categorical_features = X.select_dtypes(
+            include=["object", "category"]
+        ).columns.tolist()
 
-        num_steps = [
-            ("imputer", SimpleImputer(strategy="median")),
-            ("scaler", StandardScaler()),
-        ]
         pipeline_cfg = self.params.get("pipeline_settings", {})
-        if pipeline_cfg.get("use_pca"):
-            n_comps = pipeline_cfg.get("pca_components", 0.95)
-            num_steps.append(("pca", PCA(n_components=n_comps)))
+        auto_numeric_prep = pipeline_cfg.get(
+            "auto_numeric_prep", True
+        )  # Novo gatilho Automático
 
-        num_transformer = Pipeline(steps=num_steps)
+        transformers = []
 
-        use_te = self.params.get("use_target_encoding", False)
-        if use_te and _HAS_TARGET_ENCODER:
-            cat_transformer = Pipeline(
-                steps=[
-                    (
-                        "imputer",
-                        SimpleImputer(strategy="constant", fill_value="MISSING"),
-                    ),
-                    ("encoder", TargetEncoder(target_type="auto", smooth="auto")),
-                ]
+        # =========================================================
+        # 1. FLUXO NUMÉRICO (ANÁLISE ESTRATÉGICA AUTOMÁTICA)
+        # =========================================================
+        if auto_numeric_prep and numeric_features:
+            print(
+                "   🤖 Analisando features numéricas para Imputação e Scaling inteligente..."
             )
-        elif use_te and not _HAS_TARGET_ENCODER:
-            warnings.warn(
-                "TargetEncoder não disponível (sklearn < 1.3). Usando OrdinalEncoder.",
-                UserWarning,
-            )
-            cat_transformer = Pipeline(
-                steps=[
-                    (
-                        "imputer",
-                        SimpleImputer(strategy="constant", fill_value="MISSING"),
-                    ),
-                    (
-                        "encoder",
-                        OrdinalEncoder(
-                            handle_unknown="use_encoded_value", unknown_value=-1
+            strategy_groups = {}
+
+            for col in numeric_features:
+                col_data = X[col]
+
+                # A. Regra de Imputação
+                pct_missing = col_data.isna().mean()
+                imp_choice = "knn" if 0 < pct_missing <= 0.30 else "median"
+
+                # B. Regra de Escalonamento
+                clean_data = col_data.dropna()
+                if len(clean_data) > 2 and clean_data.nunique() > 1:
+                    # Calcula assimetria (skew) e caudas (kurtosis)
+                    k = clean_data.kurtosis()
+                    s = abs(clean_data.skew())
+                    if pd.isna(k):
+                        k = 0
+                    if pd.isna(s):
+                        s = 0
+
+                    if k > 3 or s > 1.0:
+                        scl_choice = "robust"
+                    elif clean_data.min() >= 0 and clean_data.max() <= 1:
+                        scl_choice = "minmax"
+                    else:
+                        scl_choice = "standard"
+                else:
+                    scl_choice = "standard"
+
+                # Agrupa a coluna pela combinação de estratégias que ela precisa
+                strategy_groups.setdefault((imp_choice, scl_choice), []).append(col)
+
+            # Monta as pipelines numéricas para cada grupo
+            for (imp, scl), cols in strategy_groups.items():
+                steps = []
+                # Adiciona o Imputer escolhido
+                if imp == "knn":
+                    steps.append(("imputer", KNNImputer(n_neighbors=5)))
+                else:
+                    steps.append(("imputer", SimpleImputer(strategy="median")))
+
+                # Adiciona o Scaler escolhido
+                if scl == "robust":
+                    steps.append(("scaler", RobustScaler()))
+                elif scl == "minmax":
+                    steps.append(("scaler", MinMaxScaler()))
+                else:
+                    steps.append(("scaler", StandardScaler()))
+
+                # Nomeia o bloco (ex: 'num_knn_robust') e adiciona ao ColumnTransformer
+                transformers.append((f"num_{imp}_{scl}", Pipeline(steps), cols))
+
+        elif numeric_features:
+            # Fallback Clássico caso você desligue o 'auto_numeric_prep'
+            num_steps = [
+                ("imputer", SimpleImputer(strategy="median")),
+                ("scaler", StandardScaler()),
+            ]
+            if pipeline_cfg.get("use_pca"):
+                n_comps = pipeline_cfg.get("pca_components", 0.95)
+                num_steps.append(("pca", PCA(n_components=n_comps)))
+
+            transformers.append(("num_default", Pipeline(num_steps), numeric_features))
+
+        # =========================================================
+        # 2. FLUXO CATEGÓRICO (Mantido Original)
+        # =========================================================
+        if categorical_features:
+            use_te = self.params.get("use_target_encoding", False)
+            if use_te and _HAS_TARGET_ENCODER:
+                cat_transformer = Pipeline(
+                    steps=[
+                        (
+                            "imputer",
+                            SimpleImputer(strategy="constant", fill_value="MISSING"),
                         ),
-                    ),
-                ]
-            )
-        else:
-            cat_transformer = Pipeline(
-                steps=[
-                    (
-                        "imputer",
-                        SimpleImputer(strategy="constant", fill_value="MISSING"),
-                    )
-                ]
-            )
+                        ("encoder", TargetEncoder(target_type="auto", smooth="auto")),
+                    ]
+                )
+            elif use_te and not _HAS_TARGET_ENCODER:
+                warnings.warn(
+                    "TargetEncoder não disponível (sklearn < 1.3). Usando OrdinalEncoder.",
+                    UserWarning,
+                )
+                cat_transformer = Pipeline(
+                    steps=[
+                        (
+                            "imputer",
+                            SimpleImputer(strategy="constant", fill_value="MISSING"),
+                        ),
+                        (
+                            "encoder",
+                            OrdinalEncoder(
+                                handle_unknown="use_encoded_value", unknown_value=-1
+                            ),
+                        ),
+                    ]
+                )
+            else:
+                cat_transformer = Pipeline(
+                    steps=[
+                        (
+                            "imputer",
+                            SimpleImputer(strategy="constant", fill_value="MISSING"),
+                        )
+                    ]
+                )
 
+            transformers.append(("cat", cat_transformer, categorical_features))
+
+        # =========================================================
+        # 3. CONSOLIDAÇÃO
+        # =========================================================
         preprocessor = ColumnTransformer(
-            transformers=[
-                ("num", num_transformer, numeric_features),
-                ("cat", cat_transformer, categorical_features),
-            ],
+            transformers=transformers,
             verbose_feature_names_out=False,
         ).set_output(transform="pandas")
 
@@ -785,6 +872,16 @@ class AutoClassificationEngine:
                         print(f"          {c}: média={m:.4f}, std={s:.4f}")
                     if len(cols) > 3:
                         print(f"          ... (+{len(cols) - 3} colunas)")
+
+                # --- NOVO TRECHO A ADICIONAR ---
+                # Outros Scalers e KNN
+                if cls_name == "RobustScaler":
+                    print(f"        quantile_range={step.quantile_range}")
+                elif cls_name == "MinMaxScaler":
+                    print(f"        feature_range={step.feature_range}")
+                elif cls_name == "KNNImputer":
+                    print(f"        n_neighbors={step.n_neighbors}")
+                # -------------------------------
 
                 # OrdinalEncoder — categorias aprendidas
                 if hasattr(step, "categories_") and step.categories_ is not None:
@@ -1652,10 +1749,17 @@ class AutoClassificationEngine:
                 duplicates="drop",
             )
             cut_edges = np.quantile(df["prob"], np.linspace(0, 1, bins + 1))
+
+            # --- CORREÇÃO 1: Garante que as bordas calculadas no treino sejam únicas
+            cut_edges = np.unique(cut_edges)
+
             cut_edges[0] -= 1e-6
             cut_edges[-1] += 1e-6
         else:
+            # --- CORREÇÃO 2: Garante unicidade antes de cortar o teste
+            cut_edges = np.unique(cut_edges)
             n_labels = len(cut_edges) - 1
+
             df["decile"] = pd.cut(
                 df["prob"],
                 bins=cut_edges,
