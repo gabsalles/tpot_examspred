@@ -1,19 +1,34 @@
-# v0.0.8 Gemini
+# v0.0.9 Claude
+# Changelog:
+#   [v0.0.9] ProfileAnalyzer integrado — perfil de segmentos por decil/cluster/segmento
+#   [v0.0.9] engine.profile_analyzer() — factory method pré-configurado com score do modelo
+#   [v0.0.9] cross_validate: n_repeats (RepeatedStratifiedKFold) + OOF por média de repetições
+#   [v0.0.9] cv_results persistido em save_bundle / restaurado em load
+#   [v0.0.9] FIX: matplotlib.colormaps substitui plt.cm.get_cmap (deprecated 3.7+)
+#   [v0.0.9] FIX: isinstance(dtype, pd.CategoricalDtype) substitui is_categorical_dtype (deprecated 2.1+)
+#   [v0.0.9] FIX: log_cols em cross_validate alinhado com _handle_outliers_and_log (sem trava min>=0)
+
 from __future__ import annotations
 
 import hashlib
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
 import re
-import joblib
+import builtins as _b
 import os
 import warnings
 import logging
+from math import ceil
+from typing import Dict, List, Optional
 
-from scipy.stats import entropy, skew, spearmanr, kurtosis
+import numpy as np
+import pandas as pd
+import matplotlib
+import matplotlib.pyplot as plt
+import seaborn as sns
+import joblib
+
+from scipy.stats import entropy, skew, spearmanr
 from scipy.stats.contingency import association
+from sklearn.feature_extraction.text import TfidfVectorizer
 from autogluon.tabular import TabularPredictor
 from sklearn.metrics import (
     confusion_matrix,
@@ -38,7 +53,11 @@ from sklearn.preprocessing import (
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer, KNNImputer
 from sklearn.decomposition import PCA
-from sklearn.model_selection import StratifiedKFold, train_test_split
+from sklearn.model_selection import (
+    StratifiedKFold,
+    RepeatedStratifiedKFold,
+    train_test_split,
+)
 
 try:
     from sklearn.preprocessing import TargetEncoder
@@ -54,19 +73,10 @@ try:
 except ImportError:
     _HAS_SMOTE = False
 
-import re
-import builtins as _b
-from math import ceil
-from typing import Dict, List, Optional, Union
 
-import numpy as np
-import pandas as pd
-from sklearn.feature_extraction.text import TfidfVectorizer
-
-
-# ---------------------------------------------------------------------------
-# Utilitários de Associação
-# ---------------------------------------------------------------------------
+# =============================================================================
+# BLOCO 1 — Utilitários de Associação (AutoClassificationEngine)
+# =============================================================================
 
 
 def _theils_u(x: pd.Series, y: pd.Series) -> float:
@@ -117,9 +127,629 @@ def _numeric_correlation(a: pd.Series, b: pd.Series, method: str = "pearson") ->
     return max(pearson, spearman_val)
 
 
-# ---------------------------------------------------------------------------
-# Classe Principal
-# ---------------------------------------------------------------------------
+# =============================================================================
+# BLOCO 2 — ProfileAnalyzer: utilitários de pré-processamento
+# =============================================================================
+
+
+def make_group_column(
+    df: pd.DataFrame,
+    mode: str = "decile",
+    score_col: Optional[str] = None,
+    group_col: Optional[str] = None,
+    n_quantiles: int = 10,
+    labels: Optional[List] = None,
+) -> pd.Series:
+    """
+    Cria / valida a coluna de grupo que será analisada pelo ProfileAnalyzer.
+
+    mode : "decile" | "quantile" | "existing" | "raw"
+      - "decile"   : qcut em score_col com n_quantiles=10
+      - "quantile" : qcut em score_col com n_quantiles customizável
+      - "existing" : usa group_col já existente no df (sem transformação)
+      - "raw"      : retorna group_col sem cast (clusters, segmentos, etc.)
+    """
+    if mode in ("existing", "raw"):
+        if group_col is None or group_col not in df.columns:
+            raise ValueError(f"group_col='{group_col}' não encontrado no DataFrame.")
+        return df[group_col].copy()
+
+    if score_col is None or score_col not in df.columns:
+        raise ValueError(f"score_col='{score_col}' não encontrado no DataFrame.")
+
+    q = 10 if mode == "decile" else n_quantiles
+    return pd.qcut(df[score_col], q, labels=labels, duplicates="drop")
+
+
+def remove_high_cardinality(
+    df: pd.DataFrame,
+    cols: List[str],
+    max_unique_ratio: float = 0.05,
+    min_unique_abs: int = 100,
+    suspicious_keywords: Optional[List[str]] = None,
+    whitelist: Optional[List[str]] = None,
+    blacklist: Optional[List[str]] = None,
+) -> tuple:
+    """
+    Separa colunas úteis de colunas com alta cardinalidade ou keywords de PII.
+    Retorna (cols_keep, cols_drop, stats_df).
+    """
+    _kw = suspicious_keywords or [
+        "id",
+        "cpf",
+        "cnpj",
+        "doc",
+        "matric",
+        "registro",
+        "hash",
+        "uuid",
+        "chave",
+        "token",
+        "telefone",
+        "cel",
+        "email",
+        "rg",
+        "nome",
+        "sobrenome",
+        "advog",
+        "oab",
+    ]
+    _white = set(whitelist or [])
+    _black = set(blacklist or [])
+    n = len(df)
+
+    cols_keep, cols_drop, rows = [], [], []
+    for c in cols:
+        u = df[c].astype("string").nunique(dropna=True)
+        ratio = u / n if n > 0 else 0.0
+        kw = any(k in c.lower() for k in _kw)
+
+        if c in _black:
+            drop = True
+        elif c in _white:
+            drop = False
+        else:
+            drop = (u >= min_unique_abs and ratio >= max_unique_ratio) or kw
+
+        (cols_drop if drop else cols_keep).append(c)
+        rows.append((c, u, round(ratio, 4), kw, drop))
+
+    stats = pd.DataFrame(
+        rows, columns=["coluna", "n_unique", "unique_ratio", "kw_match", "drop"]
+    ).sort_values(["drop", "unique_ratio"], ascending=[False, False])
+    return cols_keep, cols_drop, stats
+
+
+def cap_top_k(
+    df: pd.DataFrame,
+    col: str,
+    k: int = 50,
+    other_label: str = "OUTROS",
+) -> None:
+    """Agrupa a cauda longa de uma coluna nas top-k categorias. Inplace."""
+    top = set(df[col].astype("string").value_counts(dropna=True).nlargest(k).index)
+    df[col] = df[col].where(df[col].isin(top), other_label)
+
+
+def binarize_numerics(
+    df: pd.DataFrame,
+    cols: Optional[List[str]] = None,
+    quantiles: List[float] = None,
+    exclude: Optional[List[str]] = None,
+) -> pd.DataFrame:
+    """
+    Binariza colunas numéricas em bins por quantis.
+    Retorna df com colunas *_bin adicionadas e originais removidas.
+    """
+    if quantiles is None:
+        quantiles = [0, 0.25, 0.50, 0.75, 1.0]
+
+    _excl = set(exclude or [])
+    _cols = (
+        cols
+        if cols is not None
+        else df.select_dtypes(include="number").columns.tolist()
+    )
+    _cols = [c for c in _cols if c not in _excl]
+
+    new_bins: Dict[str, pd.Series] = {}
+    to_drop: List[str] = []
+
+    for col in _cols:
+        try:
+            limits = np.unique(df[col].quantile(quantiles).to_numpy())
+            if len(limits) < 2:
+                continue
+            bins = pd.cut(df[col], bins=limits, include_lowest=True)
+            new_bins[f"{col}_bin"] = bins.map(
+                lambda x: f"{x.left}a{x.right}" if pd.notnull(x) else "nulo"
+            )
+            to_drop.append(col)
+        except Exception as e:
+            print(f"[binarize] Aviso: não foi possível binarizar '{col}': {e}")
+
+    result = pd.concat([df, pd.DataFrame(new_bins, index=df.index)], axis=1)
+    if to_drop:
+        result = result.drop(columns=to_drop)
+    return result
+
+
+def _to_token(series: pd.Series) -> pd.Series:
+    """Normaliza uma Series para tokens seguros (sem espaços, ponto vira _DOT_)."""
+    s = series.astype("string").fillna("nulo").str.strip()
+    s = s.str.replace(r"^(nan|none|na|null|<na>)$", "nulo", flags=re.I, regex=True)
+    s = s.str.replace(r"[\s\-]+", "_", regex=True)
+    s = s.str.replace(".", "_DOT_", regex=False)
+    return s
+
+
+def build_token_df(df: pd.DataFrame, feature_cols: List[str]) -> pd.DataFrame:
+    """
+    Transforma cada célula em 'coluna___valor' para preservar semântica da coluna.
+    Retorna cópia do df com apenas feature_cols convertidos para tokens.
+    """
+    out = df[feature_cols].copy()
+    for col in feature_cols:
+        out[col] = col + "___" + _to_token(out[col])
+    return out
+
+
+# =============================================================================
+# BLOCO 3 — ProfileAnalyzer: núcleo de métricas
+# =============================================================================
+
+
+def _compute_record_level_metrics(
+    df_tokens: pd.DataFrame,
+    group_col: pd.Series,
+    feature_cols: List[str],
+    group_value,
+    add_k: float = 0.1,
+) -> pd.DataFrame:
+    """
+    Calcula, para cada token único nas feature_cols:
+      - suporte (nº de REGISTROS distintos que possuem o token no grupo)
+      - lift em REGISTROS (não em tokens) — correção vs. implementação ingênua
+      - base para TF-IDF (para desempate)
+    """
+    df_work = df_tokens.copy()
+    df_work["__group__"] = group_col.values
+
+    mask_in = df_work["__group__"] == group_value
+    df_in = df_work[mask_in]
+    df_out = df_work[~mask_in]
+
+    n_in = len(df_in)
+    n_out = len(df_out)
+
+    records: Dict[str, Dict] = {}
+    for col in feature_cols:
+        for grp_df, is_in in [(df_in, True), (df_out, False)]:
+            vc = grp_df[col].value_counts(dropna=True)
+            for token, cnt in vc.items():
+                if token not in records:
+                    records[token] = {"cnt_in": 0, "cnt_out": 0}
+                if is_in:
+                    records[token]["cnt_in"] += int(cnt)
+                else:
+                    records[token]["cnt_out"] += int(cnt)
+
+    if not records:
+        return pd.DataFrame()
+
+    df_m = pd.DataFrame.from_dict(records, orient="index").reset_index()
+    df_m.columns = ["Token_raw", "cnt_in", "cnt_out"]
+
+    V = len(df_m)
+    p_in = (df_m["cnt_in"] + add_k) / (n_in + add_k * V)
+    p_out = (df_m["cnt_out"] + add_k) / (n_out + add_k * V)
+
+    df_m["n_regs_in"] = n_in
+    df_m["n_regs_out"] = n_out
+    df_m["Pct_in"] = df_m["cnt_in"] / _b.max(n_in, 1)
+    df_m["Pct_out"] = df_m["cnt_out"] / _b.max(n_out, 1)
+    df_m["Lift"] = p_in / p_out
+
+    return df_m
+
+
+def _tfidf_group_scores(
+    df_tokens: pd.DataFrame,
+    group_col: pd.Series,
+    feature_cols: List[str],
+    group_value,
+    min_df: int = 1,
+    max_df: float = 0.95,
+) -> Dict[str, float]:
+    """
+    TF-IDF normalizado (L2) do grupo vs. todos os outros grupos.
+    Cada grupo = um documento. Normalização L2 remove viés de tamanho.
+    """
+    df_work = df_tokens.copy()
+    df_work["__group__"] = group_col.values
+
+    docs = (
+        df_work.groupby("__group__")[feature_cols]
+        .apply(lambda x: " ".join(x.values.flatten().astype(str)))
+        .sort_index()
+    )
+    groups = docs.index.tolist()
+    if group_value not in groups:
+        return {}
+
+    i = groups.index(group_value)
+    tv = TfidfVectorizer(
+        token_pattern=r"[^ ]+",
+        lowercase=False,
+        norm="l2",
+        sublinear_tf=True,
+        min_df=min_df,
+        max_df=max_df,
+    )
+    Xt = tv.fit_transform(docs)
+    vocab = tv.get_feature_names_out()
+    row = Xt[i].toarray()[0]
+    return dict(zip(vocab, row))
+
+
+# =============================================================================
+# BLOCO 4 — ProfileAnalyzer: classe principal
+# =============================================================================
+
+
+class ProfileAnalyzer:
+    """
+    Analisa o perfil predominante de segmentos em um DataFrame.
+
+    Suporta qualquer tipo de agrupamento:
+      - Decis de modelo  → group_mode="decile",   score_col="prob"
+      - Clusters         → group_mode="existing", group_col="cluster"
+      - Segmentos RFM    → group_mode="raw",       group_col="segmento_rfm"
+      - Quantis custom   → group_mode="quantile",  score_col="prob", n_quantiles=5
+      - Grupos de A/B    → group_mode="existing", group_col="variante"
+
+    Uso rápido via engine
+    ---------------------
+    >>> pa = engine.profile_analyzer(df_train)
+    >>> pa.fit()
+    >>> pa.profile_all(topn=15, min_lift=2.0, one_per_col=True)
+
+    Uso standalone
+    --------------
+    >>> pa = ProfileAnalyzer(
+    ...     df=df_scored,
+    ...     group_mode="decile",
+    ...     score_col="prob_target",
+    ...     label_col="target",
+    ...     exclude_cols=["id"],
+    ... )
+    >>> pa.fit()
+    >>> perfil = pa.profile_group(group_value=9, topn=20)
+    """
+
+    def __init__(
+        self,
+        df: pd.DataFrame,
+        # ── Agrupamento
+        group_mode: str = "decile",
+        score_col: Optional[str] = None,
+        group_col: Optional[str] = None,
+        n_quantiles: int = 10,
+        group_labels: Optional[List] = None,
+        # ── Filtro de instâncias
+        filter_col: Optional[str] = None,
+        filter_value=None,
+        # ── Colunas
+        label_col: Optional[str] = None,
+        exclude_cols: Optional[List[str]] = None,
+        cols_as_text: Optional[List[str]] = None,
+        whitelist: Optional[List[str]] = None,
+        blacklist: Optional[List[str]] = None,
+        # ── Binarização numérica
+        binarize: bool = True,
+        quantile_bins: Optional[List[float]] = None,
+        # ── Cardinalidade
+        max_unique_ratio: float = 0.05,
+        min_unique_abs: int = 100,
+        cap_topk: Optional[Dict[str, int]] = None,
+        # ── Parâmetros de análise
+        add_k: float = 0.1,
+        min_df: int = 1,
+        max_df: float = 0.95,
+    ):
+        self.df_raw = df.copy()
+        self.group_mode = group_mode
+        self.score_col = score_col
+        self.group_col = group_col
+        self.n_quantiles = n_quantiles
+        self.group_labels = group_labels
+        self.filter_col = filter_col
+        self.filter_value = filter_value
+        self.label_col = label_col
+        self.exclude_cols = list(exclude_cols or [])
+        self.cols_as_text = list(cols_as_text or [])
+        self.whitelist = whitelist
+        self.blacklist = blacklist
+        self.binarize = binarize
+        self.quantile_bins = quantile_bins
+        self.max_unique_ratio = max_unique_ratio
+        self.min_unique_abs = min_unique_abs
+        self.cap_topk = cap_topk or {}
+        self.add_k = add_k
+        self.min_df = min_df
+        self.max_df = max_df
+
+        # Preenchidos em fit()
+        self.df_ = None
+        self.group_series_ = None
+        self.feature_cols_ = None
+        self.df_tokens_ = None
+        self.groups_ = None
+
+    def fit(self, verbose: bool = True) -> "ProfileAnalyzer":
+        """
+        Prepara o DataFrame interno: filtra, binariza, tokeniza, remove alta cardinalidade.
+        """
+        df = self.df_raw.copy()
+
+        # 1) Filtro de instâncias
+        if self.filter_col and self.filter_value is not None:
+            df = df[df[self.filter_col] == self.filter_value].copy()
+            if verbose:
+                print(
+                    f"[fit] Filtro '{self.filter_col}=={self.filter_value}': {len(df)} registros."
+                )
+
+        # 2) Coluna de grupo
+        group = make_group_column(
+            df,
+            mode=self.group_mode,
+            score_col=self.score_col,
+            group_col=self.group_col,
+            n_quantiles=self.n_quantiles,
+            labels=self.group_labels,
+        )
+
+        # 3) Colunas a excluir da análise
+        _excl = set(self.exclude_cols)
+        if self.label_col:
+            _excl.add(self.label_col)
+        if self.score_col:
+            _excl.add(self.score_col)
+        if self.group_col:
+            _excl.add(self.group_col)
+
+        # 4) Colunas numéricas → texto (não binarizar)
+        for col in self.cols_as_text:
+            if col in df.columns:
+                df[col] = df[col].astype("string")
+
+        # 5) Binarização numérica
+        if self.binarize:
+            numeric_to_bin = [
+                c
+                for c in df.select_dtypes(include="number").columns
+                if c not in _excl and c not in self.cols_as_text
+            ]
+            df = binarize_numerics(
+                df,
+                cols=numeric_to_bin,
+                quantiles=self.quantile_bins,
+                exclude=_excl,
+            )
+
+        # 6) Cap top-K categorias
+        for col, k in self.cap_topk.items():
+            if col in df.columns:
+                cap_top_k(df, col, k=k)
+
+        # 7) Colunas candidatas ao perfil
+        candidates = [c for c in df.columns if c not in _excl]
+
+        # 8) Filtro de alta cardinalidade
+        cols_keep, cols_drop, _ = remove_high_cardinality(
+            df,
+            candidates,
+            max_unique_ratio=self.max_unique_ratio,
+            min_unique_abs=self.min_unique_abs,
+            whitelist=self.whitelist,
+            blacklist=self.blacklist,
+        )
+        if verbose:
+            print(
+                f"[fit] Colunas descartadas (alta cardinalidade/PII): {len(cols_drop)}"
+            )
+            print(f"[fit] Colunas para análise: {len(cols_keep)}")
+
+        # 9) Tokenização
+        df_tok = build_token_df(df, cols_keep)
+
+        self.df_ = df
+        self.group_series_ = group.reset_index(drop=True)
+        self.feature_cols_ = cols_keep
+        self.df_tokens_ = df_tok.reset_index(drop=True)
+        self.groups_ = sorted(self.group_series_.dropna().unique())
+
+        if verbose:
+            print(f"[fit] Grupos encontrados: {self.groups_}")
+
+        return self
+
+    def profile_group(
+        self,
+        group_value,
+        topn: int = 20,
+        min_lift: float = 2.0,
+        min_support_pct: float = 0.01,
+        one_per_col: bool = False,
+    ) -> pd.DataFrame:
+        """
+        Retorna os topn tokens mais distintivos do group_value.
+
+        Parâmetros
+        ----------
+        group_value     : valor do grupo (ex.: 9 para o 10º decil)
+        topn            : máximo de linhas no resultado
+        min_lift        : lift mínimo para inclusão primária
+        min_support_pct : % mínimo de registros do grupo que possuem o token
+        one_per_col     : se True, retorna no máx. 1 token por coluna original
+        """
+        self._check_fitted()
+
+        df_m = _compute_record_level_metrics(
+            self.df_tokens_,
+            self.group_series_,
+            self.feature_cols_,
+            group_value,
+            add_k=self.add_k,
+        )
+        if df_m.empty:
+            return df_m
+
+        tfidf_map = _tfidf_group_scores(
+            self.df_tokens_,
+            self.group_series_,
+            self.feature_cols_,
+            group_value,
+            min_df=self.min_df,
+            max_df=self.max_df,
+        )
+        df_m["TFIDF"] = df_m["Token_raw"].map(tfidf_map).fillna(0.0)
+
+        n_in = int(df_m["n_regs_in"].iloc[0]) if not df_m.empty else 1
+        piso = 5 if n_in <= 200 else 10
+        min_sup = _b.max(piso, ceil(min_support_pct * n_in))
+
+        df_filt = df_m.query("cnt_in >= @min_sup and Lift >= @min_lift").copy()
+
+        # Fallback TF-IDF se poucos tokens passarem no filtro primário
+        if len(df_filt) < topn:
+            falta = topn - len(df_filt)
+            df_fill = (
+                df_m[~df_m["Token_raw"].isin(df_filt["Token_raw"])]
+                .sort_values(["TFIDF", "cnt_in"], ascending=[False, False])
+                .head(falta)
+            )
+            df_filt = pd.concat([df_filt, df_fill], ignore_index=True)
+
+        # one_per_col: aplicado ANTES da limpeza visual (usa '___' como separador)
+        if one_per_col and not df_filt.empty:
+            df_filt[["__col__", "__val__"]] = df_filt["Token_raw"].str.split(
+                "___", n=1, expand=True
+            )
+            df_filt = (
+                df_filt.sort_values(
+                    ["__col__", "Lift", "cnt_in", "TFIDF"],
+                    ascending=[True, False, False, False],
+                )
+                .groupby("__col__", as_index=False)
+                .head(1)
+                .drop(columns=["__col__", "__val__"])
+            )
+
+        if not df_filt.empty:
+            df_filt = df_filt.sort_values(
+                ["Lift", "cnt_in", "TFIDF"], ascending=[False, False, False]
+            ).head(topn)
+
+        # Limpeza visual dos tokens (DEPOIS de one_per_col)
+        df_filt = df_filt.copy()
+        df_filt["Atributo"] = (
+            df_filt["Token_raw"]
+            .str.replace("___", ": ", regex=False)
+            .str.replace("_DOT_", ".", regex=False)
+            .str.replace(r"(?<=\d)a(?=\d)", "–", regex=True)
+            .str.replace(r"__+", "_", regex=True)
+        )
+
+        cols_out = ["Atributo", "cnt_in", "Pct_in", "Pct_out", "Lift", "TFIDF"]
+        return df_filt[[c for c in cols_out if c in df_filt.columns]].reset_index(
+            drop=True
+        )
+
+    def profile_all(
+        self,
+        topn: int = 20,
+        min_lift: float = 2.0,
+        min_support_pct: float = 0.01,
+        one_per_col: bool = False,
+        display_fn=None,
+    ) -> Dict:
+        """
+        Perfil de todos os grupos. Imprime ou passa para display_fn.
+        Retorna dict {group_value: DataFrame}.
+        """
+        self._check_fitted()
+        results = {}
+        for g in self.groups_:
+            label = (
+                f"Grupo {g}"
+                if not str(g).isdigit()
+                else f"Faixa {int(g)+1} (grupo {g})"
+            )
+            print(f"\n{'='*60}")
+            print(f"  PERFIL PREDOMINANTE — {label}")
+            print(f"{'='*60}")
+            df_p = self.profile_group(
+                g,
+                topn=topn,
+                min_lift=min_lift,
+                min_support_pct=min_support_pct,
+                one_per_col=one_per_col,
+            )
+            results[g] = df_p
+            if display_fn:
+                display_fn(df_p)
+            else:
+                print(df_p.to_string(index=False))
+        return results
+
+    def feature_importance_summary(self) -> pd.DataFrame:
+        """
+        Lift médio de cada token através de todos os grupos.
+        Útil para entender quais variáveis mais diferenciam os grupos em geral.
+        """
+        self._check_fitted()
+        rows = []
+        for g in self.groups_:
+            df_m = _compute_record_level_metrics(
+                self.df_tokens_, self.group_series_, self.feature_cols_, g, self.add_k
+            )
+            if not df_m.empty:
+                df_m["grupo"] = g
+                rows.append(df_m[["Token_raw", "Lift", "cnt_in", "grupo"]])
+
+        if not rows:
+            return pd.DataFrame()
+
+        all_m = pd.concat(rows, ignore_index=True)
+        summary = (
+            all_m.groupby("Token_raw")
+            .agg(
+                lift_max=("Lift", "max"),
+                lift_mean=("Lift", "mean"),
+                grupos_top=("grupo", lambda x: list(x[all_m.loc[x.index, "Lift"] > 2])),
+            )
+            .sort_values("lift_max", ascending=False)
+            .reset_index()
+        )
+        summary["Atributo"] = (
+            summary["Token_raw"]
+            .str.replace("___", ": ", regex=False)
+            .str.replace("_DOT_", ".", regex=False)
+        )
+        return summary[["Atributo", "lift_max", "lift_mean", "grupos_top"]]
+
+    def _check_fitted(self):
+        if self.df_tokens_ is None:
+            raise RuntimeError(
+                "Chame .fit() antes de .profile_group() ou .profile_all()."
+            )
+
+
+# =============================================================================
+# BLOCO 5 — AutoClassificationEngine
+# =============================================================================
 
 
 class AutoClassificationEngine:
@@ -277,7 +907,6 @@ class AutoClassificationEngine:
         target_series = df[self.target]
         target_is_cat = self._is_categorical_target(target_series)
 
-        # 1. Remover constantes
         const_cols = [c for c in df.columns if df[c].nunique(dropna=False) <= 1]
         if const_cols:
             self.eliminated_features.setdefault("constantes_pos_rare", []).extend(
@@ -285,7 +914,6 @@ class AutoClassificationEngine:
             )
             to_drop.extend(const_cols)
 
-        # 2. Remover Leakage (Numérico e Categórico)
         features_to_check = [
             c for c in df.columns if c not in to_drop and c != self.target
         ]
@@ -310,7 +938,6 @@ class AutoClassificationEngine:
                 self.eliminated_features.setdefault("leakage", []).append(col)
                 to_drop.append(col)
 
-        # 3. Remover Alta Cardinalidade
         cat_cols = df.select_dtypes(include=["object", "category"]).columns
         obs_count = len(df)
         for col in cat_cols:
@@ -533,7 +1160,8 @@ class AutoClassificationEngine:
         for col in cat_cols:
             if col == self.target:
                 continue
-            if df[col].dtype.name == "category":
+            # [FIX v0.0.8] isinstance substitui is_categorical_dtype (deprecated pandas 2.1+)
+            if isinstance(df[col].dtype, pd.CategoricalDtype):
                 df[col] = df[col].astype(str)
 
             if is_train:
@@ -568,10 +1196,7 @@ class AutoClassificationEngine:
                 if IQR > 0:
                     self._outlier_bounds[col] = (Q1 - 1.5 * IQR, Q3 + 1.5 * IQR)
 
-                # if abs(skew(df[col].dropna())) > 0.75 and df[col].min() >= 0:
-                #     self._log_cols.append(col)
-
-                # CORREÇÃO: Removemos a trava do min() >= 0
+                # Sem trava min() >= 0 — colunas negativas com alta assimetria também recebem log
                 if abs(skew(df[col].dropna())) > 0.75:
                     self._log_cols.append(col)
 
@@ -686,15 +1311,11 @@ class AutoClassificationEngine:
         ).columns.tolist()
 
         pipeline_cfg = self.params.get("pipeline_settings", {})
-        auto_numeric_prep = pipeline_cfg.get(
-            "auto_numeric_prep", True
-        )  # Novo gatilho Automático
+        auto_numeric_prep = pipeline_cfg.get("auto_numeric_prep", True)
 
         transformers = []
 
-        # =========================================================
-        # 1. FLUXO NUMÉRICO (ANÁLISE ESTRATÉGICA AUTOMÁTICA)
-        # =========================================================
+        # ── Fluxo numérico (análise estratégica automática) ──────────────────
         if auto_numeric_prep and numeric_features:
             print(
                 "   🤖 Analisando features numéricas para Imputação e Scaling inteligente..."
@@ -703,22 +1324,17 @@ class AutoClassificationEngine:
 
             for col in numeric_features:
                 col_data = X[col]
-
-                # A. Regra de Imputação
                 pct_missing = col_data.isna().mean()
                 imp_choice = "knn" if 0 < pct_missing <= 0.30 else "median"
 
-                # B. Regra de Escalonamento
                 clean_data = col_data.dropna()
                 if len(clean_data) > 2 and clean_data.nunique() > 1:
-                    # Calcula assimetria (skew) e caudas (kurtosis)
                     k = clean_data.kurtosis()
                     s = abs(clean_data.skew())
                     if pd.isna(k):
                         k = 0
                     if pd.isna(s):
                         s = 0
-
                     if k > 3 or s > 1.0:
                         scl_choice = "robust"
                     elif clean_data.min() >= 0 and clean_data.max() <= 1:
@@ -728,19 +1344,15 @@ class AutoClassificationEngine:
                 else:
                     scl_choice = "standard"
 
-                # Agrupa a coluna pela combinação de estratégias que ela precisa
                 strategy_groups.setdefault((imp_choice, scl_choice), []).append(col)
 
-            # Monta as pipelines numéricas para cada grupo
             for (imp, scl), cols in strategy_groups.items():
                 steps = []
-                # Adiciona o Imputer escolhido
                 if imp == "knn":
                     steps.append(("imputer", KNNImputer(n_neighbors=5)))
                 else:
                     steps.append(("imputer", SimpleImputer(strategy="median")))
 
-                # Adiciona o Scaler escolhido
                 if scl == "robust":
                     steps.append(("scaler", RobustScaler()))
                 elif scl == "minmax":
@@ -748,11 +1360,9 @@ class AutoClassificationEngine:
                 else:
                     steps.append(("scaler", StandardScaler()))
 
-                # Nomeia o bloco (ex: 'num_knn_robust') e adiciona ao ColumnTransformer
                 transformers.append((f"num_{imp}_{scl}", Pipeline(steps), cols))
 
         elif numeric_features:
-            # Fallback Clássico caso você desligue o 'auto_numeric_prep'
             num_steps = [
                 ("imputer", SimpleImputer(strategy="median")),
                 ("scaler", StandardScaler()),
@@ -760,12 +1370,9 @@ class AutoClassificationEngine:
             if pipeline_cfg.get("use_pca"):
                 n_comps = pipeline_cfg.get("pca_components", 0.95)
                 num_steps.append(("pca", PCA(n_components=n_comps)))
-
             transformers.append(("num_default", Pipeline(num_steps), numeric_features))
 
-        # =========================================================
-        # 2. FLUXO CATEGÓRICO (Mantido Original)
-        # =========================================================
+        # ── Fluxo categórico ─────────────────────────────────────────────────
         if categorical_features:
             use_te = self.params.get("use_target_encoding", False)
             if use_te and _HAS_TARGET_ENCODER:
@@ -803,15 +1410,12 @@ class AutoClassificationEngine:
                         (
                             "imputer",
                             SimpleImputer(strategy="constant", fill_value="MISSING"),
-                        )
+                        ),
                     ]
                 )
-
             transformers.append(("cat", cat_transformer, categorical_features))
 
-        # =========================================================
-        # 3. CONSOLIDAÇÃO
-        # =========================================================
+        # ── Consolidação ─────────────────────────────────────────────────────
         preprocessor = ColumnTransformer(
             transformers=transformers,
             verbose_feature_names_out=False,
@@ -839,33 +1443,26 @@ class AutoClassificationEngine:
             print(f"\n📦 Transformador: '{name}' → {len(cols)} coluna(s)")
             print(f"   Colunas: {cols}")
 
-            # --- NOVO BLOCO DE VERIFICAÇÃO ---
-            # Se for uma string (ex: 'drop') ou não tiver steps, a gente avisa e pula
             if isinstance(transformer, str):
                 print(f"   └── Ação: {transformer}")
                 continue
             if not hasattr(transformer, "steps"):
                 print(f"   └── {transformer.__class__.__name__}")
                 continue
-            # ---------------------------------
 
             for step_name, step in transformer.steps:
                 cls_name = step.__class__.__name__
                 print(f"   └── {step_name}: {cls_name}")
 
-                # SimpleImputer — valores de imputação por coluna
                 if hasattr(step, "statistics_") and step.statistics_ is not None:
                     imputed = {}
                     for c, v in zip(cols, step.statistics_):
                         try:
-                            # Tenta tratar como número
                             f_val = float(v)
                             if not np.isnan(f_val):
                                 imputed[c] = round(f_val, 4)
                         except (ValueError, TypeError):
-                            # Se for uma string (como 'MISSING'), apenas guarda o valor
                             imputed[c] = v
-
                     if imputed:
                         print(f"        strategy={step.strategy}")
                         for c, v in list(imputed.items())[:5]:
@@ -873,7 +1470,6 @@ class AutoClassificationEngine:
                         if len(imputed) > 5:
                             print(f"          ... (+{len(imputed) - 5} colunas)")
 
-                # StandardScaler — média e desvio padrão
                 if hasattr(step, "mean_") and step.mean_ is not None:
                     print(
                         f"        with_mean={step.with_mean} | with_std={step.with_std}"
@@ -883,17 +1479,13 @@ class AutoClassificationEngine:
                     if len(cols) > 3:
                         print(f"          ... (+{len(cols) - 3} colunas)")
 
-                # --- NOVO TRECHO A ADICIONAR ---
-                # Outros Scalers e KNN
                 if cls_name == "RobustScaler":
                     print(f"        quantile_range={step.quantile_range}")
                 elif cls_name == "MinMaxScaler":
                     print(f"        feature_range={step.feature_range}")
                 elif cls_name == "KNNImputer":
                     print(f"        n_neighbors={step.n_neighbors}")
-                # -------------------------------
 
-                # OrdinalEncoder — categorias aprendidas
                 if hasattr(step, "categories_") and step.categories_ is not None:
                     for c, cats in zip(cols[:3], step.categories_[:3]):
                         print(
@@ -902,21 +1494,17 @@ class AutoClassificationEngine:
                     if len(cols) > 3:
                         print(f"          ... (+{len(cols) - 3} colunas)")
 
-                # TargetEncoder
                 if cls_name == "TargetEncoder" and hasattr(step, "encodings_"):
                     print(
                         f"          target_type={step.target_type} | smooth={step.smooth}"
                     )
 
-                # PCA
                 if hasattr(step, "explained_variance_ratio_"):
                     total_var = step.explained_variance_ratio_.sum()
                     print(
-                        f"        n_components={step.n_components_} | "
-                        f"variância explicada={total_var:.1%}"
+                        f"        n_components={step.n_components_} | variância explicada={total_var:.1%}"
                     )
 
-        # Log-transform e clipping (fora da sklearn pipeline, mas parte do engine)
         print("\n📐 Transformações do Engine (pré-pipeline):")
 
         if self._log_cols:
@@ -936,11 +1524,6 @@ class AutoClassificationEngine:
             print("   Clipping IQR: nenhuma coluna")
 
         if self._rare_categories:
-            total_others = sum(
-                1
-                for col, cats in self._rare_categories.items()
-                if "OTHER" in cats or len(cats) < 10
-            )
             print(
                 f"   Rare-label agrupado em {len(self._rare_categories)} coluna(s) categórica(s)"
             )
@@ -1002,7 +1585,7 @@ class AutoClassificationEngine:
     # -----------------------------------------------------------------------
 
     def fit(self, train_data: pd.DataFrame, time_limit: int = None):
-        print("\n🚀 --- TREINAMENTO INICIADO (v0.0.7) ---")
+        print("\n🚀 --- TREINAMENTO INICIADO (v0.0.8) ---")
 
         if time_limit is None:
             time_limit = self.params.get("time_limit", 300)
@@ -1241,17 +1824,32 @@ class AutoClassificationEngine:
             self.feature_importance = None
 
     # -----------------------------------------------------------------------
-    # 5c. CROSS-VALIDATION EXTERNO
+    # 5c. CROSS-VALIDATION EXTERNO  [v0.0.8: n_repeats + OOF por média]
     # -----------------------------------------------------------------------
 
     def cross_validate(
         self,
         train_data: pd.DataFrame,
         n_folds: int = 5,
+        n_repeats: int = 1,
         time_limit_per_fold: int = None,
         use_smote: bool = False,
         smote_k_neighbors: int = 5,
     ) -> pd.DataFrame:
+        """
+        Cross-validation estratificado com suporte a repetições.
+
+        Parâmetros
+        ----------
+        n_folds            : número de folds por repetição
+        n_repeats          : número de repetições do K-fold (default=1 = sem repetição).
+                             Quando > 1, usa RepeatedStratifiedKFold — cada repetição usa
+                             uma seed diferente. OOF final é a média das repetições.
+                             Custo: n_folds × n_repeats modelos treinados.
+        time_limit_per_fold: segundos por fold (default: total_time / n_folds)
+        use_smote          : aplica SMOTE no fold de treino (requer imbalanced-learn)
+        smote_k_neighbors  : k para SMOTE
+        """
         if self.selected_features is None:
             raise RuntimeError("Execute fit() antes de cross_validate().")
 
@@ -1266,7 +1864,13 @@ class AutoClassificationEngine:
         if time_limit_per_fold is None:
             time_limit_per_fold = max(60, total_tl // n_folds)
 
-        print(f"\n🔄 --- CROSS-VALIDATION ({n_folds} folds) ---")
+        total_folds = n_folds * n_repeats
+        repeat_tag = (
+            f" × {n_repeats} repetições = {total_folds} modelos"
+            if n_repeats > 1
+            else ""
+        )
+        print(f"\n🔄 --- CROSS-VALIDATION ({n_folds} folds{repeat_tag}) ---")
         print(f"   Time limit por fold: {time_limit_per_fold}s")
 
         pairs = self.params.get("group_aggregation_pairs", [])
@@ -1290,8 +1894,15 @@ class AutoClassificationEngine:
 
         y_raw = df_base[self.target]
         pos_label = self._get_positive_class()
-        skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
         y_strat = (y_raw.astype(str) == str(pos_label)).astype(int)
+
+        # [v0.0.8] RepeatedStratifiedKFold quando n_repeats > 1
+        if n_repeats > 1:
+            skf = RepeatedStratifiedKFold(
+                n_splits=n_folds, n_repeats=n_repeats, random_state=42
+            )
+        else:
+            skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
 
         n_classes = y_raw.nunique()
         if use_smote and n_classes > 2:
@@ -1303,7 +1914,9 @@ class AutoClassificationEngine:
 
         fold_metrics = []
         fold_curves = []
+        # [v0.0.8] Acumula OOF por soma+contagem para média entre repetições
         oof_probs = np.zeros(len(y_raw))
+        oof_counts = np.zeros(len(y_raw))
         oof_true = np.zeros(len(y_raw))
 
         chosen_metric = self.params.get("eval_metric", "f1")
@@ -1311,7 +1924,8 @@ class AutoClassificationEngine:
 
         for fold_idx, (train_idx, val_idx) in enumerate(skf.split(df_base, y_strat)):
             print(
-                f"\n   📂 Fold {fold_idx + 1}/{n_folds} (treino={len(train_idx)}, val={len(val_idx)})"
+                f"\n   📂 Fold {fold_idx + 1}/{total_folds}"
+                f" (treino={len(train_idx)}, val={len(val_idx)})"
             )
 
             df_tr_fold = df_base.iloc[train_idx].copy()
@@ -1330,20 +1944,19 @@ class AutoClassificationEngine:
             y_tr = df_tr_fold[self.target]
             y_vl = df_vl_fold[self.target]
 
-            rare_cats_fold = {}
             cat_cols = X_tr_raw.select_dtypes(include=["object", "category"]).columns
             for col in cat_cols:
-                # Converte para string — evita TypeError em colunas dtype='category'
+                # [FIX v0.0.8] Converte dtype='category' → str antes do where()
                 X_tr_raw[col] = X_tr_raw[col].astype(str)
                 X_vl_raw[col] = X_vl_raw[col].astype(str)
 
                 freq = X_tr_raw[col].value_counts(normalize=True)
-                rare_cats_fold[col] = freq[freq >= 0.01].index.tolist()
+                rare_keep = freq[freq >= 0.01].index.tolist()
                 X_tr_raw[col] = X_tr_raw[col].where(
-                    X_tr_raw[col].isin(rare_cats_fold[col]), "OTHER"
+                    X_tr_raw[col].isin(rare_keep), "OTHER"
                 )
                 X_vl_raw[col] = X_vl_raw[col].where(
-                    X_vl_raw[col].isin(rare_cats_fold[col]), "OTHER"
+                    X_vl_raw[col].isin(rare_keep), "OTHER"
                 )
 
             log_cols_fold, bounds_fold = [], {}
@@ -1352,10 +1965,8 @@ class AutoClassificationEngine:
                 IQR = Q3 - Q1
                 if IQR > 0:
                     bounds_fold[col] = (Q1 - 1.5 * IQR, Q3 + 1.5 * IQR)
-                if (
-                    abs(skew(X_tr_raw[col].dropna())) > 0.75
-                    and X_tr_raw[col].min() >= 0
-                ):
+                # [FIX v0.0.8] Alinhado com _handle_outliers_and_log (sem trava min >= 0)
+                if abs(skew(X_tr_raw[col].dropna())) > 0.75:
                     log_cols_fold.append(col)
 
             for col, (lo, hi) in bounds_fold.items():
@@ -1428,11 +2039,11 @@ class AutoClassificationEngine:
             y_prob_pos = y_prob_df[pos_label]
             y_pred = pred_fold.predict(X_vl_t)
             y_bin = (y_vl.astype(str) == str(pos_label)).astype(int)
-
-            # Binariza y_pred — necessário quando target é string ('good'/'bad')
             y_pred = (y_pred.astype(str) == str(pos_label)).astype(int)
 
-            oof_probs[val_idx] = y_prob_pos.values
+            # [v0.0.8] Acumula para média entre repetições
+            oof_probs[val_idx] += y_prob_pos.values
+            oof_counts[val_idx] += 1
             oof_true[val_idx] = y_bin.values
 
             fpr, tpr, thresh_roc = roc_curve(y_bin, y_prob_pos)
@@ -1469,12 +2080,16 @@ class AutoClassificationEngine:
                 {"fpr": fpr, "tpr": tpr, "auc": roc_auc, "fold": fold_idx + 1}
             )
             print(
-                f"      AUC={roc_auc:.4f} | AP={pr_auc:.4f} | F1(0.5)={fold_metrics[-1]['F1 (thr=0.5)']:.4f}"
+                f"      AUC={roc_auc:.4f} | AP={pr_auc:.4f}"
+                f" | F1(0.5)={fold_metrics[-1]['F1 (thr=0.5)']:.4f}"
             )
 
-        fpr_oof, tpr_oof, _ = roc_curve(oof_true, oof_probs)
+        # [v0.0.8] Média das repetições por amostra
+        oof_probs_final = oof_probs / np.maximum(oof_counts, 1)
+
+        fpr_oof, tpr_oof, _ = roc_curve(oof_true, oof_probs_final)
         oof_auc = auc(fpr_oof, tpr_oof)
-        oof_ap = average_precision_score(oof_true, oof_probs)
+        oof_ap = average_precision_score(oof_true, oof_probs_final)
 
         metrics_df = pd.DataFrame(fold_metrics).set_index("Fold")
         mean_row = metrics_df.mean().rename("Média")
@@ -1484,7 +2099,7 @@ class AutoClassificationEngine:
         )
 
         thr_strategy = self.params.get("threshold_strategy", "youden")
-        print(f"\n📊 RESUMO ({n_folds} folds):")
+        print(f"\n📊 RESUMO ({total_folds} folds):")
         print(f"   AUC-ROC  : {mean_row['AUC-ROC']:.4f} ± {std_row['AUC-ROC']:.4f}")
         print(
             f"   Avg Prec : {mean_row['Avg Precision']:.4f} ± {std_row['Avg Precision']:.4f}"
@@ -1498,13 +2113,14 @@ class AutoClassificationEngine:
         self.cv_results = {
             "summary_df": summary_df,
             "fold_curves": fold_curves,
-            "oof_probs": oof_probs,
+            "oof_probs": oof_probs_final,
             "oof_true": oof_true,
             "fpr_oof": fpr_oof,
             "tpr_oof": tpr_oof,
             "oof_auc": oof_auc,
             "oof_ap": oof_ap,
             "n_folds": n_folds,
+            "n_repeats": n_repeats,
             "pos_label": pos_label,
             "use_smote": use_smote,
             "thr_strategy": thr_strategy,
@@ -1521,8 +2137,15 @@ class AutoClassificationEngine:
 
         cv = self.cv_results
         n = cv["n_folds"]
-        cmap = plt.cm.get_cmap("tab10", n)
+        n_repeats = cv.get("n_repeats", 1)
+        total_folds = n * n_repeats
         thr_strategy = cv.get("thr_strategy", "youden")
+
+        # [FIX v0.0.8] matplotlib.colormaps substitui plt.cm.get_cmap (deprecated 3.7+)
+        try:
+            cmap = matplotlib.colormaps.get_cmap("tab10").resampled(total_folds)
+        except AttributeError:
+            cmap = plt.cm.get_cmap("tab10", total_folds)
 
         fig, axes = plt.subplots(2, 3, figsize=(20, 12), constrained_layout=True)
 
@@ -1545,8 +2168,11 @@ class AutoClassificationEngine:
             table[n_rows - 1, j].set_facecolor("#d4edda")
             table[n_rows, j].set_facecolor("#fff3cd")
         smote_tag = " | SMOTE" if cv.get("use_smote") else ""
+        repeat_tag = f" × {n_repeats}rep" if n_repeats > 1 else ""
         ax.set_title(
-            f"Métricas por Fold (n={n}{smote_tag})", fontweight="bold", fontsize=12
+            f"Métricas por Fold (n={n}{repeat_tag}{smote_tag})",
+            fontweight="bold",
+            fontsize=12,
         )
 
         ax = axes[0, 1]
@@ -1581,7 +2207,7 @@ class AutoClassificationEngine:
             "F1 (opt)",
             "Accuracy",
         ]
-        fold_only = cv["summary_df"].iloc[:n][metric_cols]
+        fold_only = cv["summary_df"].iloc[:total_folds][metric_cols]
         ax.boxplot(
             [fold_only[c].values for c in metric_cols],
             labels=metric_cols,
@@ -1644,7 +2270,11 @@ class AutoClassificationEngine:
         aucs = [fc["auc"] for fc in cv["fold_curves"]]
         folds = [fc["fold"] for fc in cv["fold_curves"]]
         bars = ax.bar(
-            folds, aucs, color=[cmap(i) for i in range(n)], edgecolor="white", width=0.6
+            folds,
+            aucs,
+            color=[cmap(i) for i in range(total_folds)],
+            edgecolor="white",
+            width=0.6,
         )
         ax.axhline(
             np.mean(aucs),
@@ -1676,14 +2306,72 @@ class AutoClassificationEngine:
                 fontweight="bold",
             )
 
+        repeat_info = f" | {n_repeats} repetições" if n_repeats > 1 else ""
         plt.suptitle(
-            f"Relatório CV ({n} Folds Estratificados)  —  "
+            f"Relatório CV ({n} Folds Estratificados{repeat_info})  —  "
             f"AUC OOF: {cv['oof_auc']:.4f}  |  AP OOF: {cv['oof_ap']:.4f}"
             f"  |  Threshold: {thr_strategy}",
             fontsize=14,
             fontweight="bold",
         )
         plt.show()
+
+    # -----------------------------------------------------------------------
+    # 5e. PROFILE ANALYZER — factory method  [v0.0.8]
+    # -----------------------------------------------------------------------
+
+    def profile_analyzer(
+        self,
+        df: pd.DataFrame,
+        score_col: str = "prob_target",
+        group_mode: str = "decile",
+        n_quantiles: int = 10,
+        **kwargs,
+    ) -> "ProfileAnalyzer":
+        """
+        Cria um ProfileAnalyzer pré-configurado com o score do modelo.
+
+        O df deve conter uma coluna com as probabilidades preditas. Use
+        predict_proba() para gerá-la antes de chamar este método:
+
+            df_train["prob_target"] = engine.predict_proba(df_train)[pos_label]
+            pa = engine.profile_analyzer(df_train, score_col="prob_target")
+            pa.fit()
+            pa.profile_all(topn=15, min_lift=2.0, one_per_col=True)
+
+        Parâmetros
+        ----------
+        df          : DataFrame com features originais + coluna de score
+        score_col   : nome da coluna de probabilidade predita
+        group_mode  : "decile" | "quantile" | "existing" | "raw"
+        n_quantiles : número de quantis (somente para group_mode="quantile")
+        **kwargs    : quaisquer outros parâmetros aceitos por ProfileAnalyzer
+                      (exclude_cols, label_col, whitelist, blacklist, etc.)
+
+        Retorna
+        -------
+        ProfileAnalyzer (não fitted — chame .fit() em seguida)
+        """
+        if self.selected_features is None:
+            raise RuntimeError("Execute fit() antes de profile_analyzer().")
+
+        # Herda exclusões padrão do engine
+        default_exclude = list(kwargs.pop("exclude_cols", []))
+        default_exclude += [self.target]
+        if score_col not in default_exclude:
+            default_exclude_clean = [c for c in default_exclude if c != score_col]
+        else:
+            default_exclude_clean = default_exclude
+
+        return ProfileAnalyzer(
+            df=df,
+            group_mode=group_mode,
+            score_col=score_col,
+            n_quantiles=n_quantiles,
+            label_col=kwargs.pop("label_col", self.target),
+            exclude_cols=default_exclude_clean,
+            **kwargs,
+        )
 
     # -----------------------------------------------------------------------
     # 6. PREDIÇÃO
@@ -1741,13 +2429,7 @@ class AutoClassificationEngine:
     # 7. VISUALIZAÇÕES
     # -----------------------------------------------------------------------
 
-    def _get_decile_stats(
-        self,
-        y_true: np.ndarray,
-        y_prob: np.ndarray,
-        bins: int = 10,
-        cut_edges=None,
-    ):
+    def _get_decile_stats(self, y_true, y_prob, bins=10, cut_edges=None):
         df = pd.DataFrame({"target": y_true, "prob": y_prob})
 
         if cut_edges is None:
@@ -1759,17 +2441,12 @@ class AutoClassificationEngine:
                 duplicates="drop",
             )
             cut_edges = np.quantile(df["prob"], np.linspace(0, 1, bins + 1))
-
-            # --- CORREÇÃO 1: Garante que as bordas calculadas no treino sejam únicas
             cut_edges = np.unique(cut_edges)
-
             cut_edges[0] -= 1e-6
             cut_edges[-1] += 1e-6
         else:
-            # --- CORREÇÃO 2: Garante unicidade antes de cortar o teste
             cut_edges = np.unique(cut_edges)
             n_labels = len(cut_edges) - 1
-
             df["decile"] = pd.cut(
                 df["prob"],
                 bins=cut_edges,
@@ -1783,7 +2460,6 @@ class AutoClassificationEngine:
             .agg(count=("target", "count"), events=("target", "sum"))
             .reset_index()
         )
-
         stats["event_rate"] = stats["events"] / stats["count"].replace(0, np.nan)
         global_rate = df["target"].mean()
         stats["lift"] = stats["event_rate"] / global_rate if global_rate > 0 else np.nan
@@ -1885,7 +2561,8 @@ class AutoClassificationEngine:
             cbar_kws={"label": "Associação"},
         )
         ax2.set_title(
-            f"Matriz de Associação entre Features\n(Pearson/Spearman[{corr_method}] | Theil's U | Eta²)",
+            f"Matriz de Associação entre Features\n"
+            f"(Pearson/Spearman[{corr_method}] | Theil's U | Eta²)",
             fontweight="bold",
         )
         plt.suptitle("Relatório de Associações", fontsize=16, fontweight="bold")
@@ -2325,20 +3002,13 @@ class AutoClassificationEngine:
         ax.set_title("Análise de Threshold (Teste)", fontweight="bold")
         ax.legend(fontsize=8)
 
-    def _plot_decil(
-        self,
-        ax,
-        decile_data: dict,
-        results: dict,
-        colors: dict,
-        bins: int,
-        title_mode: str,
-    ):
+    def _plot_decil(self, ax, decile_data, results, colors, bins, title_mode):
         all_stats = []
         for name, stats in decile_data.items():
             d = stats.copy()
             d["Dataset"] = name
-            if not pd.api.types.is_categorical_dtype(d["decile"]):
+            # [FIX v0.0.8] isinstance substitui is_categorical_dtype (deprecated pandas 2.1+)
+            if not isinstance(d["decile"].dtype, pd.CategoricalDtype):
                 d["decile"] = pd.Categorical(
                     d["decile"], categories=range(1, bins + 1), ordered=True
                 )
@@ -2382,7 +3052,6 @@ class AutoClassificationEngine:
                 .sort_values("decile")
                 .reset_index(drop=True)
             )
-
             valid = d_lab[d_lab["count"] > 0].reset_index(drop=True)
             valid_bars = [
                 bar
@@ -2391,7 +3060,6 @@ class AutoClassificationEngine:
                 and bar.get_bbox() is not None
                 and bar.get_height() > 0
             ]
-
             for bar, (_, row) in zip(valid_bars, valid.iterrows()):
                 x = bar.get_x() + bar.get_width() / 2
                 y = bar.get_height()
@@ -2403,7 +3071,6 @@ class AutoClassificationEngine:
             ks_stat = results["Teste"]["decile_stats"]["ks"].max()
             ks_txt = f"  |  KS Máximo (Teste): {ks_stat:.4f}"
 
-        # [FIX] label_type genérico para qualquer valor de bins
         label_map_bins = {5: "Quintil", 10: "Decil", 4: "Quartil", 20: "Vigésimo"}
         label_type = label_map_bins.get(bins, f"{bins}-Faixas")
 
@@ -2459,67 +3126,7 @@ class AutoClassificationEngine:
         ax.legend(fontsize=8)
 
     # -----------------------------------------------------------------------
-    # 8. ANÁLISE DE PERFIL (PROFILING)
-    # -----------------------------------------------------------------------
-
-    def profile_predictions(
-        self,
-        data: pd.DataFrame,
-        group_mode: str = "quantile",  # <-- Alterado o padrão para evitar conflito
-        n_quantiles: int = 10,
-        analyze_top_only: bool = True,
-        topn: int = 15,
-        min_lift: float = 1.5,
-    ):
-        if self.predictor is None:
-            raise RuntimeError(
-                "O modelo precisa ser treinado com .fit() antes de gerar o perfil."
-            )
-
-        print("\n🔍 Iniciando Análise de Perfil de Predições...")
-
-        probs = self.predict_proba(data)
-        pos_label = self._get_positive_class()
-        score_col = f"prob_{pos_label}"
-
-        df_scored = data.copy()
-        df_scored[score_col] = probs[pos_label].values
-
-        exclude = [self.target] if self.target in df_scored.columns else []
-
-        # Instancia o Analyzer sem forçar labels (deixando retornar os intervalos reais de probabilidade)
-        pa = ProfileAnalyzer(
-            df=df_scored,
-            group_mode=group_mode,
-            score_col=score_col,
-            n_quantiles=n_quantiles,
-            group_labels=None,  # <-- Segredo para não quebrar com decis vazios
-            exclude_cols=exclude,
-            add_k=0.1,
-        )
-
-        pa.fit(verbose=False)
-
-        if analyze_top_only:
-            # Pega dinamicamente o último grupo real que sobreviveu ao corte
-            top_group = pa.groups_[-1]
-            print(
-                f"\n🏆 Perfil Predominante do Grupo de Maior Risco/Probabilidade (Faixa {top_group}):"
-            )
-            perfil = pa.profile_group(
-                group_value=top_group, topn=topn, min_lift=min_lift, one_per_col=True
-            )
-            (
-                display(perfil)
-                if "display" in globals()
-                else print(perfil.to_string(index=False))
-            )
-            return perfil
-        else:
-            return pa.profile_all(topn=topn, min_lift=min_lift, one_per_col=True)
-
-    # -----------------------------------------------------------------------
-    # 8. SERIALIZAÇÃO
+    # 8. SERIALIZAÇÃO  [v0.0.8: cv_results persistido]
     # -----------------------------------------------------------------------
 
     def save_bundle(self, path: str = "modelo_prod"):
@@ -2538,13 +3145,20 @@ class AutoClassificationEngine:
                 "feature_importance": self.feature_importance,
                 "train_schema": self._train_schema,
                 "train_hash": self._train_hash,
+                "cv_results": self.cv_results,  # [v0.0.8]
             },
             f"{path}/assets.pkl",
         )
         self.predictor.save(f"{path}/autogluon")
+        cv_tag = (
+            f"CV salvo (AUC OOF: {self.cv_results['oof_auc']:.4f})"
+            if self.cv_results
+            else "CV não disponível"
+        )
         print(f"📦 Bundle salvo em '{path}/'")
         print(f"   🔑 Hash do treino: {self._train_hash[:16]}...")
         print(f"   📐 Schema salvo  : {len(self._train_schema)} features")
+        print(f"   📊 {cv_tag}")
 
     @staticmethod
     def load(path: str) -> "AutoClassificationEngine":
@@ -2571,7 +3185,7 @@ class AutoClassificationEngine:
         engine.feature_importance = assets.get("feature_importance", None)
         engine._train_schema = assets.get("train_schema", {})
         engine._train_hash = assets.get("train_hash", "")
-        engine.cv_results = {}
+        engine.cv_results = assets.get("cv_results", {})  # [v0.0.8]
         engine.predictor = TabularPredictor.load(ag_path)
 
         print(f"✅ Engine carregado de '{path}/'")
@@ -2581,739 +3195,8 @@ class AutoClassificationEngine:
             print(f"   🔑 Hash  : {engine._train_hash[:16]}...")
         if engine._train_schema:
             print(f"   📐 Schema: {len(engine._train_schema)} features esperadas")
-        return engine
-
-
-"""
-ProfileAnalyzer — Perfil de Segmento Generalizado
-==================================================
-Autoria: adaptado e corrigido a partir de código de análise por decis.
-
-Suporta qualquer tipo de agrupamento:
-  - Decis de modelo (padrão)
-  - Clusters (K-Means, DBSCAN, etc.)
-  - Segmentos de negócio (RFM, canal, região)
-  - Colunas categóricas de interesse
-  - Grupos de A/B test
-
-Correções em relação ao código original:
-  1. Lift calculado em registros (não tokens) → comparável ao suporte mínimo
-  2. TF-IDF normalizado por comprimento de documento (sem viés de volume)
-  3. one_per_col usa separador correto (aplicado ANTES da limpeza visual)
-  4. Suporte expresso tanto em contagens quanto em percentual de registros
-  5. API limpa: separação clara entre pré-processamento e análise
-
-Dependências: pandas, numpy, scikit-learn
-"""
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Utilitários de pré-processamento
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def make_group_column(
-    df: pd.DataFrame,
-    mode: str = "decile",
-    score_col: Optional[str] = None,
-    group_col: Optional[str] = None,
-    n_quantiles: int = 10,
-    labels: Optional[List] = None,
-) -> pd.Series:
-    """
-    Cria / valida a coluna de grupo que será analisada.
-
-    Parâmetros
-    ----------
-    mode : {"decile", "quantile", "existing", "raw"}
-        - "decile"   : qcut em score_col com n_quantiles=10
-        - "quantile" : qcut em score_col com n_quantiles customizável
-        - "existing" : usa group_col já existente no df (sem transformação)
-        - "raw"      : retorna group_col sem cast (clusters, segmentos, etc.)
-    score_col  : coluna de score para modos decile/quantile
-    group_col  : coluna já existente para modo existing/raw
-    n_quantiles: nº de quantis (modo "quantile")
-    labels     : rótulos customizados (len == n_quantiles)
-    """
-    if mode in ("existing", "raw"):
-        if group_col is None or group_col not in df.columns:
-            raise ValueError(f"group_col='{group_col}' não encontrado no DataFrame.")
-        return df[group_col].copy()
-
-    if score_col is None or score_col not in df.columns:
-        raise ValueError(f"score_col='{score_col}' não encontrado no DataFrame.")
-
-    # Se passar 'decile', fixa em 10. Se não, usa n_quantiles
-    q = 10 if mode == "decile" else n_quantiles
-
-    try:
-        return pd.qcut(df[score_col], q, labels=labels, duplicates="drop")
-    except ValueError:
-        # Se deu erro, faixas foram engolidas por terem valores idênticos.
-        # Cortamos sem labels para pegar os índices sobreviventes reais
-        s_cut = pd.qcut(df[score_col], q, labels=False, duplicates="drop")
-        return s_cut + 1
-
-
-def remove_high_cardinality(
-    df: pd.DataFrame,
-    cols: List[str],
-    max_unique_ratio: float = 0.05,
-    min_unique_abs: int = 100,
-    suspicious_keywords: Optional[List[str]] = None,
-    whitelist: Optional[List[str]] = None,
-    blacklist: Optional[List[str]] = None,
-) -> tuple[List[str], List[str], pd.DataFrame]:
-    """
-    Separa colunas úteis de colunas com alta cardinalidade ou keywords de PII.
-
-    Retorna
-    -------
-    cols_keep, cols_drop, stats_df
-    """
-    _kw = suspicious_keywords or [
-        "id",
-        "cpf",
-        "cnpj",
-        "doc",
-        "matric",
-        "registro",
-        "hash",
-        "uuid",
-        "chave",
-        "token",
-        "telefone",
-        "cel",
-        "email",
-        "rg",
-        "nome",
-        "sobrenome",
-        "advog",
-        "oab",
-    ]
-    _white = set(whitelist or [])
-    _black = set(blacklist or [])
-    n = len(df)
-
-    cols_keep, cols_drop, rows = [], [], []
-    for c in cols:
-        u = df[c].astype("string").nunique(dropna=True)
-        ratio = u / n if n > 0 else 0.0
-        kw = any(k in c.lower() for k in _kw)
-
-        if c in _black:
-            drop = True
-        elif c in _white:
-            drop = False
+        if engine.cv_results:
+            print(f"   📊 CV disponível (AUC OOF: {engine.cv_results['oof_auc']:.4f})")
         else:
-            drop = (u >= min_unique_abs and ratio >= max_unique_ratio) or kw
-
-        (cols_drop if drop else cols_keep).append(c)
-        rows.append((c, u, round(ratio, 4), kw, drop))
-
-    stats = pd.DataFrame(
-        rows, columns=["coluna", "n_unique", "unique_ratio", "kw_match", "drop"]
-    ).sort_values(["drop", "unique_ratio"], ascending=[False, False])
-    return cols_keep, cols_drop, stats
-
-
-def cap_top_k(
-    df: pd.DataFrame,
-    col: str,
-    k: int = 50,
-    other_label: str = "OUTROS",
-) -> None:
-    """Agrupa a cauda longa de uma coluna nas top-k categorias. Inplace."""
-    top = set(df[col].astype("string").value_counts(dropna=True).nlargest(k).index)
-    df[col] = df[col].where(df[col].isin(top), other_label)
-
-
-def binarize_numerics(
-    df: pd.DataFrame,
-    cols: Optional[List[str]] = None,
-    quantiles: List[float] = None,
-    exclude: Optional[List[str]] = None,
-) -> pd.DataFrame:
-    """
-    Binariza colunas numéricas em bins por quantis.
-
-    Parâmetros
-    ----------
-    cols      : lista de colunas numéricas a binarizar (None = todas)
-    quantiles : limites (padrão: [0, .25, .50, .75, 1.0] = quartis)
-    exclude   : colunas a nunca binarizar (ex.: group_col, label)
-
-    Retorna
-    -------
-    df com colunas *_bin adicionadas e originais removidas.
-    """
-    if quantiles is None:
-        quantiles = [0, 0.25, 0.50, 0.75, 1.0]
-
-    _excl = set(exclude or [])
-    _cols = (
-        cols
-        if cols is not None
-        else df.select_dtypes(include="number").columns.tolist()
-    )
-    _cols = [c for c in _cols if c not in _excl]
-
-    new_bins: Dict[str, pd.Series] = {}
-    to_drop: List[str] = []
-
-    for col in _cols:
-        try:
-            limits = np.unique(df[col].quantile(quantiles).to_numpy())
-            if len(limits) < 2:
-                continue
-            bins = pd.cut(df[col], bins=limits, include_lowest=True)
-            new_bins[f"{col}_bin"] = bins.map(
-                lambda x: f"{x.left}a{x.right}" if pd.notnull(x) else "nulo"
-            )
-            to_drop.append(col)
-        except Exception as e:
-            print(f"[binarize] Aviso: não foi possível binarizar '{col}': {e}")
-
-    result = pd.concat([df, pd.DataFrame(new_bins, index=df.index)], axis=1)
-    if to_drop:
-        result = result.drop(columns=to_drop)
-    return result
-
-
-def _to_token(series: pd.Series) -> pd.Series:
-    """Normaliza uma Series para tokens seguros (sem espaços, ponto vira _DOT_)."""
-    s = series.astype("string").fillna("nulo").str.strip()
-    s = s.str.replace(r"^(nan|none|na|null|<na>)$", "nulo", flags=re.I, regex=True)
-    s = s.str.replace(r"[\s\-]+", "_", regex=True)
-    s = s.str.replace(".", "_DOT_", regex=False)
-    return s
-
-
-def build_token_df(
-    df: pd.DataFrame,
-    feature_cols: List[str],
-) -> pd.DataFrame:
-    """
-    Transforma cada célula em 'coluna___valor' para preservar semântica da coluna.
-
-    Retorna cópia do df com apenas feature_cols convertidos para tokens.
-    """
-    out = df[feature_cols].copy()
-    for col in feature_cols:
-        out[col] = col + "___" + _to_token(out[col])
-    return out
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Núcleo: cálculo de métricas POR REGISTRO (correção principal)
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def _compute_record_level_metrics(
-    df_tokens: pd.DataFrame,
-    group_col: pd.Series,
-    feature_cols: List[str],
-    group_value,
-    add_k: float = 0.1,
-) -> pd.DataFrame:
-    """
-    Calcula, para cada token único nas feature_cols:
-      - suporte (nº de REGISTROS distintos que possuem o token no grupo)
-      - lift em REGISTROS (não em tokens)
-      - TF-IDF do grupo vs. outros grupos (para desempate)
-
-    Isso corrige o bug original onde cnt_in somava tokens, não registros.
-    """
-    df_work = df_tokens.copy()
-    df_work["__group__"] = group_col.values
-
-    mask_in = df_work["__group__"] == group_value
-    df_in = df_work[mask_in]
-    df_out = df_work[~mask_in]
-
-    n_in = len(df_in)
-    n_out = len(df_out)
-
-    # Para cada token, conta registros únicos que o possuem
-    records: Dict[str, Dict] = {}
-    for col in feature_cols:
-        for grp_df, is_in in [(df_in, True), (df_out, False)]:
-            vc = grp_df[col].value_counts(dropna=True)
-            for token, cnt in vc.items():
-                if token not in records:
-                    records[token] = {"cnt_in": 0, "cnt_out": 0}
-                if is_in:
-                    records[token]["cnt_in"] += int(cnt)
-                else:
-                    records[token]["cnt_out"] += int(cnt)
-
-    if not records:
-        return pd.DataFrame()
-
-    df_m = pd.DataFrame.from_dict(records, orient="index").reset_index()
-    df_m.columns = ["Token_raw", "cnt_in", "cnt_out"]
-
-    V = len(df_m)
-    p_in = (df_m["cnt_in"] + add_k) / (n_in + add_k * V)
-    p_out = (df_m["cnt_out"] + add_k) / (n_out + add_k * V)
-
-    df_m["n_regs_in"] = n_in
-    df_m["n_regs_out"] = n_out
-    df_m["Pct_in"] = df_m["cnt_in"] / _b.max(n_in, 1)
-    df_m["Pct_out"] = df_m["cnt_out"] / _b.max(n_out, 1)
-    df_m["Lift"] = p_in / p_out
-
-    return df_m
-
-
-def _tfidf_group_scores(
-    df_tokens: pd.DataFrame,
-    group_col: pd.Series,
-    feature_cols: List[str],
-    group_value,
-    min_df: int = 1,
-    max_df: float = 0.95,
-) -> Dict[str, float]:
-    """
-    Calcula TF-IDF normalizado para o grupo_value vs. todos os outros grupos.
-    Cada grupo = um documento (concatenação de tokens).
-    Normalização L2 remove o viés de tamanho de documento.
-    """
-    df_work = df_tokens.copy()
-    df_work["__group__"] = group_col.values
-
-    docs = (
-        df_work.groupby("__group__")[feature_cols]
-        .apply(lambda x: " ".join(x.values.flatten().astype(str)))
-        .sort_index()
-    )
-    groups = docs.index.tolist()
-    if group_value not in groups:
-        return {}
-
-    i = groups.index(group_value)
-
-    tv = TfidfVectorizer(
-        token_pattern=r"[^ ]+",
-        lowercase=False,
-        norm="l2",  # ← normalização L2: corrige viés de volume
-        sublinear_tf=True,
-        min_df=min_df,
-        max_df=max_df,
-    )
-    Xt = tv.fit_transform(docs)
-    vocab = tv.get_feature_names_out()
-    row = Xt[i].toarray()[0]
-    return dict(zip(vocab, row))
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Interface Principal
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-class ProfileAnalyzer:
-    """
-    Analisa o perfil predominante de segmentos em um DataFrame.
-
-    Exemplo de uso
-    --------------
-    >>> pa = ProfileAnalyzer(
-    ...     df=df_scored,
-    ...     group_mode="decile",
-    ...     score_col="prob_churn",
-    ...     label_col="churn",
-    ...     exclude_cols=["cliente_id"],
-    ... )
-    >>> pa.fit()
-    >>> perfil = pa.profile_group(group_value=9, topn=20)  # decil 9 (maior score)
-    >>> pa.profile_all(topn=15, min_lift=2.0)
-    """
-
-    def __init__(
-        self,
-        df: pd.DataFrame,
-        # ── Agrupamento ──────────────────────────────────────────────
-        group_mode: str = "decile",  # "decile" | "quantile" | "existing" | "raw"
-        score_col: Optional[str] = None,
-        group_col: Optional[str] = None,
-        n_quantiles: int = 10,
-        group_labels: Optional[List] = None,
-        # ── Filtro de instâncias ──────────────────────────────────────
-        filter_col: Optional[str] = None,  # ex.: "tempo_ativo_4y"
-        filter_value=None,  # ex.: 1
-        # ── Colunas ──────────────────────────────────────────────────
-        label_col: Optional[str] = None,
-        exclude_cols: Optional[List[str]] = None,
-        cols_as_text: Optional[List[str]] = None,  # numéricas → tratar como cat.
-        whitelist: Optional[List[str]] = None,
-        blacklist: Optional[List[str]] = None,
-        # ── Binarização numérica ─────────────────────────────────────
-        binarize: bool = True,
-        quantile_bins: Optional[List[float]] = None,
-        # ── Cardinalidade ────────────────────────────────────────────
-        max_unique_ratio: float = 0.05,
-        min_unique_abs: int = 100,
-        cap_topk: Optional[Dict[str, int]] = None,  # {"cargo": 60}
-        # ── Parâmetros de análise ─────────────────────────────────────
-        add_k: float = 0.1,
-        min_df: int = 1,
-        max_df: float = 0.95,
-    ):
-        self.df_raw = df.copy()
-        self.group_mode = group_mode
-        self.score_col = score_col
-        self.group_col = group_col
-        self.n_quantiles = n_quantiles
-        self.group_labels = group_labels
-        self.filter_col = filter_col
-        self.filter_value = filter_value
-        self.label_col = label_col
-        self.exclude_cols = list(exclude_cols or [])
-        self.cols_as_text = list(cols_as_text or [])
-        self.whitelist = whitelist
-        self.blacklist = blacklist
-        self.binarize = binarize
-        self.quantile_bins = quantile_bins
-        self.max_unique_ratio = max_unique_ratio
-        self.min_unique_abs = min_unique_abs
-        self.cap_topk = cap_topk or {}
-        self.add_k = add_k
-        self.min_df = min_df
-        self.max_df = max_df
-
-        # Preenchidos em fit()
-        self.df_ = None
-        self.group_series_ = None
-        self.feature_cols_ = None
-        self.df_tokens_ = None
-        self.groups_ = None
-
-    # ── Pré-processamento ─────────────────────────────────────────────────────
-
-    def fit(self, verbose: bool = True) -> "ProfileAnalyzer":
-        """Prepara o DataFrame interno: filtra, binariza, tokeniza, remove alta cardinalidade."""
-        df = self.df_raw.copy()
-
-        # 1) Filtro de instâncias
-        if self.filter_col and self.filter_value is not None:
-            df = df[df[self.filter_col] == self.filter_value].copy()
-            if verbose:
-                print(
-                    f"[fit] Filtro '{self.filter_col}=={self.filter_value}': {len(df)} registros."
-                )
-
-        # 2) Coluna de grupo
-        group = make_group_column(
-            df,
-            mode=self.group_mode,
-            score_col=self.score_col,
-            group_col=self.group_col,
-            n_quantiles=self.n_quantiles,
-            labels=self.group_labels,
-        )
-
-        # 3) Cols a excluir da análise
-        _excl = set(self.exclude_cols)
-        if self.label_col:
-            _excl.add(self.label_col)
-        if self.score_col:
-            _excl.add(self.score_col)
-        if self.group_col:
-            _excl.add(self.group_col)
-
-        # 4) Colunas numéricas → texto (não binarizar)
-        for col in self.cols_as_text:
-            if col in df.columns:
-                df[col] = df[col].astype("string")
-
-        # 5) Binarização numérica
-        if self.binarize:
-            numeric_to_bin = [
-                c
-                for c in df.select_dtypes(include="number").columns
-                if c not in _excl and c not in self.cols_as_text
-            ]
-            df = binarize_numerics(
-                df,
-                cols=numeric_to_bin,
-                quantiles=self.quantile_bins,
-                exclude=_excl,
-            )
-
-        # 6) Cap top-K categorias
-        for col, k in self.cap_topk.items():
-            if col in df.columns:
-                cap_top_k(df, col, k=k)
-
-        # 7) Colunas candidatas ao perfil
-        candidates = [c for c in df.columns if c not in _excl]
-
-        # 8) Filtro de alta cardinalidade
-        cols_keep, cols_drop, _ = remove_high_cardinality(
-            df,
-            candidates,
-            max_unique_ratio=self.max_unique_ratio,
-            min_unique_abs=self.min_unique_abs,
-            whitelist=self.whitelist,
-            blacklist=self.blacklist,
-        )
-        if verbose:
-            print(
-                f"[fit] Colunas descartadas (alta cardinalidade/PII): {len(cols_drop)}"
-            )
-            print(f"[fit] Colunas para análise: {len(cols_keep)}")
-
-        # 9) Tokenização
-        df_tok = build_token_df(df, cols_keep)
-
-        self.df_ = df
-        self.group_series_ = group.reset_index(drop=True)
-        self.feature_cols_ = cols_keep
-        self.df_tokens_ = df_tok.reset_index(drop=True)
-        self.groups_ = sorted(self.group_series_.dropna().unique())
-
-        if verbose:
-            print(f"[fit] Grupos encontrados: {self.groups_}")
-
-        return self
-
-    # ── Análise por grupo ─────────────────────────────────────────────────────
-
-    def profile_group(
-        self,
-        group_value,
-        topn: int = 20,
-        min_lift: float = 2.0,
-        min_support_pct: float = 0.01,
-        one_per_col: bool = False,
-    ) -> pd.DataFrame:
-        """
-        Retorna os topn tokens mais distintivos do grupo_value.
-
-        Parâmetros
-        ----------
-        group_value     : valor do grupo a analisar (ex.: 9 para o 10º decil)
-        topn            : máximo de linhas no resultado
-        min_lift        : lift mínimo para inclusão primária
-        min_support_pct : percentual mínimo de registros do grupo que possuem o token
-        one_per_col     : se True, retorna no máx. 1 token por coluna original
-        """
-        self._check_fitted()
-
-        # Métricas em registros (CORREÇÃO principal)
-        df_m = _compute_record_level_metrics(
-            self.df_tokens_,
-            self.group_series_,
-            self.feature_cols_,
-            group_value,
-            add_k=self.add_k,
-        )
-        if df_m.empty:
-            return df_m
-
-        # TF-IDF normalizado para desempate
-        tfidf_map = _tfidf_group_scores(
-            self.df_tokens_,
-            self.group_series_,
-            self.feature_cols_,
-            group_value,
-            min_df=self.min_df,
-            max_df=self.max_df,
-        )
-        df_m["TFIDF"] = df_m["Token_raw"].map(tfidf_map).fillna(0.0)
-
-        n_in = int(df_m["n_regs_in"].iloc[0]) if not df_m.empty else 1
-        piso = 5 if n_in <= 200 else 10
-        min_sup = _b.max(piso, ceil(min_support_pct * n_in))
-
-        # Filtro principal
-        df_filt = df_m.query("cnt_in >= @min_sup and Lift >= @min_lift").copy()
-
-        # Fallback por TF-IDF (sem abaixar suporte)
-        if len(df_filt) < topn:
-            falta = topn - len(df_filt)
-            df_fill = (
-                df_m[~df_m["Token_raw"].isin(df_filt["Token_raw"])]
-                .sort_values(["TFIDF", "cnt_in"], ascending=[False, False])
-                .head(falta)
-            )
-            df_filt = pd.concat([df_filt, df_fill], ignore_index=True)
-
-        # one_per_col: aplicado ANTES da limpeza visual (usa '___' como separador)
-        if one_per_col and not df_filt.empty:
-            df_filt[["__col__", "__val__"]] = df_filt["Token_raw"].str.split(
-                "___", n=1, expand=True
-            )
-            df_filt = (
-                df_filt.sort_values(
-                    ["__col__", "Lift", "cnt_in", "TFIDF"],
-                    ascending=[True, False, False, False],
-                )
-                .groupby("__col__", as_index=False)
-                .head(1)
-                .drop(columns=["__col__", "__val__"])
-            )
-
-        # Ordenação final
-        if not df_filt.empty:
-            df_filt = df_filt.sort_values(
-                ["Lift", "cnt_in", "TFIDF"], ascending=[False, False, False]
-            ).head(topn)
-
-        # Limpeza visual dos tokens (DEPOIS de one_per_col)
-        df_filt = df_filt.copy()
-        df_filt["Atributo"] = (
-            df_filt["Token_raw"]
-            .str.replace("___", ": ", regex=False)
-            .str.replace("_DOT_", ".", regex=False)
-            .str.replace(r"(?<=\d)a(?=\d)", "–", regex=True)
-            .str.replace(r"__+", "_", regex=True)
-        )
-
-        cols_out = ["Atributo", "cnt_in", "Pct_in", "Pct_out", "Lift", "TFIDF"]
-        return df_filt[[c for c in cols_out if c in df_filt.columns]].reset_index(
-            drop=True
-        )
-
-    def profile_all(
-        self,
-        topn: int = 20,
-        min_lift: float = 2.0,
-        min_support_pct: float = 0.01,
-        one_per_col: bool = False,
-        display_fn=None,
-    ) -> Dict:
-        """
-        Perfil de todos os grupos. Imprime ou passa para display_fn.
-
-        Retorna dict {group_value: DataFrame}.
-        """
-        self._check_fitted()
-        results = {}
-        for g in self.groups_:
-            label = (
-                f"Grupo {g}"
-                if not str(g).isdigit()
-                else f"Faixa {int(g)+1} (grupo {g})"
-            )
-            print(f"\n{'='*60}")
-            print(f"  PERFIL PREDOMINANTE — {label}")
-            print(f"{'='*60}")
-            df_p = self.profile_group(
-                g,
-                topn=topn,
-                min_lift=min_lift,
-                min_support_pct=min_support_pct,
-                one_per_col=one_per_col,
-            )
-            results[g] = df_p
-            if display_fn:
-                display_fn(df_p)
-            else:
-                print(df_p.to_string(index=False))
-        return results
-
-    # ── Helpers ───────────────────────────────────────────────────────────────
-
-    def _check_fitted(self):
-        if self.df_tokens_ is None:
-            raise RuntimeError(
-                "Chame .fit() antes de .profile_group() ou .profile_all()."
-            )
-
-    def feature_importance_summary(self) -> pd.DataFrame:
-        """
-        Retorna um DataFrame com o lift médio de cada token através de todos os grupos.
-        Útil para entender quais variáveis mais diferenciam os grupos em geral.
-        """
-        self._check_fitted()
-        rows = []
-        for g in self.groups_:
-            df_m = _compute_record_level_metrics(
-                self.df_tokens_, self.group_series_, self.feature_cols_, g, self.add_k
-            )
-            if not df_m.empty:
-                df_m["grupo"] = g
-                rows.append(df_m[["Token_raw", "Lift", "cnt_in", "grupo"]])
-
-        if not rows:
-            return pd.DataFrame()
-
-        all_m = pd.concat(rows, ignore_index=True)
-        summary = (
-            all_m.groupby("Token_raw")
-            .agg(
-                lift_max=("Lift", "max"),
-                lift_mean=("Lift", "mean"),
-                grupos_top=("grupo", lambda x: list(x[all_m.loc[x.index, "Lift"] > 2])),
-            )
-            .sort_values("lift_max", ascending=False)
-            .reset_index()
-        )
-        summary["Atributo"] = (
-            summary["Token_raw"]
-            .str.replace("___", ": ", regex=False)
-            .str.replace("_DOT_", ".", regex=False)
-        )
-        return summary[["Atributo", "lift_max", "lift_mean", "grupos_top"]]
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Exemplo de uso
-# ─────────────────────────────────────────────────────────────────────────────
-"""
-# ── Caso 1: Decis de modelo (reproduz o comportamento original, com correções) ──
-pa = ProfileAnalyzer(
-    df=df_scored,
-    group_mode="decile",
-    score_col="prob_target",
-    filter_col="tempo_ativo_4y",
-    filter_value=1,
-    label_col="tempo_ativo_4y",
-    exclude_cols=["cliente_id"],
-    cols_as_text=["cfunc_lider", "cfunc_sindz"],
-    blacklist=["cescri_cont", "cescri_contt"],
-    whitelist=["cargo", "cargo_raiz"],
-    cap_topk={"cargo": 60},
-)
-pa.fit()
-pa.profile_all(topn=20, min_lift=2.0, one_per_col=False)
-
-# ── Caso 2: Clusters K-Means ──
-from sklearn.cluster import KMeans
-km = KMeans(n_clusters=5, random_state=42).fit(X_scaled)
-df["cluster"] = km.labels_
-
-pa2 = ProfileAnalyzer(
-    df=df,
-    group_mode="existing",
-    group_col="cluster",
-    exclude_cols=["cliente_id"],
-)
-pa2.fit()
-pa2.profile_all(topn=15, min_lift=1.5)
-
-# ── Caso 3: Segmento de negócio já existente ──
-pa3 = ProfileAnalyzer(
-    df=df,
-    group_mode="raw",
-    group_col="segmento_rfm",   # ex.: "Campeão", "Em risco", "Hibernando"
-    exclude_cols=["cliente_id"],
-)
-pa3.fit()
-perfil_campeao = pa3.profile_group("Campeão", topn=20)
-
-# ── Caso 4: Quantis customizados (quintis) ──
-pa4 = ProfileAnalyzer(
-    df=df_scored,
-    group_mode="quantile",
-    score_col="prob_churn",
-    n_quantiles=5,
-)
-pa4.fit()
-pa4.profile_all()
-
-# ── Resumo de features que mais diferenciam grupos ──
-summary = pa.feature_importance_summary()
-"""
+            print("   📊 CV não disponível")
+        return engine
