@@ -254,46 +254,6 @@ class AutoClassificationEngine:
                             df[c] = df[c].astype(str).replace("nan", np.nan)
         return df
 
-    # def _sanity_check(self, df: pd.DataFrame) -> pd.DataFrame:
-    #     leakage_thr = self.params.get("leakage_threshold", 0.98)
-    #     to_drop = []
-    #     target_series = df[self.target]
-
-    #     const_cols = [c for c in df.columns if df[c].nunique(dropna=False) <= 1]
-    #     if const_cols:
-    #         self.eliminated_features.setdefault("constantes_pos_rare", []).extend(
-    #             const_cols
-    #         )
-    #         to_drop.extend(const_cols)
-    #         df = df.drop(columns=const_cols)
-
-    #     num_cols = df.select_dtypes(include=[np.number]).columns
-    #     if self.target in num_cols:
-    #         corrs = df[num_cols].corr()[self.target].abs().sort_values(ascending=False)
-    #         leaks = corrs[(corrs > leakage_thr) & (corrs.index != self.target)]
-    #         if not leaks.empty:
-    #             self.eliminated_features["leakage"].extend(leaks.index.tolist())
-    #             to_drop.extend(leaks.index.tolist())
-
-    #     cat_cols = df.select_dtypes(include=["object", "category"]).columns
-    #     for col in cat_cols:
-    #         if col == self.target or col in to_drop:
-    #             continue
-    #         u = _theils_u(df[col], target_series)
-    #         if u > leakage_thr:
-    #             self.eliminated_features["leakage"].append(col)
-    #             to_drop.append(col)
-
-    #     obs_count = len(df)
-    #     for col in cat_cols:
-    #         if col == self.target or col in to_drop:
-    #             continue
-    #         if df[col].nunique() / obs_count > 0.5:
-    #             self.eliminated_features["alta_cardinalidade"].append(col)
-    #             to_drop.append(col)
-
-    #     return df.drop(columns=to_drop)
-
     def _sanity_check(self, df: pd.DataFrame) -> pd.DataFrame:
         leakage_thr = self.params.get("leakage_threshold", 0.98)
         to_drop = []
@@ -312,28 +272,19 @@ class AutoClassificationEngine:
         features_to_check = [
             c for c in df.columns if c not in to_drop and c != self.target
         ]
-
         for col in features_to_check:
             col_is_num = pd.api.types.is_numeric_dtype(df[col])
-
             try:
                 if col_is_num and not target_is_cat:
-                    # Numérico vs Numérico (Regressão)
                     corr_method = self.params.get("corr_method", "pearson")
                     assoc = _numeric_correlation(
                         df[col], target_series.astype(float), method=corr_method
                     )
-
                 elif not col_is_num and target_is_cat:
-                    # Categórico vs Categórico (Classificação)
                     assoc = _theils_u(df[col], target_series)
-
                 elif col_is_num and target_is_cat:
-                    # Feature Numérica vs Target Categórico (Classificação)
                     assoc = _eta_squared(target_series, df[col])
-
                 else:
-                    # Feature Categórica vs Target Numérico (Regressão)
                     assoc = _eta_squared(df[col], target_series.astype(float))
             except Exception:
                 assoc = 0.0
@@ -769,8 +720,114 @@ class AutoClassificationEngine:
 
         return Pipeline(steps=[("preprocessor", preprocessor)])
 
+    def describe_pipeline(self):
+        """
+        Exibe um resumo legível de todas as transformações aplicadas pela pipeline sklearn,
+        incluindo imputação, scaling, encoding, log-transform e clipping de outliers.
+        """
+        if self.pipeline is None:
+            print("⚠️  Pipeline sklearn não está ativo (use_sklearn_pipeline=False).")
+            return
+
+        print("\n🔬 --- DESCRIÇÃO DA PIPELINE SKLEARN ---")
+
+        preprocessor = self.pipeline.named_steps["preprocessor"]
+
+        for name, transformer, cols in preprocessor.transformers_:
+            cols = list(cols)
+            if not cols:
+                continue
+            print(f"\n📦 Transformador: '{name}' → {len(cols)} coluna(s)")
+            print(f"   Colunas: {cols}")
+
+            for step_name, step in transformer.steps:
+                cls_name = step.__class__.__name__
+                print(f"   └── {step_name}: {cls_name}")
+
+                # SimpleImputer — valores de imputação por coluna
+                if hasattr(step, "statistics_") and step.statistics_ is not None:
+                    imputed = {
+                        c: round(float(v), 4)
+                        for c, v in zip(cols, step.statistics_)
+                        if not np.isnan(float(v))
+                    }
+                    if imputed:
+                        print(f"        strategy={step.strategy}")
+                        for c, v in list(imputed.items())[:5]:
+                            print(f"          {c}: {v}")
+                        if len(imputed) > 5:
+                            print(f"          ... (+{len(imputed) - 5} colunas)")
+
+                # StandardScaler — média e desvio padrão
+                if hasattr(step, "mean_") and step.mean_ is not None:
+                    print(
+                        f"        with_mean={step.with_mean} | with_std={step.with_std}"
+                    )
+                    for c, m, s in zip(cols[:3], step.mean_[:3], step.scale_[:3]):
+                        print(f"          {c}: média={m:.4f}, std={s:.4f}")
+                    if len(cols) > 3:
+                        print(f"          ... (+{len(cols) - 3} colunas)")
+
+                # OrdinalEncoder — categorias aprendidas
+                if hasattr(step, "categories_") and step.categories_ is not None:
+                    for c, cats in zip(cols[:3], step.categories_[:3]):
+                        print(
+                            f"          {c}: {list(cats[:5])}{'...' if len(cats) > 5 else ''}"
+                        )
+                    if len(cols) > 3:
+                        print(f"          ... (+{len(cols) - 3} colunas)")
+
+                # TargetEncoder
+                if cls_name == "TargetEncoder" and hasattr(step, "encodings_"):
+                    print(
+                        f"          target_type={step.target_type} | smooth={step.smooth}"
+                    )
+
+                # PCA
+                if hasattr(step, "explained_variance_ratio_"):
+                    total_var = step.explained_variance_ratio_.sum()
+                    print(
+                        f"        n_components={step.n_components_} | "
+                        f"variância explicada={total_var:.1%}"
+                    )
+
+        # Log-transform e clipping (fora da sklearn pipeline, mas parte do engine)
+        print("\n📐 Transformações do Engine (pré-pipeline):")
+
+        if self._log_cols:
+            print(f"   Log1p aplicado em {len(self._log_cols)} coluna(s):")
+            for c in self._log_cols:
+                print(f"     - {c}")
+        else:
+            print("   Log1p: nenhuma coluna")
+
+        if self._outlier_bounds:
+            print(f"   Clipping IQR aplicado em {len(self._outlier_bounds)} coluna(s):")
+            for c, (lo, hi) in list(self._outlier_bounds.items())[:5]:
+                print(f"     - {c}: [{lo:.4f}, {hi:.4f}]")
+            if len(self._outlier_bounds) > 5:
+                print(f"     ... (+{len(self._outlier_bounds) - 5} colunas)")
+        else:
+            print("   Clipping IQR: nenhuma coluna")
+
+        if self._rare_categories:
+            total_others = sum(
+                1
+                for col, cats in self._rare_categories.items()
+                if "OTHER" in cats or len(cats) < 10
+            )
+            print(
+                f"   Rare-label agrupado em {len(self._rare_categories)} coluna(s) categórica(s)"
+            )
+        else:
+            print("   Rare-label: nenhuma coluna")
+
+        print(f"\n📋 Features finais ({len(self.selected_features)}):")
+        print(f"   {self.selected_features}")
+        print("\n" + "─" * 60)
+
     # -----------------------------------------------------------------------
-    # [NEW-3] THRESHOLD HELPERS
+    # THRESHOLD HELPERS
     # -----------------------------------------------------------------------
 
     def get_threshold(
@@ -820,7 +877,7 @@ class AutoClassificationEngine:
     # -----------------------------------------------------------------------
 
     def fit(self, train_data: pd.DataFrame, time_limit: int = None):
-        print("\n🚀 --- TREINAMENTO INICIADO (v0.0.6) ---")
+        print("\n🚀 --- TREINAMENTO INICIADO (v0.0.7) ---")
 
         if time_limit is None:
             time_limit = self.params.get("time_limit", 300)
@@ -1151,7 +1208,7 @@ class AutoClassificationEngine:
             rare_cats_fold = {}
             cat_cols = X_tr_raw.select_dtypes(include=["object", "category"]).columns
             for col in cat_cols:
-                # Converte para string antes — evita TypeError em colunas dtype='category'
+                # Converte para string — evita TypeError em colunas dtype='category'
                 X_tr_raw[col] = X_tr_raw[col].astype(str)
                 X_vl_raw[col] = X_vl_raw[col].astype(str)
 
@@ -1247,7 +1304,7 @@ class AutoClassificationEngine:
             y_pred = pred_fold.predict(X_vl_t)
             y_bin = (y_vl.astype(str) == str(pos_label)).astype(int)
 
-            # Linha nova
+            # Binariza y_pred — necessário quando target é string ('good'/'bad')
             y_pred = (y_pred.astype(str) == str(pos_label)).astype(int)
 
             oof_probs[val_idx] = y_prob_pos.values
@@ -1566,26 +1623,9 @@ class AutoClassificationEngine:
         bins: int = 10,
         cut_edges=None,
     ):
-        """
-        Calcula estatísticas por decil.
-
-        Parâmetros:
-            y_true     : array de labels verdadeiros (0/1)
-            y_prob     : array de probabilidades preditas
-            bins       : número de decis (default 10)
-            cut_edges  : bordas dos intervalos aprendidas no treino.
-                         Se None, aprende via qcut (decis independentes)
-                         e retorna os edges para reusar no teste.
-
-        Retorna:
-            (stats_df, cut_edges)
-            cut_edges pode ser passado na chamada do teste para usar os
-            mesmos intervalos do treino (análise de estabilidade).
-        """
         df = pd.DataFrame({"target": y_true, "prob": y_prob})
 
         if cut_edges is None:
-            # qcut no rank para lidar com empates, mas edges salvos em probabilidade
             df["decile"] = pd.qcut(
                 df["prob"].rank(method="first", ascending=True),
                 bins,
@@ -1593,12 +1633,10 @@ class AutoClassificationEngine:
                 retbins=False,
                 duplicates="drop",
             )
-            # edges em probabilidade: quantis reais para usar no teste
             cut_edges = np.quantile(df["prob"], np.linspace(0, 1, bins + 1))
-            cut_edges[0] -= 1e-6  # garante inclusão do menor valor
-            cut_edges[-1] += 1e-6  # garante inclusão do maior valor
+            cut_edges[0] -= 1e-6
+            cut_edges[-1] += 1e-6
         else:
-            # Edges fixos do treino — análise de estabilidade
             n_labels = len(cut_edges) - 1
             df["decile"] = pd.cut(
                 df["prob"],
@@ -1608,7 +1646,6 @@ class AutoClassificationEngine:
                 ordered=True,
             )
 
-        # Agrupamento por decil — calcula contagem e eventos
         stats = (
             df.groupby("decile", observed=False)
             .agg(count=("target", "count"), events=("target", "sum"))
@@ -1619,7 +1656,6 @@ class AutoClassificationEngine:
         global_rate = df["target"].mean()
         stats["lift"] = stats["event_rate"] / global_rate if global_rate > 0 else np.nan
 
-        # KS cumulativo (ordem decrescente de score = maior risco primeiro)
         stats_sorted = stats.sort_values("decile", ascending=False).copy()
         total_pos = stats_sorted["events"].sum()
         total_neg = (stats_sorted["count"] - stats_sorted["events"]).sum()
@@ -1635,7 +1671,6 @@ class AutoClassificationEngine:
         )
         stats = stats_sorted.sort_values("decile").reset_index(drop=True)
 
-        # Intervalos de score por decil (baseados nas probabilidades originais, não no rank)
         score_ranges = (
             df.groupby("decile", observed=False)["prob"]
             .agg(score_min="min", score_max="max")
@@ -1732,20 +1767,7 @@ class AutoClassificationEngine:
         use_oof: bool = False,
         bins: int = 10,
     ):
-        """
-        Gera relatório completo de performance.
-
-        Parâmetros:
-            test_data  : DataFrame de teste (obrigatório)
-            train_data : DataFrame de treino para comparação in-sample (opcional)
-            use_oof    : Se True e cross_validate() foi executado, usa predições
-                         OOF no lugar do treino in-sample — estimativa mais honesta.
-                         Requer que cross_validate() tenha sido chamado antes.
-            bins       : Número de decis/quintis
-        """
         datasets_raw = {"Teste": test_data}
-
-        # Só adiciona treino in-sample se use_oof=False
         if train_data is not None and not use_oof:
             datasets_raw["Treino"] = train_data
 
@@ -1754,7 +1776,6 @@ class AutoClassificationEngine:
         colors = {"Treino": "#ff7f0e", "Treino (OOF)": "#ff7f0e", "Teste": "#1f77b4"}
         thr_strategy = self.params.get("threshold_strategy", "youden")
 
-        # ── Pré-processa datasets normais (Teste e eventualmente Treino in-sample)
         for name, data in datasets_raw.items():
             X_trans, y = self._preprocess_for_inference(data)
             y_prob_pos = self.predictor.predict_proba(X_trans)[pos_label].values
@@ -1804,7 +1825,6 @@ class AutoClassificationEngine:
                 "calib_pred": prob_pred,
             }
 
-        # ── OOF: constrói entrada "Treino (OOF)" sem preprocessar nada ────────
         if use_oof:
             if not self.cv_results:
                 raise RuntimeError(
@@ -1862,8 +1882,6 @@ class AutoClassificationEngine:
                 "calib_pred": prob_pred_oof,
             }
 
-        # ── Decis ─────────────────────────────────────────────────────────────
-        # "referencia" = "Treino (OOF)" se use_oof, senão "Treino"
         ref_name = "Treino (OOF)" if use_oof else "Treino"
 
         decile_indep = {}
@@ -1897,10 +1915,8 @@ class AutoClassificationEngine:
             if "Teste" in results:
                 decile_fixed["Teste"] = decile_indep["Teste"]
 
-        # ── Verifica overfitting usando referência correta ─────────────────────
         ref_for_overfit = ref_name if ref_name in results else None
 
-        # ── Layout ────────────────────────────────────────────────────────────
         fig = plt.figure(figsize=(24, 26), constrained_layout=True)
         gs = fig.add_gridspec(5, 4)
 
@@ -1961,7 +1977,6 @@ class AutoClassificationEngine:
                 label=f"{name} AP={res['metrics']['Avg Precision']:.3f}",
             )
 
-        # Alerta de overfitting baseado na referência correta
         if ref_for_overfit and ref_for_overfit in results:
             ap_gap = (
                 results[ref_for_overfit]["metrics"]["Avg Precision"]
@@ -2187,13 +2202,6 @@ class AutoClassificationEngine:
         bins: int,
         title_mode: str,
     ):
-        """
-        Renderiza um painel de decis.
-
-        title_mode:
-          'performance'  → bins independentes, cada dataset com seus próprios percentis
-          'estabilidade' → bins fixos do treino, teste mapeado nos mesmos intervalos
-        """
         all_stats = []
         for name, stats in decile_data.items():
             d = stats.copy()
@@ -2222,7 +2230,6 @@ class AutoClassificationEngine:
             palette=colors,
         )
 
-        # Linha de média global por dataset
         for ds in hue_order:
             if ds in results:
                 mean_pct = results[ds]["y_true"].mean() * 100.0
@@ -2234,7 +2241,6 @@ class AutoClassificationEngine:
                     label=f"Média {ds} ({mean_pct:.1f}%)",
                 )
 
-        # Labels em cada barra: "% \n [score_min, score_max] \n n=X"
         for i, container in enumerate(ax.containers):
             if i >= len(hue_order):
                 continue
@@ -2260,13 +2266,14 @@ class AutoClassificationEngine:
                 label = f"{row['pct_positivos']:.1f}%\n{row['intervalo']}\nn={int(row['count'])}"
                 ax.text(x, y + 0.3, label, ha="center", va="bottom", fontsize=7)
 
-        # KS apenas no painel de performance
         ks_txt = ""
         if title_mode == "performance" and "Teste" in results:
             ks_stat = results["Teste"]["decile_stats"]["ks"].max()
             ks_txt = f"  |  KS Máximo (Teste): {ks_stat:.4f}"
 
-        label_type = "Decil" if bins == 10 else "Quintil"
+        # [FIX] label_type genérico para qualquer valor de bins
+        label_map_bins = {5: "Quintil", 10: "Decil", 4: "Quartil", 20: "Vigésimo"}
+        label_type = label_map_bins.get(bins, f"{bins}-Faixas")
 
         if title_mode == "performance":
             title = f"Taxa de Eventos por {label_type} — Performance (bins independentes){ks_txt}"
