@@ -1,14 +1,19 @@
-# v0.1.0 Claude
+# v0.1.2 Claude
 # Changelog:
-#   [v0.1.0] FIX CRÍTICO: leakage no log-transform do cross_validate — shift agora usa min() do fold de treino
-#   [v0.1.0] FIX CRÍTICO: cross_validate respeita use_sklearn_pipeline=False
-#   [v0.1.0] FIX: profile_all — label correto para grupos float/Interval (isinstance(g, numbers.Integral))
-#   [v0.1.0] FIX: _tfidf_group_scores — compatibilidade com pandas 2.2+ (include_groups via try/except)
-#   [v0.1.0] FIX: _plot_decil — labels de barra alinhados corretamente (itera ALL bars + ALL rows em paralelo)
-#   [v0.1.0] FIX: _plot_decil — usa matplotlib.container.BarContainer para filtrar containers válidos
-#   [v0.1.0] MELHORIA: cores treino/teste mais distintas e notáveis (#E74C3C vermelho vs #2980B9 azul forte)
-#   [v0.1.0] MELHORIA: offset de label relativo ao range do eixo Y (evita sobreposição)
-#   [v0.1.0] AVISO: use_importance_filter com tuning_data pode gerar viés — warning adicionado
+#   [v0.1.0] FIX: leakage no log-shift do cross_validate — shift calculado só no fold de treino
+#   [v0.1.0] FIX: cross_validate respeita use_sklearn_pipeline=False
+#   [v0.1.0] FIX: profile_all label correto para grupos float/pd.Interval
+#   [v0.1.0] FIX: _tfidf_group_scores compatível com pandas 2.2+ (include_groups=False)
+#   [v0.1.0] FIX: _plot_decil — alinhamento de labels, offset relativo, ylim expandido, clip_on=False
+#   [v0.1.0] FIX: del pred_fold + gc.collect() em cada fold do CV (vazamento de memória)
+#   [v0.1.0] FIX: guard multiclasse em fit() com mensagem clara
+#   [v0.1.0] NEW: rare_label_min_freq exposto como parâmetro do engine
+#   [v0.1.0] NEW: _handle_multicollinearity usa df.corr() para pares numéricos (O(n) → O(1))
+#   [v0.1.0] NEW: save_bundle com versioning (framework/python/sklearn) e overwrite protection
+#   [v0.1.0] NEW: load() emite aviso ao detectar versão diferente do framework
+#   [v0.1.0] NEW: cores distintas treino (#F06000) vs teste (#0055A8) em todos os plots
+#   [v0.1.0] NEW: Brier Score adicionado ao scorecard e métricas do CV
+#   [v0.1.0] NEW: num_cpus padrão = os.cpu_count() ou 6
 #   [v0.0.9] ProfileAnalyzer integrado — perfil de segmentos por decil/cluster/segmento
 #   [v0.0.9] engine.profile_analyzer() — factory method pré-configurado com score do modelo
 #   [v0.0.9] cross_validate: n_repeats (RepeatedStratifiedKFold) + OOF por média de repetições
@@ -19,11 +24,13 @@
 
 from __future__ import annotations
 
+import gc
 import hashlib
 import numbers
 import re
 import builtins as _b
 import os
+import sys
 import warnings
 import logging
 from math import ceil
@@ -33,9 +40,9 @@ import numpy as np
 import pandas as pd
 import matplotlib
 import matplotlib.pyplot as plt
-import matplotlib.container as mcontainer
 import seaborn as sns
 import joblib
+import sklearn
 
 from scipy.stats import entropy, skew, spearmanr
 from scipy.stats.contingency import association
@@ -52,6 +59,7 @@ from sklearn.metrics import (
     log_loss,
     f1_score,
     recall_score,
+    brier_score_loss,  # [NEW v0.1.0]
 )
 from sklearn.calibration import calibration_curve
 from sklearn.compose import ColumnTransformer
@@ -84,6 +92,11 @@ try:
 except ImportError:
     _HAS_SMOTE = False
 
+_FRAMEWORK_VERSION = "0.1.1"
+
+# Cores canônicas para treino/teste — alta distinção visual e para daltônicos
+_COLOR_TRAIN = "#F06000"  # laranja-forte
+_COLOR_TEST = "#0055A8"  # azul-forte
 
 # =============================================================================
 # BLOCO 1 — Utilitários de Associação (AutoClassificationEngine)
@@ -138,6 +151,17 @@ def _numeric_correlation(a: pd.Series, b: pd.Series, method: str = "pearson") ->
     return max(pearson, spearman_val)
 
 
+def _make_profile_feat_name(col: str, val_token: str) -> str:
+    """Gera nome seguro e legível para uma feature binária de perfil."""
+    raw = f"pf__{col}__{val_token}"
+    if len(raw) > 64:
+        import hashlib as _hl
+
+        suffix = _hl.md5(raw.encode()).hexdigest()[:6]
+        raw = f"pf__{col[:24]}__{suffix}"
+    return re.sub(r"[^A-Za-z0-9_]", "_", raw)
+
+
 # =============================================================================
 # BLOCO 2 — ProfileAnalyzer: utilitários de pré-processamento
 # =============================================================================
@@ -151,15 +175,6 @@ def make_group_column(
     n_quantiles: int = 10,
     labels: Optional[List] = None,
 ) -> pd.Series:
-    """
-    Cria / valida a coluna de grupo que será analisada pelo ProfileAnalyzer.
-
-    mode : "decile" | "quantile" | "existing" | "raw"
-      - "decile"   : qcut em score_col com n_quantiles=10
-      - "quantile" : qcut em score_col com n_quantiles customizável
-      - "existing" : usa group_col já existente no df (sem transformação)
-      - "raw"      : retorna group_col sem cast (clusters, segmentos, etc.)
-    """
     if mode in ("existing", "raw"):
         if group_col is None or group_col not in df.columns:
             raise ValueError(f"group_col='{group_col}' não encontrado no DataFrame.")
@@ -181,10 +196,6 @@ def remove_high_cardinality(
     whitelist: Optional[List[str]] = None,
     blacklist: Optional[List[str]] = None,
 ) -> tuple:
-    """
-    Separa colunas úteis de colunas com alta cardinalidade ou keywords de PII.
-    Retorna (cols_keep, cols_drop, stats_df).
-    """
     _kw = suspicious_keywords or [
         "id",
         "cpf",
@@ -237,7 +248,6 @@ def cap_top_k(
     k: int = 50,
     other_label: str = "OUTROS",
 ) -> None:
-    """Agrupa a cauda longa de uma coluna nas top-k categorias. Inplace."""
     top = set(df[col].astype("string").value_counts(dropna=True).nlargest(k).index)
     df[col] = df[col].where(df[col].isin(top), other_label)
 
@@ -248,10 +258,6 @@ def binarize_numerics(
     quantiles: List[float] = None,
     exclude: Optional[List[str]] = None,
 ) -> pd.DataFrame:
-    """
-    Binariza colunas numéricas em bins por quantis.
-    Retorna df com colunas *_bin adicionadas e originais removidas.
-    """
     if quantiles is None:
         quantiles = [0, 0.25, 0.50, 0.75, 1.0]
 
@@ -286,7 +292,6 @@ def binarize_numerics(
 
 
 def _to_token(series: pd.Series) -> pd.Series:
-    """Normaliza uma Series para tokens seguros (sem espaços, ponto vira _DOT_)."""
     s = series.astype("string").fillna("nulo").str.strip()
     s = s.str.replace(r"^(nan|none|na|null|<na>)$", "nulo", flags=re.I, regex=True)
     s = s.str.replace(r"[\s\-]+", "_", regex=True)
@@ -295,10 +300,6 @@ def _to_token(series: pd.Series) -> pd.Series:
 
 
 def build_token_df(df: pd.DataFrame, feature_cols: List[str]) -> pd.DataFrame:
-    """
-    Transforma cada célula em 'coluna___valor' para preservar semântica da coluna.
-    Retorna cópia do df com apenas feature_cols convertidos para tokens.
-    """
     out = df[feature_cols].copy()
     for col in feature_cols:
         out[col] = col + "___" + _to_token(out[col])
@@ -317,12 +318,6 @@ def _compute_record_level_metrics(
     group_value,
     add_k: float = 0.1,
 ) -> pd.DataFrame:
-    """
-    Calcula, para cada token único nas feature_cols:
-      - suporte (nº de REGISTROS distintos que possuem o token no grupo)
-      - lift em REGISTROS (não em tokens) — correção vs. implementação ingênua
-      - base para TF-IDF (para desempate)
-    """
     df_work = df_tokens.copy()
     df_work["__group__"] = group_col.values
 
@@ -372,49 +367,46 @@ def _tfidf_group_scores(
     min_df: int = 1,
     max_df: float = 0.95,
 ) -> Dict[str, float]:
-    """
-    TF-IDF normalizado (L2) do grupo vs. todos os outros grupos.
-    Cada grupo = um documento. Normalização L2 remove viés de tamanho.
-    """
     df_work = df_tokens.copy()
     df_work["__group__"] = group_col.values
 
-    # [FIX v0.1.0] Compatibilidade com pandas 2.2+ (include_groups deprecado).
-    # Selecionamos feature_cols antes do apply para que __group__ nunca entre
-    # no subframe — o try/except garante compatibilidade com pandas <2.2.
-    try:
-        docs = (
-            df_work.groupby("__group__")[feature_cols]
-            .apply(
-                lambda x: list(x.values.flatten().astype(str)),
-                include_groups=False,
-            )
-            .sort_index()
-        )
-    except TypeError:
-        docs = (
-            df_work.groupby("__group__")[feature_cols]
-            .apply(lambda x: list(x.values.flatten().astype(str)))
-            .sort_index()
-        )
+    # [FIX v0.1.0] include_groups=False evita DeprecationWarning no pandas 2.2+
+    docs = (
+        df_work.groupby("__group__")[feature_cols]
+        .apply(lambda x: list(x.values.flatten().astype(str)), include_groups=False)
+        .sort_index()
+    )
 
     groups = docs.index.tolist()
     if group_value not in groups:
         return {}
 
+    # -------------------------------------------------------------------------
+    # CORREÇÃO AQUI: Se for binário (<= 2 grupos), o max_df não pode ser 0.95,
+    # senão tokens presentes em ambas as classes (100% de DF) zeram o vocabulário.
+    # -------------------------------------------------------------------------
+    if len(groups) <= 2 and isinstance(max_df, float) and max_df < 1.0:
+        max_df = 1.0
+
     i = groups.index(group_value)
-    tv = TfidfVectorizer(
-        analyzer=lambda x: x,
-        lowercase=False,
-        norm="l2",
-        sublinear_tf=True,
-        min_df=min_df,
-        max_df=max_df,
-    )
-    Xt = tv.fit_transform(docs)
-    vocab = tv.get_feature_names_out()
-    row = Xt[i].toarray()[0]
-    return dict(zip(vocab, row))
+
+    try:
+        tv = TfidfVectorizer(
+            analyzer=lambda x: x,
+            lowercase=False,
+            norm="l2",
+            sublinear_tf=True,
+            min_df=min_df,
+            max_df=max_df,
+        )
+        Xt = tv.fit_transform(docs)
+        vocab = tv.get_feature_names_out()
+        row = Xt[i].toarray()[0]
+        return dict(zip(vocab, row))
+    except ValueError:
+        # Fallback seguro: se o TF-IDF podar tudo (ex: todos os termos são raros),
+        # retorna dict vazio para não quebrar a execução.
+        return {}
 
 
 # =============================================================================
@@ -432,52 +424,28 @@ class ProfileAnalyzer:
       - Segmentos RFM    → group_mode="raw",       group_col="segmento_rfm"
       - Quantis custom   → group_mode="quantile",  score_col="prob", n_quantiles=5
       - Grupos de A/B    → group_mode="existing", group_col="variante"
-
-    Uso rápido via engine
-    ---------------------
-    >>> pa = engine.profile_analyzer(df_train)
-    >>> pa.fit()
-    >>> pa.profile_all(topn=15, min_lift=2.0, one_per_col=True)
-
-    Uso standalone
-    --------------
-    >>> pa = ProfileAnalyzer(
-    ...     df=df_scored,
-    ...     group_mode="decile",
-    ...     score_col="prob_target",
-    ...     label_col="target",
-    ...     exclude_cols=["id"],
-    ... )
-    >>> pa.fit()
-    >>> perfil = pa.profile_group(group_value=9, topn=20)
     """
 
     def __init__(
         self,
         df: pd.DataFrame,
-        # ── Agrupamento
         group_mode: str = "decile",
         score_col: Optional[str] = None,
         group_col: Optional[str] = None,
         n_quantiles: int = 10,
         group_labels: Optional[List] = None,
-        # ── Filtro de instâncias
         filter_col: Optional[str] = None,
         filter_value=None,
-        # ── Colunas
         label_col: Optional[str] = None,
         exclude_cols: Optional[List[str]] = None,
         cols_as_text: Optional[List[str]] = None,
         whitelist: Optional[List[str]] = None,
         blacklist: Optional[List[str]] = None,
-        # ── Binarização numérica
         binarize: bool = True,
         quantile_bins: Optional[List[float]] = None,
-        # ── Cardinalidade
         max_unique_ratio: float = 0.05,
         min_unique_abs: int = 100,
         cap_topk: Optional[Dict[str, int]] = None,
-        # ── Parâmetros de análise
         add_k: float = 0.1,
         min_df: int = 1,
         max_df: float = 0.95,
@@ -504,7 +472,6 @@ class ProfileAnalyzer:
         self.min_df = min_df
         self.max_df = max_df
 
-        # Preenchidos em fit()
         self.df_ = None
         self.group_series_ = None
         self.feature_cols_ = None
@@ -512,12 +479,8 @@ class ProfileAnalyzer:
         self.groups_ = None
 
     def fit(self, verbose: bool = True) -> "ProfileAnalyzer":
-        """
-        Prepara o DataFrame interno: filtra, binariza, tokeniza, remove alta cardinalidade.
-        """
         df = self.df_raw.copy()
 
-        # 1) Filtro de instâncias
         if self.filter_col and self.filter_value is not None:
             df = df[df[self.filter_col] == self.filter_value].copy()
             if verbose:
@@ -525,7 +488,6 @@ class ProfileAnalyzer:
                     f"[fit] Filtro '{self.filter_col}=={self.filter_value}': {len(df)} registros."
                 )
 
-        # 2) Coluna de grupo
         group = make_group_column(
             df,
             mode=self.group_mode,
@@ -535,7 +497,6 @@ class ProfileAnalyzer:
             labels=self.group_labels,
         )
 
-        # 3) Colunas a excluir da análise
         _excl = set(self.exclude_cols)
         if self.label_col:
             _excl.add(self.label_col)
@@ -544,12 +505,10 @@ class ProfileAnalyzer:
         if self.group_col:
             _excl.add(self.group_col)
 
-        # 4) Colunas numéricas → texto (não binarizar)
         for col in self.cols_as_text:
             if col in df.columns:
                 df[col] = df[col].astype("string")
 
-        # 5) Binarização numérica
         if self.binarize:
             numeric_to_bin = [
                 c
@@ -557,21 +516,15 @@ class ProfileAnalyzer:
                 if c not in _excl and c not in self.cols_as_text
             ]
             df = binarize_numerics(
-                df,
-                cols=numeric_to_bin,
-                quantiles=self.quantile_bins,
-                exclude=_excl,
+                df, cols=numeric_to_bin, quantiles=self.quantile_bins, exclude=_excl
             )
 
-        # 6) Cap top-K categorias
         for col, k in self.cap_topk.items():
             if col in df.columns:
                 cap_top_k(df, col, k=k)
 
-        # 7) Colunas candidatas ao perfil
         candidates = [c for c in df.columns if c not in _excl]
 
-        # 8) Filtro de alta cardinalidade
         cols_keep, cols_drop, _ = remove_high_cardinality(
             df,
             candidates,
@@ -586,7 +539,6 @@ class ProfileAnalyzer:
             )
             print(f"[fit] Colunas para análise: {len(cols_keep)}")
 
-        # 9) Tokenização
         df_tok = build_token_df(df, cols_keep)
 
         self.df_ = df
@@ -607,10 +559,8 @@ class ProfileAnalyzer:
         min_lift: float = 2.0,
         min_support_pct: float = 0.01,
         one_per_col: bool = False,
+        include_raw: bool = False,
     ) -> pd.DataFrame:
-        """
-        Retorna os topn tokens mais distintivos do group_value.
-        """
         self._check_fitted()
 
         df_m = _compute_record_level_metrics(
@@ -639,7 +589,6 @@ class ProfileAnalyzer:
 
         df_filt = df_m.query("cnt_in >= @min_sup and Lift >= @min_lift").copy()
 
-        # Fallback TF-IDF se poucos tokens passarem no filtro primário
         if len(df_filt) < topn:
             falta = topn - len(df_filt)
             df_fill = (
@@ -649,7 +598,6 @@ class ProfileAnalyzer:
             )
             df_filt = pd.concat([df_filt, df_fill], ignore_index=True)
 
-        # one_per_col: aplicado ANTES da limpeza visual (usa '___' como separador)
         if one_per_col and not df_filt.empty:
             df_filt[["__col__", "__val__"]] = df_filt["Token_raw"].str.split(
                 "___", n=1, expand=True
@@ -669,7 +617,6 @@ class ProfileAnalyzer:
                 ["Lift", "cnt_in", "TFIDF"], ascending=[False, False, False]
             ).head(topn)
 
-        # Limpeza visual dos tokens (DEPOIS de one_per_col)
         df_filt = df_filt.copy()
         df_filt["Atributo"] = (
             df_filt["Token_raw"]
@@ -680,6 +627,8 @@ class ProfileAnalyzer:
         )
 
         cols_out = ["Atributo", "cnt_in", "Pct_in", "Pct_out", "Lift", "TFIDF"]
+        if include_raw:
+            cols_out = ["Token_raw"] + cols_out
         return df_filt[[c for c in cols_out if c in df_filt.columns]].reset_index(
             drop=True
         )
@@ -692,16 +641,10 @@ class ProfileAnalyzer:
         one_per_col: bool = False,
         display_fn=None,
     ) -> Dict:
-        """
-        Perfil de todos os grupos. Imprime ou passa para display_fn.
-        Retorna dict {group_value: DataFrame}.
-        """
         self._check_fitted()
         results = {}
         for g in self.groups_:
-            # [FIX v0.1.0] Label correto para grupos inteiros, floats e pd.Interval.
-            # A checagem anterior `not str(g).isdigit()` falhava para floats como
-            # 0.0 ou objetos pd.Interval retornados pelo pd.qcut.
+            # [FIX v0.1.0] Label correto para grupos inteiros, float e pd.Interval
             if isinstance(g, numbers.Integral):
                 label = f"Faixa {int(g)+1} (grupo {g})"
             else:
@@ -725,10 +668,6 @@ class ProfileAnalyzer:
         return results
 
     def feature_importance_summary(self) -> pd.DataFrame:
-        """
-        Lift médio de cada token através de todos os grupos.
-        Útil para entender quais variáveis mais diferenciam os grupos em geral.
-        """
         self._check_fitted()
         rows = []
         for g in self.groups_:
@@ -803,6 +742,7 @@ class AutoClassificationEngine:
 
         self.association_report: dict = {}
         self.cv_results: dict = {}
+        self._profile_features: list = []  # [NEW v0.1.1]
 
     # -----------------------------------------------------------------------
     # 0. VALIDAÇÃO DE PARÂMETROS
@@ -1007,22 +947,51 @@ class AutoClassificationEngine:
                 target_assoc[col] = 0.0
 
         to_drop = set()
+
+        # [NEW v0.1.0] Pares numérico-numérico via df.corr() — O(n) em vez de O(n²)
+        if len(num_cols) > 1:
+            corr_pd_method = (
+                "pearson" if corr_method in ("pearson", "max") else "spearman"
+            )
+            num_corr = df[num_cols].corr(method=corr_pd_method).abs()
+            if corr_method == "max":
+                spearman_corr = df[num_cols].corr(method="spearman").abs()
+                num_corr = num_corr.combine(spearman_corr, np.maximum)
+
+            for i, col_a in enumerate(num_cols):
+                if col_a in to_drop:
+                    continue
+                for col_b in num_cols[i + 1 :]:
+                    if col_b in to_drop:
+                        continue
+                    assoc = num_corr.loc[col_a, col_b]
+                    if assoc > threshold:
+                        assoc_a = target_assoc.get(col_a, 0.0)
+                        assoc_b = target_assoc.get(col_b, 0.0)
+                        if abs(assoc_a - assoc_b) < 0.01:
+                            loser = (
+                                col_a
+                                if df[col_a].nunique() > df[col_b].nunique()
+                                else col_b
+                            )
+                        else:
+                            loser = col_b if assoc_a >= assoc_b else col_a
+                        to_drop.add(loser)
+
+        # Pares envolvendo ao menos uma coluna categórica (mantém loop, menos custoso)
         for i, col_a in enumerate(all_feat):
-            if col_a in to_drop:
+            if col_a in to_drop or col_a in num_cols:
                 continue
             for col_b in all_feat[i + 1 :]:
                 if col_b in to_drop:
                     continue
-
                 a_is_num = pd.api.types.is_numeric_dtype(df[col_a])
                 b_is_num = pd.api.types.is_numeric_dtype(df[col_b])
+                if a_is_num and b_is_num:
+                    continue  # já tratado acima
 
                 try:
-                    if a_is_num and b_is_num:
-                        assoc = _numeric_correlation(
-                            df[col_a], df[col_b], method=corr_method
-                        )
-                    elif not a_is_num and not b_is_num:
+                    if not a_is_num and not b_is_num:
                         assoc = max(
                             _theils_u(df[col_a], df[col_b]),
                             _theils_u(df[col_b], df[col_a]),
@@ -1174,8 +1143,12 @@ class AutoClassificationEngine:
         return df
 
     def _handle_rare_labels(
-        self, df: pd.DataFrame, is_train: bool = True, limit: float = 0.01
+        self, df: pd.DataFrame, is_train: bool = True, limit: float = None
     ) -> pd.DataFrame:
+        # [NEW v0.1.0] rare_label_min_freq exposto como parâmetro do engine
+        if limit is None:
+            limit = self.params.get("rare_label_min_freq", 0.01)
+
         cat_cols = df.select_dtypes(include=["object", "category"]).columns
         for col in cat_cols:
             if col == self.target:
@@ -1365,18 +1338,22 @@ class AutoClassificationEngine:
 
             for (imp, scl), cols in strategy_groups.items():
                 steps = []
-                if imp == "knn":
-                    steps.append(("imputer", KNNImputer(n_neighbors=5)))
-                else:
-                    steps.append(("imputer", SimpleImputer(strategy="median")))
-
+                steps.append(
+                    (
+                        "imputer",
+                        (
+                            KNNImputer(n_neighbors=5)
+                            if imp == "knn"
+                            else SimpleImputer(strategy="median")
+                        ),
+                    )
+                )
                 if scl == "robust":
                     steps.append(("scaler", RobustScaler()))
                 elif scl == "minmax":
                     steps.append(("scaler", MinMaxScaler()))
                 else:
                     steps.append(("scaler", StandardScaler()))
-
                 transformers.append((f"num_{imp}_{scl}", Pipeline(steps), cols))
 
         elif numeric_features:
@@ -1439,15 +1416,11 @@ class AutoClassificationEngine:
         return Pipeline(steps=[("preprocessor", preprocessor)])
 
     def describe_pipeline(self):
-        """
-        Exibe um resumo legível de todas as transformações aplicadas pela pipeline sklearn.
-        """
         if self.pipeline is None:
             print("⚠️  Pipeline sklearn não está ativo (use_sklearn_pipeline=False).")
             return
 
         print("\n🔬 --- DESCRIÇÃO DA PIPELINE SKLEARN ---")
-
         preprocessor = self.pipeline.named_steps["preprocessor"]
 
         for name, transformer, cols in preprocessor.transformers_:
@@ -1520,7 +1493,6 @@ class AutoClassificationEngine:
                     )
 
         print("\n📐 Transformações do Engine (pré-pipeline):")
-
         if self._log_cols:
             print(f"   Log1p aplicado em {len(self._log_cols)} coluna(s):")
             for c in self._log_cols:
@@ -1595,17 +1567,229 @@ class AutoClassificationEngine:
             return thresholds[idx], fpr[idx], tpr[idx]
 
     # -----------------------------------------------------------------------
+    # 2.5  PROFILE-BASED FEATURE ENGINEERING  [NEW v0.1.1]
+    # -----------------------------------------------------------------------
+
+    def _compute_profile_features(self, df_with_target: pd.DataFrame) -> list:
+        """
+        Roda ProfileAnalyzer agrupado pelo target e extrai tokens de maior lift
+        por classe. Retorna lista de specs de features binárias a criar.
+
+        Restringe análise a colunas categóricas/object — comparações de
+        igualdade exata em numéricas contínuas não fazem sentido.
+
+        Parâmetros consumidos de self.params
+        ------------------------------------
+        profile_min_lift         : float = 2.5
+        profile_topn_per_group   : int   = 10
+        profile_min_support_pct  : float = 0.05
+        profile_one_per_col      : bool  = False
+        profile_max_features     : int   = 50
+        """
+        min_lift = self.params.get("profile_min_lift", 2.5)
+        topn = self.params.get("profile_topn_per_group", 10)
+        min_sup = self.params.get("profile_min_support_pct", 0.05)
+        one_per_col = self.params.get("profile_one_per_col", False)
+        max_feats = self.params.get("profile_max_features", 50)
+
+        cat_cols = df_with_target.select_dtypes(
+            include=["object", "category"]
+        ).columns.tolist()
+        cat_cols = [c for c in cat_cols if c != self.target]
+
+        if not cat_cols:
+            warnings.warn(
+                "[ProfileFeatures] Nenhuma coluna categórica encontrada. "
+                "Nenhuma feature de perfil será criada.",
+                UserWarning,
+            )
+            return []
+
+        non_cat = [
+            c for c in df_with_target.columns if c not in cat_cols and c != self.target
+        ]
+
+        pa = ProfileAnalyzer(
+            df=df_with_target,
+            group_mode="existing",
+            group_col=self.target,
+            label_col=self.target,
+            exclude_cols=non_cat,
+            binarize=False,
+            max_unique_ratio=0.5,
+        )
+        pa.fit(verbose=False)
+
+        seen_tokens = set()
+        feature_specs = []
+
+        for g in sorted(pa.groups_, key=str):
+            if len(feature_specs) >= max_feats:
+                break
+
+            df_p = pa.profile_group(
+                g,
+                topn=topn,
+                min_lift=min_lift,
+                min_support_pct=min_sup,
+                one_per_col=one_per_col,
+                include_raw=True,
+            )
+            if df_p.empty:
+                continue
+
+            df_p = df_p.sort_values("Lift", ascending=False)
+
+            for _, row in df_p.iterrows():
+                if len(feature_specs) >= max_feats:
+                    break
+
+                raw = row.get("Token_raw", "")
+                if not raw or raw in seen_tokens:
+                    continue
+                seen_tokens.add(raw)
+
+                parts = raw.split("___", 1)
+                if len(parts) != 2:
+                    continue
+                col, val_token = parts[0], parts[1]
+
+                if col not in df_with_target.columns:
+                    continue
+
+                feat_name = _make_profile_feat_name(col, val_token)
+                feature_specs.append(
+                    {
+                        "col": col,
+                        "val_token": val_token,
+                        "feat_name": feat_name,
+                        "group": g,
+                        "lift": round(float(row["Lift"]), 4),
+                        "pct_in": round(float(row["Pct_in"]), 4),
+                    }
+                )
+
+        return feature_specs
+
+    def _apply_profile_features(
+        self,
+        df: pd.DataFrame,
+        feature_specs: list,
+    ) -> pd.DataFrame:
+        """
+        Cria colunas binárias {0,1} no df para cada spec de feature de perfil.
+        Seguro tanto em treino quanto em inferência — não usa target.
+        """
+        if not feature_specs:
+            return df
+
+        df = df.copy()
+        for spec in feature_specs:
+            col = spec["col"]
+            val_token = spec["val_token"]
+            feat_name = spec["feat_name"]
+
+            if col not in df.columns:
+                df[feat_name] = 0
+                continue
+
+            col_tokenized = _to_token(df[col].astype("object"))
+            df[feat_name] = (col_tokenized == val_token).astype(int)
+
+        return df
+
+    def _profile_based_feature_engineering(
+        self,
+        df: pd.DataFrame,
+        is_train: bool = True,
+        _external_specs: list = None,
+    ) -> pd.DataFrame:
+        """
+        Orquestra criação/aplicação de profile features.
+
+        is_train=True  : computa specs a partir de df (deve conter target),
+                         armazena em self._profile_features e aplica.
+        is_train=False : aplica specs armazenados (ou _external_specs).
+
+        _external_specs é interno — usado pelo cross_validate() para
+        recomputar specs por fold usando só dados de treino, evitando leakage.
+        """
+        if not self.params.get("use_profile_features", False):
+            return df
+
+        if is_train:
+            self._profile_features = self._compute_profile_features(df)
+            n = len(self._profile_features)
+            print(f"\n   🔬 Profile Features: {n} indicadores binários criados")
+            if self._profile_features:
+                top5 = sorted(
+                    self._profile_features, key=lambda x: x["lift"], reverse=True
+                )[:5]
+                print("      Top-5 por Lift:")
+                for pf in top5:
+                    print(
+                        f"        {pf['feat_name']}"
+                        f"  (lift={pf['lift']:.2f},"
+                        f" pct_in={pf['pct_in']:.1%},"
+                        f" grupo={pf['group']})"
+                    )
+            specs = self._profile_features
+        else:
+            specs = (
+                _external_specs
+                if _external_specs is not None
+                else self._profile_features
+            )
+
+        return self._apply_profile_features(df, specs)
+
+    def get_profile_features_report(self) -> pd.DataFrame:
+        """
+        DataFrame com todas as profile features criadas, ordenadas por lift.
+        Útil para inspeção e documentação do modelo.
+        """
+        if not self._profile_features:
+            print(
+                "⚠️  Nenhuma profile feature disponível. "
+                "Execute fit() com use_profile_features=True."
+            )
+            return pd.DataFrame()
+
+        df_rep = pd.DataFrame(self._profile_features)
+        df_rep["Atributo"] = (
+            df_rep["col"]
+            + ": "
+            + df_rep["val_token"]
+            .str.replace("_DOT_", ".", regex=False)
+            .str.replace(r"(?<=\d)_(?=\d)", "–", regex=True)
+        )
+        return (
+            df_rep[["feat_name", "Atributo", "group", "lift", "pct_in"]]
+            .sort_values("lift", ascending=False)
+            .reset_index(drop=True)
+        )
+
+    # -----------------------------------------------------------------------
     # 5. FIT
     # -----------------------------------------------------------------------
 
     def fit(self, train_data: pd.DataFrame, time_limit: int = None):
-        print("\n🚀 --- TREINAMENTO INICIADO (v0.1.0) ---")
+        print(f"\n🚀 --- TREINAMENTO INICIADO (v{_FRAMEWORK_VERSION}) ---")
 
         if time_limit is None:
             time_limit = self.params.get("time_limit", 300)
 
         df = self._standardize_and_clean(train_data)
         df = self._extract_temporal_features(df)
+
+        # [NEW v0.1.0] Guard multiclasse — engine suporta apenas classificação binária
+        n_classes = df[self.target].nunique()
+        if n_classes > 2:
+            raise ValueError(
+                f"AutoClassificationEngine suporta apenas classificação BINÁRIA. "
+                f"Target '{self.target}' possui {n_classes} classes. "
+                f"Para multiclasse, use AutoGluon diretamente com TabularPredictor."
+            )
 
         self._validate_group_agg_pairs(df.columns.tolist())
 
@@ -1649,6 +1833,7 @@ class AutoClassificationEngine:
             cols_to_keep = [c for c in df_tuning.columns if c in df_core.columns]
             df_tuning = df_tuning[cols_to_keep]
 
+        # 1. Tratamento de Rare Labels e Outliers (Treino e Tuning)
         df_core = self._handle_rare_labels(df_core, is_train=True)
         if self.params.get("handle_outliers", True):
             df_core = self._handle_outliers_and_log(df_core, is_train=True)
@@ -1658,6 +1843,26 @@ class AutoClassificationEngine:
             if self.params.get("handle_outliers", True):
                 df_tuning = self._handle_outliers_and_log(df_tuning, is_train=False)
 
+        # 2. Profile-based Feature Engineering (AGORA VEM ANTES DA COLINEARIDADE)
+        if self.params.get("use_profile_features", False):
+            print("\n🔬 Profile-based Feature Engineering (target-guided)...")
+            df_core = self._profile_based_feature_engineering(df_core, is_train=True)
+            if df_tuning is not None:
+                df_tuning = self._profile_based_feature_engineering(
+                    df_tuning, is_train=False
+                )
+
+        # 3. Tratamento de Leakage e Colinearidade (AGORA VEM DEPOIS DE TUDO)
+        # Assim ele pega a redundância das Profile Features!
+        df_core = self._sanity_check(df_core)
+        df_core = self._handle_multicollinearity(df_core)
+
+        # Sincroniza o tuning para remover o que a colinearidade/sanity derrubou
+        if df_tuning is not None:
+            cols_to_keep = [c for c in df_tuning.columns if c in df_core.columns]
+            df_tuning = df_tuning[cols_to_keep]
+
+        # Finaliza a seleção
         self.selected_features = [c for c in df_core.columns if c != self.target]
         X_core = df_core[self.selected_features]
         y_core = df_core[self.target]
@@ -1669,20 +1874,6 @@ class AutoClassificationEngine:
         chosen_metric = self.params.get("eval_metric", "f1")
 
         if self.params.get("use_importance_filter", False):
-            # [v0.1.0] AVISO: feature selection usa df_tuning para avaliar importância,
-            # e depois df_tuning é passado como tuning_data para o predictor final.
-            # Isso pode gerar viés favorável sutil. Considere usar um terceiro split
-            # exclusivo para feature selection em produção de alta exigência.
-            if df_tuning is not None:
-                warnings.warn(
-                    "[use_importance_filter] As features serão selecionadas com base em df_tuning, "
-                    "que também é usado como tuning_data para o predictor final. Isso pode introduzir "
-                    "viés favorável na avaliação. Para máximo rigor, desative tuning_data_fraction "
-                    "ou use um split separado para importance filtering.",
-                    UserWarning,
-                    stacklevel=2,
-                )
-
             print("\n🔍 Importance Filter...")
             pre_time = min(60, max(20, time_limit // 6))
             train_imp = X_core.copy()
@@ -1699,7 +1890,7 @@ class AutoClassificationEngine:
                     presets="optimize_for_deployment",
                     hyperparameters={"GBM": {}, "CAT": {}, "XGB": {}},
                     ag_args_ensemble={"fold_fitting_strategy": "sequential_local"},
-                    num_cpus=self.params.get("num_cpus", 6),
+                    num_cpus=self.params.get("num_cpus", os.cpu_count() or 6),
                 )
                 logging.disable(logging.NOTSET)
 
@@ -1787,7 +1978,8 @@ class AutoClassificationEngine:
         fit_kwargs = {
             "time_limit": time_limit,
             "presets": chosen_preset,
-            "num_cpus": self.params.get("num_cpus", 6),
+            # [NEW v0.1.0] num_cpus padrão = os.cpu_count() ou 6
+            "num_cpus": self.params.get("num_cpus", os.cpu_count() or 6),
             "ag_args_ensemble": self.params.get(
                 "ag_args_ensemble", {"fold_fitting_strategy": "sequential_local"}
             ),
@@ -1864,19 +2056,6 @@ class AutoClassificationEngine:
         use_smote: bool = False,
         smote_k_neighbors: int = 5,
     ) -> pd.DataFrame:
-        """
-        Cross-validation estratificado com suporte a repetições.
-
-        Parâmetros
-        ----------
-        n_folds            : número de folds por repetição
-        n_repeats          : número de repetições do K-fold (default=1).
-                             Quando > 1, usa RepeatedStratifiedKFold.
-                             OOF final é a média das repetições.
-        time_limit_per_fold: segundos por fold
-        use_smote          : aplica SMOTE no fold de treino
-        smote_k_neighbors  : k para SMOTE
-        """
         if self.selected_features is None:
             raise RuntimeError("Execute fit() antes de cross_validate().")
 
@@ -1946,12 +2125,10 @@ class AutoClassificationEngine:
 
         chosen_metric = self.params.get("eval_metric", "f1")
         chosen_preset = self.params.get("presets", "high_quality")
-        use_pipeline = self.params.get("use_sklearn_pipeline", True)  # [FIX v0.1.0]
 
         for fold_idx, (train_idx, val_idx) in enumerate(skf.split(df_base, y_strat)):
             print(
-                f"\n   📂 Fold {fold_idx + 1}/{total_folds}"
-                f" (treino={len(train_idx)}, val={len(val_idx)})"
+                f"\n   📂 Fold {fold_idx + 1}/{total_folds} (treino={len(train_idx)}, val={len(val_idx)})"
             )
 
             df_tr_fold = df_base.iloc[train_idx].copy()
@@ -1974,9 +2151,10 @@ class AutoClassificationEngine:
             for col in cat_cols:
                 X_tr_raw[col] = X_tr_raw[col].astype(str)
                 X_vl_raw[col] = X_vl_raw[col].astype(str)
-
                 freq = X_tr_raw[col].value_counts(normalize=True)
-                rare_keep = freq[freq >= 0.01].index.tolist()
+                rare_keep = freq[
+                    freq >= self.params.get("rare_label_min_freq", 0.01)
+                ].index.tolist()
                 X_tr_raw[col] = X_tr_raw[col].where(
                     X_tr_raw[col].isin(rare_keep), "OTHER"
                 )
@@ -1997,18 +2175,50 @@ class AutoClassificationEngine:
                 X_tr_raw[col] = np.clip(X_tr_raw[col], lo, hi)
                 X_vl_raw[col] = np.clip(X_vl_raw[col], lo, hi)
 
-            # [FIX v0.1.0] Log-transform: shift calculado APENAS no fold de treino
-            # e aplicado consistentemente na validação — elimina o leakage da versão anterior.
+            # [FIX v0.1.0] Shift calculado APENAS no fold de treino — sem leakage para validação
             for col in log_cols_fold:
-                col_min_train = X_tr_raw[col].min()  # estatística do treino apenas
+                col_min_train = X_tr_raw[col].min()  # estatística só do treino
                 for split in [X_tr_raw, X_vl_raw]:
                     if col_min_train < 0:
                         split[col] = split[col] - col_min_train
                     split[col] = np.log1p(split[col])
 
-            # [FIX v0.1.0] Respeita use_sklearn_pipeline=False — antes o pipeline
-            # era sempre construído independentemente do parâmetro.
-            if use_pipeline:
+            # [NEW v0.1.1] Profile features por fold — recomputados só com treino do fold
+            if self.params.get("use_profile_features", False):
+                df_tr_pf = X_tr_raw.copy()
+                df_tr_pf[self.target] = y_tr.values
+                fold_profile_specs = self._compute_profile_features(df_tr_pf)
+                X_tr_raw = self._apply_profile_features(X_tr_raw, fold_profile_specs)
+                X_vl_raw = self._apply_profile_features(X_vl_raw, fold_profile_specs)
+                if fold_profile_specs:
+                    print(
+                        f"      🔬 Profile features no fold: {len(fold_profile_specs)}"
+                    )
+
+            # ====================================================================
+            # --- INSIRA ESTE BLOCO AQUI ---
+            # Combate a colinearidade recriada pelas novas profile features do fold
+            df_tr_colin = X_tr_raw.copy()
+            df_tr_colin[self.target] = y_tr.values
+
+            # Backup do dicionário de features eliminadas para não poluir o global
+            import copy
+
+            _bkp_elim = copy.deepcopy(self.eliminated_features)
+
+            df_tr_colin = self._sanity_check(df_tr_colin)
+            df_tr_colin = self._handle_multicollinearity(df_tr_colin)
+
+            self.eliminated_features = _bkp_elim  # Restaura o dicionário global
+
+            # Sincroniza as colunas limpas para treino e validação do fold
+            surviving_fold_cols = [c for c in df_tr_colin.columns if c != self.target]
+            X_tr_raw = df_tr_colin[surviving_fold_cols]
+            X_vl_raw = X_vl_raw[surviving_fold_cols]
+            # ====================================================================
+
+            # [FIX v0.1.0] Respeita use_sklearn_pipeline=False
+            if self.params.get("use_sklearn_pipeline", True):
                 pipe_fold = self._build_sklearn_pipeline(X_tr_raw, y=y_tr)
                 X_tr_t = pipe_fold.fit_transform(X_tr_raw, y_tr)
                 X_vl_t = pipe_fold.transform(X_vl_raw)
@@ -2059,7 +2269,7 @@ class AutoClassificationEngine:
                     train_ag,
                     time_limit=time_limit_per_fold,
                     presets=chosen_preset,
-                    num_cpus=self.params.get("num_cpus", 6),
+                    num_cpus=self.params.get("num_cpus", os.cpu_count() or 6),
                     dynamic_stacking=self.params.get("dynamic_stacking", False),
                     ag_args_ensemble=self.params.get(
                         "ag_args_ensemble",
@@ -2087,6 +2297,9 @@ class AutoClassificationEngine:
             )
             y_pred_opt = (y_prob_pos >= opt_t).astype(int)
 
+            # [NEW v0.1.0] Brier Score adicionado ao CV
+            brier = brier_score_loss(y_bin, y_prob_pos)
+
             fold_metrics.append(
                 {
                     "Fold": fold_idx + 1,
@@ -2105,25 +2318,30 @@ class AutoClassificationEngine:
                         recall_score(y_bin, y_pred, zero_division=0), 4
                     ),
                     "Log-Loss": round(log_loss(y_bin, y_prob_pos), 4),
+                    "Brier Score": round(brier, 4),
                     "Accuracy": round(accuracy_score(y_bin, y_pred), 4),
                 }
             )
             fold_curves.append(
                 {"fpr": fpr, "tpr": tpr, "auc": roc_auc, "fold": fold_idx + 1}
             )
+
+            # [NEW v0.1.0] Libera memória do predictor do fold
+            del pred_fold
+            gc.collect()
+
             print(
                 f"      AUC={roc_auc:.4f} | AP={pr_auc:.4f}"
                 f" | F1(0.5)={fold_metrics[-1]['F1 (thr=0.5)']:.4f}"
+                f" | Brier={brier:.4f}"
             )
-
-            # Libera memória do predictor do fold (não será mais usado)
-            del pred_fold
 
         oof_probs_final = oof_probs / np.maximum(oof_counts, 1)
 
         fpr_oof, tpr_oof, _ = roc_curve(oof_true, oof_probs_final)
         oof_auc = auc(fpr_oof, tpr_oof)
         oof_ap = average_precision_score(oof_true, oof_probs_final)
+        oof_brier = brier_score_loss(oof_true, oof_probs_final)
 
         metrics_df = pd.DataFrame(fold_metrics).set_index("Fold")
         mean_row = metrics_df.mean().rename("Média")
@@ -2141,8 +2359,12 @@ class AutoClassificationEngine:
         print(
             f"   F1(0.5)  : {mean_row['F1 (thr=0.5)']:.4f} ± {std_row['F1 (thr=0.5)']:.4f}"
         )
+        print(
+            f"   Brier    : {mean_row['Brier Score']:.4f} ± {std_row['Brier Score']:.4f}"
+        )
         print(f"   AUC OOF  : {oof_auc:.4f}")
         print(f"   AP  OOF  : {oof_ap:.4f}")
+        print(f"   Brier OOF: {oof_brier:.4f}")
 
         self.cv_results = {
             "summary_df": summary_df,
@@ -2153,6 +2375,7 @@ class AutoClassificationEngine:
             "tpr_oof": tpr_oof,
             "oof_auc": oof_auc,
             "oof_ap": oof_ap,
+            "oof_brier": oof_brier,
             "n_folds": n_folds,
             "n_repeats": n_repeats,
             "pos_label": pos_label,
@@ -2267,7 +2490,10 @@ class AutoClassificationEngine:
         oof_df = pd.DataFrame(
             {"prob": cv["oof_probs"], "label": cv["oof_true"].astype(int)}
         )
-        for lbl, color, name in [(0, "#ff7f0e", "Neg (0)"), (1, "#1f77b4", "Pos (1)")]:
+        for lbl, color, name in [
+            (0, _COLOR_TRAIN, "Neg (0)"),
+            (1, _COLOR_TEST, "Pos (1)"),
+        ]:
             sns.kdeplot(
                 oof_df[oof_df["label"] == lbl]["prob"],
                 ax=ax,
@@ -2290,7 +2516,7 @@ class AutoClassificationEngine:
             prob_true_oof,
             "o-",
             lw=2,
-            color="#1f77b4",
+            color=_COLOR_TEST,
             label="Calibração OOF",
         )
         ax.plot([0, 1], [0, 1], "k--", label="Perfeito")
@@ -2343,6 +2569,7 @@ class AutoClassificationEngine:
         plt.suptitle(
             f"Relatório CV ({n} Folds Estratificados{repeat_info})  —  "
             f"AUC OOF: {cv['oof_auc']:.4f}  |  AP OOF: {cv['oof_ap']:.4f}"
+            f"  |  Brier OOF: {cv['oof_brier']:.4f}"
             f"  |  Threshold: {thr_strategy}",
             fontsize=14,
             fontweight="bold",
@@ -2361,9 +2588,6 @@ class AutoClassificationEngine:
         n_quantiles: int = 10,
         **kwargs,
     ) -> "ProfileAnalyzer":
-        """
-        Cria um ProfileAnalyzer pré-configurado com o score do modelo.
-        """
         if self.selected_features is None:
             raise RuntimeError("Execute fit() antes de profile_analyzer().")
 
@@ -2400,6 +2624,8 @@ class AutoClassificationEngine:
         df_proc = self._create_group_aggregations(df_proc, is_train=False)
         df_proc = self._handle_rare_labels(df_proc, is_train=False)
         df_proc = self._handle_outliers_and_log(df_proc, is_train=False)
+        # [NEW v0.1.1] Aplica profile features em inferência
+        df_proc = self._profile_based_feature_engineering(df_proc, is_train=False)
 
         has_target = self.target in df_proc.columns
         y = df_proc[self.target] if has_target else None
@@ -2498,7 +2724,7 @@ class AutoClassificationEngine:
         stats = stats.merge(score_ranges, on="decile", how="left")
         stats["intervalo"] = stats.apply(
             lambda r: (
-                f"[{r['score_min']:.2f}, {r['score_max']:.2f}]"
+                f"[{r['score_min']:.2f},{r['score_max']:.2f}]"
                 if pd.notna(r["score_min"])
                 else "—"
             ),
@@ -2509,7 +2735,6 @@ class AutoClassificationEngine:
         return stats, cut_edges
 
     def _youden_threshold(self, fpr, tpr, thresholds):
-        """Mantido para compatibilidade. Prefira get_threshold()."""
         idx = np.argmax(tpr - fpr)
         return thresholds[idx], fpr[idx], tpr[idx]
 
@@ -2594,16 +2819,12 @@ class AutoClassificationEngine:
         results = {}
         pos_label = self._get_positive_class()
 
-        # [v0.1.0] Cores mais distintas e notáveis:
-        #   Treino     → vermelho forte (#E74C3C) — dado visto, quente
-        #   Teste      → azul forte  (#2980B9) — dado novo, frio
-        #   Linhas de referência (mean) ficam mais escuras para contrastar com as barras
+        # [NEW v0.1.0] Cores com alta distinção visual treino vs. teste
         colors = {
-            "Treino": "#E74C3C",
-            "Treino (OOF)": "#E74C3C",
-            "Teste": "#2980B9",
+            "Treino": _COLOR_TRAIN,
+            "Treino (OOF)": _COLOR_TRAIN,
+            "Teste": _COLOR_TEST,
         }
-
         thr_strategy = self.params.get("threshold_strategy", "youden")
 
         for name, data in datasets_raw.items():
@@ -2625,6 +2846,9 @@ class AutoClassificationEngine:
             )
             y_pred_opt = (y_prob_pos >= opt_thresh).astype(int)
 
+            # [NEW v0.1.0] Brier Score
+            brier = brier_score_loss(y_bin, y_prob_pos)
+
             results[name] = {
                 "y_true": y_bin,
                 "y_prob": y_prob_pos,
@@ -2643,6 +2867,7 @@ class AutoClassificationEngine:
                     "F1 (opt)": f1_score(y_bin, y_pred_opt, zero_division=0),
                     "Recall (thr=0.5)": recall_score(y_bin, y_pred, zero_division=0),
                     "Log-Loss": log_loss(y_bin, y_prob_pos),
+                    "Brier Score": brier,
                     "Accuracy": accuracy_score(y_bin, y_pred),
                     "Avg Precision": pr_auc,
                 },
@@ -2679,6 +2904,7 @@ class AutoClassificationEngine:
             )
             y_pred_oof = (oof_probs >= 0.5).astype(int)
             y_pred_oof_opt = (oof_probs >= opt_thresh_oof).astype(int)
+            brier_oof = brier_score_loss(oof_true, oof_probs)
 
             results["Treino (OOF)"] = {
                 "y_true": oof_true,
@@ -2700,6 +2926,7 @@ class AutoClassificationEngine:
                         oof_true, y_pred_oof, zero_division=0
                     ),
                     "Log-Loss": log_loss(oof_true, oof_probs),
+                    "Brier Score": brier_oof,
                     "Accuracy": accuracy_score(oof_true, y_pred_oof),
                     "Avg Precision": pr_auc_oof,
                 },
@@ -2929,6 +3156,13 @@ class AutoClassificationEngine:
         metric_df = pd.DataFrame({k: v["metrics"] for k, v in results.items()})
 
         def _color(metric, val):
+            # Brier Score: menor = melhor
+            if metric == "Brier Score":
+                return (
+                    "#d4edda"
+                    if val <= 0.10
+                    else "#fff3cd" if val <= 0.20 else "#f8d7da"
+                )
             good = metric not in ["Log-Loss"]
             if good:
                 return (
@@ -3024,6 +3258,11 @@ class AutoClassificationEngine:
         ax.legend(fontsize=8)
 
     def _plot_decil(self, ax, decile_data, results, colors, bins, title_mode):
+        """
+        [FIX v0.1.0] Labels alinhados por iteração direta container→dados,
+        offset relativo ao ylim, ylim expandido para acomodar anotações,
+        clip_on=False para labels acima do topo.
+        """
         all_stats = []
         for name, stats in decile_data.items():
             d = stats.copy()
@@ -3042,9 +3281,6 @@ class AutoClassificationEngine:
         plot_df = pd.concat(all_stats, ignore_index=True)
         hue_order = [h for h in colors.keys() if h in plot_df["Dataset"].unique()]
 
-        # Paleta com cores de borda explícitas para melhor distinção visual
-        bar_palette = {ds: colors[ds] for ds in hue_order}
-
         sns.barplot(
             data=plot_df,
             x="decile",
@@ -3052,68 +3288,49 @@ class AutoClassificationEngine:
             hue="Dataset",
             hue_order=hue_order,
             ax=ax,
-            palette=bar_palette,
-            edgecolor="white",
-            linewidth=0.8,
-            alpha=0.88,
+            palette=colors,
         )
 
         for ds in hue_order:
             if ds in results:
                 mean_pct = results[ds]["y_true"].mean() * 100.0
-                # Linha de média com a cor do dataset, mais escura que as barras
-                line_color = colors[ds]
                 ax.axhline(
                     mean_pct,
-                    color=line_color,
+                    color=colors[ds],
                     linestyle="--",
-                    linewidth=2.0,
-                    alpha=0.9,
+                    linewidth=1.5,
                     label=f"Média {ds} ({mean_pct:.1f}%)",
                 )
 
-        # [FIX v0.1.0] Labels de barra: iteração correta sobre ALL bars + ALL rows em paralelo.
-        #
-        # Problema original: `zip(valid_bars, valid.iterrows())` filtrava barras com
-        # height==0 e linhas com count==0 SEPARADAMENTE, causando desalinhamento quando
-        # um decil intermediário estava vazio (a barra era ignorada mas a linha também,
-        # porém o índice dentro do zip desincronizava em certos layouts do seaborn).
-        #
-        # Correção: itera ALL bars (sem filtro prévio) junto com TODAS as linhas do
-        # DataFrame em paralelo. A anotação só é escrita quando AMBOS têm dados válidos.
-        # Usa `mcontainer.BarContainer` para ignorar containers de error bars ou outros
-        # objetos que seaborn/matplotlib possam ter adicionado em ax.containers.
+        # [FIX v0.1.0] ① Expande ylim para dar espaço vertical às anotações (3 linhas de texto)
+        ylim_lo, ylim_hi = ax.get_ylim()
+        ax.set_ylim(ylim_lo, ylim_hi * 1.45)
 
-        bar_containers = [
-            c for c in ax.containers if isinstance(c, mcontainer.BarContainer)
-        ]
+        # [FIX v0.1.0] ② Offset relativo ao range do eixo (não absoluto)
+        y_range = ax.get_ylim()[1] - ax.get_ylim()[0]
+        offset = y_range * 0.012
 
-        for i, container in enumerate(bar_containers):
+        # [FIX v0.1.0] ③ Itera container[i] ↔ hue_order[i] e alinha diretamente com os dados
+        for i, container in enumerate(ax.containers):
             if i >= len(hue_order):
                 break
             ds = hue_order[i]
 
-            # Linhas do DataFrame para esse dataset, na mesma ordem das barras (decile asc)
-            ds_rows = (
+            # Dados do dataset ordenados por decil (mesma ordem que as barras)
+            d_sorted = (
                 plot_df[plot_df["Dataset"] == ds]
                 .sort_values("decile")
                 .reset_index(drop=True)
             )
 
-            # Ordena barras por posição x para garantir alinhamento com ds_rows
-            all_bars = sorted(container, key=lambda b: b.get_x())
+            bar_list = list(container)
 
-            # Offset relativo ao range do eixo Y — evita sobreposição em diferentes escalas
-            y_lo, y_hi = ax.get_ylim()
-            y_offset = (y_hi - y_lo) * 0.012
-
-            for bar, (_, row) in zip(all_bars, ds_rows.iterrows()):
-                # Só anota quando tanto a barra quanto os dados são válidos
-                if bar is None or row["count"] == 0 or bar.get_height() <= 0:
+            # Garante alinhamento 1:1 — itera juntos sem filtragem prévia
+            for bar, (_, row) in zip(bar_list, d_sorted.iterrows()):
+                h = bar.get_height()
+                if h <= 0 or row["count"] == 0:
                     continue
-
                 x = bar.get_x() + bar.get_width() / 2
-                y = bar.get_height()
                 label = (
                     f"{row['pct_positivos']:.1f}%\n"
                     f"{row['intervalo']}\n"
@@ -3121,13 +3338,13 @@ class AutoClassificationEngine:
                 )
                 ax.text(
                     x,
-                    y + y_offset,
+                    h + offset,
                     label,
                     ha="center",
                     va="bottom",
                     fontsize=6.5,
-                    fontweight="bold",
-                    color=colors.get(ds, "black"),
+                    color="black",
+                    clip_on=False,  # permite que o texto ultrapasse a borda do axes
                 )
 
         ks_txt = ""
@@ -3162,10 +3379,18 @@ class AutoClassificationEngine:
         ks_max_idx = ks_vals.argmax()
 
         ax.plot(
-            pct_pop, cum_pos.values, color="#1f77b4", lw=2, label="Cumulativo Positivos"
+            pct_pop,
+            cum_pos.values,
+            color=_COLOR_TEST,
+            lw=2,
+            label="Cumulativo Positivos",
         )
         ax.plot(
-            pct_pop, cum_neg.values, color="#d62728", lw=2, label="Cumulativo Negativos"
+            pct_pop,
+            cum_neg.values,
+            color=_COLOR_TRAIN,
+            lw=2,
+            label="Cumulativo Negativos",
         )
         ax.plot([0, 1], [0, 1], "k--", alpha=0.3)
         x_ks = pct_pop[ks_max_idx]
@@ -3189,14 +3414,176 @@ class AutoClassificationEngine:
         ax.set_ylabel("% Cumulativo")
         ax.legend(fontsize=8)
 
+    def evaluate_quantile_cutoff(
+        self,
+        test_data: pd.DataFrame,
+        top_q: int = 2,
+        bins: int = 10,
+        basis: str = "train",
+    ):
+        """
+        Avalia a performance fixando o threshold no limite inferior de um quantil.
+
+        basis="train": Usa a distribuição OOF (treino) para definir o corte (fiel à produção).
+        basis="test": Usa a distribuição do próprio teste (ideal para diagnóstico de drift).
+        """
+        if basis == "train" and not self.cv_results:
+            raise RuntimeError(
+                "Para usar basis='train', execute cross_validate() antes."
+            )
+
+        pos_label = self._get_positive_class()
+        neg_label = (
+            f"Não {pos_label}" if isinstance(pos_label, str) else f"≠{pos_label}"
+        )
+
+        # 1. Obter probabilidades do Teste para avaliação
+        X_trans, y_test = self._preprocess_for_inference(test_data)
+        y_prob = self.predictor.predict_proba(X_trans)[pos_label].values
+
+        # 2. Definir o Threshold baseado na escolha do usuário
+        percentil_corte = 1.0 - (top_q / bins)
+
+        if basis == "train":
+            ref_probs = self.cv_results["oof_probs"]
+            ref_name = "Treino (OOF)"
+        else:
+            ref_probs = y_prob
+            ref_name = "Próprio Teste"
+
+        cut_threshold = np.quantile(ref_probs, percentil_corte)
+
+        # 3. Gerar predições baseadas no corte
+        y_bin = (y_test.astype(str) == str(pos_label)).astype(int)
+        y_pred_q = (y_prob >= cut_threshold).astype(int)
+
+        # 4. Calcular Métricas
+        cm = confusion_matrix(y_bin, y_pred_q)
+        prec = precision_score(y_bin, y_pred_q, zero_division=0)
+        rec = recall_score(y_bin, y_pred_q, zero_division=0)
+        f1 = f1_score(y_bin, y_pred_q, zero_division=0)
+        acc = accuracy_score(y_bin, y_pred_q)
+        fracao_atingida = y_pred_q.mean() * 100
+
+        # 5. Visualização
+        fig, axes = plt.subplots(
+            1, 2, figsize=(14, 5), gridspec_kw={"width_ratios": [1, 1.2]}
+        )
+
+        # --- Tabela de Métricas ---
+        ax_table = axes[0]
+        ax_table.axis("off")
+
+        metrics_data = [
+            ["Base de Referência", ref_name],
+            ["Threshold (Score de Corte)", f"{cut_threshold:.4f}"],
+            ["População de Teste Atingida", f"{fracao_atingida:.1f}%"],
+            ["Precision (Acerto no alvo)", f"{prec:.4f}"],
+            ["Recall (Captura do risco)", f"{rec:.4f}"],
+            ["F1-Score", f"{f1:.4f}"],
+            ["Accuracy", f"{acc:.4f}"],
+        ]
+
+        table = ax_table.table(
+            cellText=metrics_data,
+            colLabels=["Métrica", "Valor"],
+            loc="center",
+            cellLoc="center",
+            bbox=[0, 0.1, 1, 0.8],
+        )
+        table.auto_set_font_size(False)
+        table.set_fontsize(11)
+        table.scale(1, 2)
+
+        for i in range(len(metrics_data) + 1):
+            table[i, 0].set_facecolor("#f2f2f2")
+            table[i, 0].set_text_props(weight="bold")
+            if i > 0:
+                try:
+                    val = float(metrics_data[i - 1][1].replace("%", ""))
+                    if i > 3:  # Ignora referência, threshold e população atingida
+                        table[i, 1].set_facecolor(
+                            "#d4edda" if val >= 0.5 else "#fff3cd"
+                        )
+                except ValueError:
+                    pass
+
+        ax_table.set_title(
+            f"🎯 Performance no Top {top_q}/{bins} Quantis\n(Base de Teste)",
+            fontweight="bold",
+            fontsize=13,
+        )
+
+        # --- Matriz de Confusão ---
+        ax_cm = axes[1]
+        class_labels = [neg_label, str(pos_label)]
+        row_totals = cm.sum(axis=1, keepdims=True)
+        pct = (
+            np.divide(
+                cm,
+                row_totals,
+                out=np.zeros_like(cm, dtype=float),
+                where=row_totals != 0,
+            )
+            * 100
+        )
+
+        annot = np.array(
+            [[f"{cm[i,j]}\n({pct[i,j]:.1f}%)" for j in range(2)] for i in range(2)]
+        )
+        sns.heatmap(
+            cm,
+            annot=annot,
+            fmt="",
+            cmap="Blues",
+            ax=ax_cm,
+            cbar=False,
+            annot_kws={"size": 12, "weight": "bold"},
+            xticklabels=class_labels,
+            yticklabels=class_labels,
+        )
+
+        ax_cm.set_title(
+            f"Matriz de Confusão — Corte: >= {cut_threshold:.4f}\n(Referência: {ref_name})",
+            fontweight="bold",
+            fontsize=12,
+        )
+        ax_cm.set_xlabel("Predição do Modelo", fontsize=11, fontweight="bold")
+        ax_cm.set_ylabel("Realidade", fontsize=11, fontweight="bold")
+
+        plt.tight_layout()
+        plt.show()
+
     # -----------------------------------------------------------------------
     # 8. SERIALIZAÇÃO
     # -----------------------------------------------------------------------
 
-    def save_bundle(self, path: str = "modelo_prod"):
+    def save_bundle(self, path: str = "modelo_prod", overwrite: bool = False):
+        """
+        Salva o bundle do modelo em disco.
+
+        [NEW v0.1.0] Parâmetros adicionados:
+          overwrite (bool) : se False (padrão), lança FileExistsError caso o diretório já exista.
+                             Use overwrite=True para substituir um bundle existente.
+
+        O bundle inclui versioning (framework, python, sklearn) para detectar
+        incompatibilidades ao carregar em ambientes diferentes.
+        """
+        # [NEW v0.1.0] Overwrite protection
+        if os.path.exists(path) and not overwrite:
+            raise FileExistsError(
+                f"Bundle já existe em '{path}/'. "
+                f"Use save_bundle(path, overwrite=True) para sobrescrever."
+            )
+
         os.makedirs(path, exist_ok=True)
         joblib.dump(
             {
+                # [NEW v0.1.0] Versioning para detectar incompatibilidades
+                "framework_version": _FRAMEWORK_VERSION,
+                "python_version": sys.version,
+                "sklearn_version": sklearn.__version__,
+                # Artefatos do modelo
                 "pipeline": self.pipeline,
                 "params": self.params,
                 "log_cols": self._log_cols,
@@ -3210,6 +3597,7 @@ class AutoClassificationEngine:
                 "train_schema": self._train_schema,
                 "train_hash": self._train_hash,
                 "cv_results": self.cv_results,
+                "profile_features": self._profile_features,  # [NEW v0.1.1]
             },
             f"{path}/assets.pkl",
         )
@@ -3220,8 +3608,9 @@ class AutoClassificationEngine:
             else "CV não disponível"
         )
         print(f"📦 Bundle salvo em '{path}/'")
-        print(f"   🔑 Hash do treino: {self._train_hash[:16]}...")
-        print(f"   📐 Schema salvo  : {len(self._train_schema)} features")
+        print(f"   🔖 Versão          : v{_FRAMEWORK_VERSION}")
+        print(f"   🔑 Hash do treino  : {self._train_hash[:16]}...")
+        print(f"   📐 Schema salvo    : {len(self._train_schema)} features")
         print(f"   📊 {cv_tag}")
 
     @staticmethod
@@ -3235,6 +3624,23 @@ class AutoClassificationEngine:
             raise FileNotFoundError(f"Modelo AutoGluon não encontrado em '{ag_path}'")
 
         assets = joblib.load(assets_path)
+
+        # [NEW v0.1.0] Aviso de versão incompatível
+        saved_version = assets.get("framework_version", "desconhecida")
+        if saved_version != _FRAMEWORK_VERSION:
+            warnings.warn(
+                f"Versão do bundle ({saved_version}) difere da versão atual ({_FRAMEWORK_VERSION}). "
+                f"Resultados podem ser inconsistentes.",
+                UserWarning,
+            )
+        saved_sklearn = assets.get("sklearn_version", "desconhecida")
+        if saved_sklearn != sklearn.__version__:
+            warnings.warn(
+                f"sklearn do bundle ({saved_sklearn}) difere do atual ({sklearn.__version__}). "
+                f"Transformações do pipeline podem se comportar diferente.",
+                UserWarning,
+            )
+
         engine = AutoClassificationEngine.__new__(AutoClassificationEngine)
         engine.params = assets["params"]
         engine.target = assets["params"]["target"]
@@ -3250,9 +3656,11 @@ class AutoClassificationEngine:
         engine._train_schema = assets.get("train_schema", {})
         engine._train_hash = assets.get("train_hash", "")
         engine.cv_results = assets.get("cv_results", {})
+        engine._profile_features = assets.get("profile_features", [])  # [NEW v0.1.1]
         engine.predictor = TabularPredictor.load(ag_path)
 
         print(f"✅ Engine carregado de '{path}/'")
+        print(f"   🔖 Versão  : v{saved_version}")
         print(f"   Target   : {engine.target}")
         print(f"   Features : {engine.selected_features}")
         if engine._train_hash:
