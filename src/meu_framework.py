@@ -1,4 +1,4 @@
-# v0.1.2 Claude
+# v0.1.3 Claude
 # Changelog:
 #   [v0.1.0] FIX: leakage no log-shift do cross_validate — shift calculado só no fold de treino
 #   [v0.1.0] FIX: cross_validate respeita use_sklearn_pipeline=False
@@ -3553,6 +3553,134 @@ class AutoClassificationEngine:
 
         plt.tight_layout()
         plt.show()
+
+    # -----------------------------------------------------------------------
+    # 7.9. DRIFT DE SCORE E PSI
+    # -----------------------------------------------------------------------
+
+    def calculate_psi(self, train_probs, test_probs, bins=10):
+        """Calcula o Population Stability Index entre duas distribuições."""
+        # Criar os buckets baseados nos decis do treino
+        buckets = np.linspace(0, 1, bins + 1)
+
+        train_percents = np.histogram(train_probs, bins=buckets)[0] / len(train_probs)
+        test_percents = np.histogram(test_probs, bins=buckets)[0] / len(test_probs)
+
+        # Evitar divisão por zero
+        train_percents = np.where(train_percents == 0, 0.0001, train_percents)
+        test_percents = np.where(test_percents == 0, 0.0001, test_percents)
+
+        psi_values = (test_percents - train_percents) * np.log(
+            test_percents / train_percents
+        )
+        return np.sum(psi_values)
+
+    def check_threshold_volatility(self, test_data, top_q=1, bins=10):
+        """
+        Identifica a sensibilidade do threshold.
+        Se uma mudança de 1% no threshold mudar 10% do volume, o modelo é instável.
+        """
+        X_trans, _ = self._preprocess_for_inference(test_data)
+        y_prob = self.predictor.predict_proba(X_trans)[
+            self._get_positive_class()
+        ].values
+
+        # Threshold alvo (ex: 10%)
+        thr_main = np.quantile(y_prob, 1.0 - (top_q / bins))
+
+        # Threshold com leve perturbação (±0.005)
+        vol_plus = (y_prob >= (thr_main + 0.005)).mean()
+        vol_minus = (y_prob >= (thr_main - 0.005)).mean()
+
+        volatility_index = (vol_minus - vol_plus) * 100
+        return thr_main, volatility_index
+
+    def get_drift_report(self, test_data, bins=10):
+        """
+        Gera um relatório completo de PSI e Volatilidade de Threshold.
+        Ideal para identificar compressão de scores como a do Bank Marketing.
+        """
+        if not self.cv_results:
+            raise RuntimeError(
+                "Execute cross_validate() antes para ter a referência do treino (OOF)."
+            )
+
+        pos_label = self._get_positive_class()
+
+        # 1. Obter Probabilidades
+        train_probs = self.cv_results["oof_probs"]
+        X_trans, _ = self._preprocess_for_inference(test_data)
+        test_probs = self.predictor.predict_proba(X_trans)[pos_label].values
+
+        # 2. Cálculo do PSI (Population Stability Index)
+        # Criamos os buckets baseados nos decis do TREINO
+        buckets = np.quantile(train_probs, np.linspace(0, 1, bins + 1))
+        # Evitar buckets duplicados em distribuições muito comprimidas
+        buckets = np.unique(buckets)
+        if len(buckets) < 2:
+            buckets = np.linspace(0, 1, bins + 1)
+
+        train_dist = np.histogram(train_probs, bins=buckets)[0] / len(train_probs)
+        test_dist = np.histogram(test_probs, bins=buckets)[0] / len(test_probs)
+
+        # Ajuste para evitar log(0)
+        train_dist = np.where(train_dist == 0, 0.0001, train_dist)
+        test_dist = np.where(test_dist == 0, 0.0001, test_dist)
+
+        psi_values = (test_dist - train_dist) * np.log(test_dist / train_dist)
+        total_psi = np.sum(psi_values)
+
+        # 3. Cálculo de Elasticidade (Volatilidade) do Threshold
+        # Se eu mudar o threshold em 0.01, quanto o volume de aprovados muda?
+        thr_atual = np.median(test_probs)
+        vol_base = (test_probs >= thr_atual).mean()
+        vol_up = (test_probs >= (thr_atual + 0.01)).mean()
+        vol_down = (test_probs >= (thr_atual - 0.01)).mean()
+
+        # Sensibilidade: % de mudança na população por 0.01 de mudança no score
+        elasticidade = (vol_down - vol_up) * 100
+
+        # 4. Print do Diagnóstico
+        print(f"\n{'='*40}")
+        print(f"📊 RELATÓRIO DE ESTABILIDADE (DRIFT)")
+        print(f"{'='*40}")
+
+        status_psi = (
+            "✅ Estável"
+            if total_psi < 0.1
+            else "⚠️ Alerta" if total_psi < 0.25 else "🚨 Drift Crítico"
+        )
+        print(f"Total PSI: {total_psi:.4f} ({status_psi})")
+        print(f"Elasticidade do Threshold: {elasticidade:.2f}% por ±0.01 de score")
+
+        if elasticidade > 15:
+            print(
+                "🔴 ALERTA: Scores muito comprimidos! Pequenas oscilações mudarão drasticamente o volume."
+            )
+
+        # 5. Visualização do Desvio
+        plt.figure(figsize=(12, 5))
+        sns.kdeplot(
+            train_probs, label="Treino (OOF)", fill=True, color="blue", alpha=0.3
+        )
+        sns.kdeplot(
+            test_probs, label="Teste (Atual)", fill=True, color="orange", alpha=0.3
+        )
+        plt.axvline(
+            thr_atual,
+            color="red",
+            linestyle="--",
+            label=f"Mediana Teste ({thr_atual:.3f})",
+        )
+        plt.title(
+            f"Distribuição de Scores: Treino vs Teste (PSI: {total_psi:.4f})",
+            fontweight="bold",
+        )
+        plt.xlabel("Probabilidade Prevista")
+        plt.legend()
+        plt.show()
+
+        return {"psi": total_psi, "elasticity": elasticidade}
 
     # -----------------------------------------------------------------------
     # 8. SERIALIZAÇÃO
