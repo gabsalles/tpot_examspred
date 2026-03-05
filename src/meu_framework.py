@@ -1,5 +1,14 @@
-# v0.0.9 Claude
+# v0.1.0 Claude
 # Changelog:
+#   [v0.1.0] FIX CRÍTICO: leakage no log-transform do cross_validate — shift agora usa min() do fold de treino
+#   [v0.1.0] FIX CRÍTICO: cross_validate respeita use_sklearn_pipeline=False
+#   [v0.1.0] FIX: profile_all — label correto para grupos float/Interval (isinstance(g, numbers.Integral))
+#   [v0.1.0] FIX: _tfidf_group_scores — compatibilidade com pandas 2.2+ (include_groups via try/except)
+#   [v0.1.0] FIX: _plot_decil — labels de barra alinhados corretamente (itera ALL bars + ALL rows em paralelo)
+#   [v0.1.0] FIX: _plot_decil — usa matplotlib.container.BarContainer para filtrar containers válidos
+#   [v0.1.0] MELHORIA: cores treino/teste mais distintas e notáveis (#E74C3C vermelho vs #2980B9 azul forte)
+#   [v0.1.0] MELHORIA: offset de label relativo ao range do eixo Y (evita sobreposição)
+#   [v0.1.0] AVISO: use_importance_filter com tuning_data pode gerar viés — warning adicionado
 #   [v0.0.9] ProfileAnalyzer integrado — perfil de segmentos por decil/cluster/segmento
 #   [v0.0.9] engine.profile_analyzer() — factory method pré-configurado com score do modelo
 #   [v0.0.9] cross_validate: n_repeats (RepeatedStratifiedKFold) + OOF por média de repetições
@@ -11,6 +20,7 @@
 from __future__ import annotations
 
 import hashlib
+import numbers
 import re
 import builtins as _b
 import os
@@ -23,6 +33,7 @@ import numpy as np
 import pandas as pd
 import matplotlib
 import matplotlib.pyplot as plt
+import matplotlib.container as mcontainer
 import seaborn as sns
 import joblib
 
@@ -368,12 +379,24 @@ def _tfidf_group_scores(
     df_work = df_tokens.copy()
     df_work["__group__"] = group_col.values
 
-    # Antes: .apply(lambda x: " ".join(x.values.flatten().astype(str)))
-    docs = (
-        df_work.groupby("__group__")[feature_cols]
-        .apply(lambda x: list(x.values.flatten().astype(str)))
-        .sort_index()
-    )
+    # [FIX v0.1.0] Compatibilidade com pandas 2.2+ (include_groups deprecado).
+    # Selecionamos feature_cols antes do apply para que __group__ nunca entre
+    # no subframe — o try/except garante compatibilidade com pandas <2.2.
+    try:
+        docs = (
+            df_work.groupby("__group__")[feature_cols]
+            .apply(
+                lambda x: list(x.values.flatten().astype(str)),
+                include_groups=False,
+            )
+            .sort_index()
+        )
+    except TypeError:
+        docs = (
+            df_work.groupby("__group__")[feature_cols]
+            .apply(lambda x: list(x.values.flatten().astype(str)))
+            .sort_index()
+        )
 
     groups = docs.index.tolist()
     if group_value not in groups:
@@ -381,7 +404,7 @@ def _tfidf_group_scores(
 
     i = groups.index(group_value)
     tv = TfidfVectorizer(
-        analyzer=lambda x: x,  # 🟢 Isso avisa ao TF-IDF que a entrada já é uma lista de tokens inteiros
+        analyzer=lambda x: x,
         lowercase=False,
         norm="l2",
         sublinear_tf=True,
@@ -587,14 +610,6 @@ class ProfileAnalyzer:
     ) -> pd.DataFrame:
         """
         Retorna os topn tokens mais distintivos do group_value.
-
-        Parâmetros
-        ----------
-        group_value     : valor do grupo (ex.: 9 para o 10º decil)
-        topn            : máximo de linhas no resultado
-        min_lift        : lift mínimo para inclusão primária
-        min_support_pct : % mínimo de registros do grupo que possuem o token
-        one_per_col     : se True, retorna no máx. 1 token por coluna original
         """
         self._check_fitted()
 
@@ -684,11 +699,14 @@ class ProfileAnalyzer:
         self._check_fitted()
         results = {}
         for g in self.groups_:
-            label = (
-                f"Grupo {g}"
-                if not str(g).isdigit()
-                else f"Faixa {int(g)+1} (grupo {g})"
-            )
+            # [FIX v0.1.0] Label correto para grupos inteiros, floats e pd.Interval.
+            # A checagem anterior `not str(g).isdigit()` falhava para floats como
+            # 0.0 ou objetos pd.Interval retornados pelo pd.qcut.
+            if isinstance(g, numbers.Integral):
+                label = f"Faixa {int(g)+1} (grupo {g})"
+            else:
+                label = f"Grupo {g}"
+
             print(f"\n{'='*60}")
             print(f"  PERFIL PREDOMINANTE — {label}")
             print(f"{'='*60}")
@@ -1162,7 +1180,6 @@ class AutoClassificationEngine:
         for col in cat_cols:
             if col == self.target:
                 continue
-            # [FIX v0.0.8] isinstance substitui is_categorical_dtype (deprecated pandas 2.1+)
             if isinstance(df[col].dtype, pd.CategoricalDtype):
                 df[col] = df[col].astype(str)
 
@@ -1198,7 +1215,6 @@ class AutoClassificationEngine:
                 if IQR > 0:
                     self._outlier_bounds[col] = (Q1 - 1.5 * IQR, Q3 + 1.5 * IQR)
 
-                # Sem trava min() >= 0 — colunas negativas com alta assimetria também recebem log
                 if abs(skew(df[col].dropna())) > 0.75:
                     self._log_cols.append(col)
 
@@ -1317,7 +1333,6 @@ class AutoClassificationEngine:
 
         transformers = []
 
-        # ── Fluxo numérico (análise estratégica automática) ──────────────────
         if auto_numeric_prep and numeric_features:
             print(
                 "   🤖 Analisando features numéricas para Imputação e Scaling inteligente..."
@@ -1374,7 +1389,6 @@ class AutoClassificationEngine:
                 num_steps.append(("pca", PCA(n_components=n_comps)))
             transformers.append(("num_default", Pipeline(num_steps), numeric_features))
 
-        # ── Fluxo categórico ─────────────────────────────────────────────────
         if categorical_features:
             use_te = self.params.get("use_target_encoding", False)
             if use_te and _HAS_TARGET_ENCODER:
@@ -1417,7 +1431,6 @@ class AutoClassificationEngine:
                 )
             transformers.append(("cat", cat_transformer, categorical_features))
 
-        # ── Consolidação ─────────────────────────────────────────────────────
         preprocessor = ColumnTransformer(
             transformers=transformers,
             verbose_feature_names_out=False,
@@ -1427,8 +1440,7 @@ class AutoClassificationEngine:
 
     def describe_pipeline(self):
         """
-        Exibe um resumo legível de todas as transformações aplicadas pela pipeline sklearn,
-        incluindo imputação, scaling, encoding, log-transform e clipping de outliers.
+        Exibe um resumo legível de todas as transformações aplicadas pela pipeline sklearn.
         """
         if self.pipeline is None:
             print("⚠️  Pipeline sklearn não está ativo (use_sklearn_pipeline=False).")
@@ -1587,7 +1599,7 @@ class AutoClassificationEngine:
     # -----------------------------------------------------------------------
 
     def fit(self, train_data: pd.DataFrame, time_limit: int = None):
-        print("\n🚀 --- TREINAMENTO INICIADO (v0.0.8) ---")
+        print("\n🚀 --- TREINAMENTO INICIADO (v0.1.0) ---")
 
         if time_limit is None:
             time_limit = self.params.get("time_limit", 300)
@@ -1657,6 +1669,20 @@ class AutoClassificationEngine:
         chosen_metric = self.params.get("eval_metric", "f1")
 
         if self.params.get("use_importance_filter", False):
+            # [v0.1.0] AVISO: feature selection usa df_tuning para avaliar importância,
+            # e depois df_tuning é passado como tuning_data para o predictor final.
+            # Isso pode gerar viés favorável sutil. Considere usar um terceiro split
+            # exclusivo para feature selection em produção de alta exigência.
+            if df_tuning is not None:
+                warnings.warn(
+                    "[use_importance_filter] As features serão selecionadas com base em df_tuning, "
+                    "que também é usado como tuning_data para o predictor final. Isso pode introduzir "
+                    "viés favorável na avaliação. Para máximo rigor, desative tuning_data_fraction "
+                    "ou use um split separado para importance filtering.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+
             print("\n🔍 Importance Filter...")
             pre_time = min(60, max(20, time_limit // 6))
             train_imp = X_core.copy()
@@ -1826,7 +1852,7 @@ class AutoClassificationEngine:
             self.feature_importance = None
 
     # -----------------------------------------------------------------------
-    # 5c. CROSS-VALIDATION EXTERNO  [v0.0.8: n_repeats + OOF por média]
+    # 5c. CROSS-VALIDATION EXTERNO
     # -----------------------------------------------------------------------
 
     def cross_validate(
@@ -1844,12 +1870,11 @@ class AutoClassificationEngine:
         Parâmetros
         ----------
         n_folds            : número de folds por repetição
-        n_repeats          : número de repetições do K-fold (default=1 = sem repetição).
-                             Quando > 1, usa RepeatedStratifiedKFold — cada repetição usa
-                             uma seed diferente. OOF final é a média das repetições.
-                             Custo: n_folds × n_repeats modelos treinados.
-        time_limit_per_fold: segundos por fold (default: total_time / n_folds)
-        use_smote          : aplica SMOTE no fold de treino (requer imbalanced-learn)
+        n_repeats          : número de repetições do K-fold (default=1).
+                             Quando > 1, usa RepeatedStratifiedKFold.
+                             OOF final é a média das repetições.
+        time_limit_per_fold: segundos por fold
+        use_smote          : aplica SMOTE no fold de treino
         smote_k_neighbors  : k para SMOTE
         """
         if self.selected_features is None:
@@ -1898,7 +1923,6 @@ class AutoClassificationEngine:
         pos_label = self._get_positive_class()
         y_strat = (y_raw.astype(str) == str(pos_label)).astype(int)
 
-        # [v0.0.8] RepeatedStratifiedKFold quando n_repeats > 1
         if n_repeats > 1:
             skf = RepeatedStratifiedKFold(
                 n_splits=n_folds, n_repeats=n_repeats, random_state=42
@@ -1916,13 +1940,13 @@ class AutoClassificationEngine:
 
         fold_metrics = []
         fold_curves = []
-        # [v0.0.8] Acumula OOF por soma+contagem para média entre repetições
         oof_probs = np.zeros(len(y_raw))
         oof_counts = np.zeros(len(y_raw))
         oof_true = np.zeros(len(y_raw))
 
         chosen_metric = self.params.get("eval_metric", "f1")
         chosen_preset = self.params.get("presets", "high_quality")
+        use_pipeline = self.params.get("use_sklearn_pipeline", True)  # [FIX v0.1.0]
 
         for fold_idx, (train_idx, val_idx) in enumerate(skf.split(df_base, y_strat)):
             print(
@@ -1948,7 +1972,6 @@ class AutoClassificationEngine:
 
             cat_cols = X_tr_raw.select_dtypes(include=["object", "category"]).columns
             for col in cat_cols:
-                # [FIX v0.0.8] Converte dtype='category' → str antes do where()
                 X_tr_raw[col] = X_tr_raw[col].astype(str)
                 X_vl_raw[col] = X_vl_raw[col].astype(str)
 
@@ -1967,7 +1990,6 @@ class AutoClassificationEngine:
                 IQR = Q3 - Q1
                 if IQR > 0:
                     bounds_fold[col] = (Q1 - 1.5 * IQR, Q3 + 1.5 * IQR)
-                # [FIX v0.0.8] Alinhado com _handle_outliers_and_log (sem trava min >= 0)
                 if abs(skew(X_tr_raw[col].dropna())) > 0.75:
                     log_cols_fold.append(col)
 
@@ -1975,15 +1997,24 @@ class AutoClassificationEngine:
                 X_tr_raw[col] = np.clip(X_tr_raw[col], lo, hi)
                 X_vl_raw[col] = np.clip(X_vl_raw[col], lo, hi)
 
+            # [FIX v0.1.0] Log-transform: shift calculado APENAS no fold de treino
+            # e aplicado consistentemente na validação — elimina o leakage da versão anterior.
             for col in log_cols_fold:
+                col_min_train = X_tr_raw[col].min()  # estatística do treino apenas
                 for split in [X_tr_raw, X_vl_raw]:
-                    if split[col].min() < 0:
-                        split[col] = split[col] - split[col].min()
+                    if col_min_train < 0:
+                        split[col] = split[col] - col_min_train
                     split[col] = np.log1p(split[col])
 
-            pipe_fold = self._build_sklearn_pipeline(X_tr_raw, y=y_tr)
-            X_tr_t = pipe_fold.fit_transform(X_tr_raw, y_tr)
-            X_vl_t = pipe_fold.transform(X_vl_raw)
+            # [FIX v0.1.0] Respeita use_sklearn_pipeline=False — antes o pipeline
+            # era sempre construído independentemente do parâmetro.
+            if use_pipeline:
+                pipe_fold = self._build_sklearn_pipeline(X_tr_raw, y=y_tr)
+                X_tr_t = pipe_fold.fit_transform(X_tr_raw, y_tr)
+                X_vl_t = pipe_fold.transform(X_vl_raw)
+            else:
+                X_tr_t = X_tr_raw.copy()
+                X_vl_t = X_vl_raw.copy()
 
             y_bin_tr = (y_tr.astype(str) == str(pos_label)).astype(int)
 
@@ -2043,7 +2074,6 @@ class AutoClassificationEngine:
             y_bin = (y_vl.astype(str) == str(pos_label)).astype(int)
             y_pred = (y_pred.astype(str) == str(pos_label)).astype(int)
 
-            # [v0.0.8] Acumula para média entre repetições
             oof_probs[val_idx] += y_prob_pos.values
             oof_counts[val_idx] += 1
             oof_true[val_idx] = y_bin.values
@@ -2086,7 +2116,9 @@ class AutoClassificationEngine:
                 f" | F1(0.5)={fold_metrics[-1]['F1 (thr=0.5)']:.4f}"
             )
 
-        # [v0.0.8] Média das repetições por amostra
+            # Libera memória do predictor do fold (não será mais usado)
+            del pred_fold
+
         oof_probs_final = oof_probs / np.maximum(oof_counts, 1)
 
         fpr_oof, tpr_oof, _ = roc_curve(oof_true, oof_probs_final)
@@ -2143,7 +2175,6 @@ class AutoClassificationEngine:
         total_folds = n * n_repeats
         thr_strategy = cv.get("thr_strategy", "youden")
 
-        # [FIX v0.0.8] matplotlib.colormaps substitui plt.cm.get_cmap (deprecated 3.7+)
         try:
             cmap = matplotlib.colormaps.get_cmap("tab10").resampled(total_folds)
         except AttributeError:
@@ -2319,7 +2350,7 @@ class AutoClassificationEngine:
         plt.show()
 
     # -----------------------------------------------------------------------
-    # 5e. PROFILE ANALYZER — factory method  [v0.0.8]
+    # 5e. PROFILE ANALYZER — factory method
     # -----------------------------------------------------------------------
 
     def profile_analyzer(
@@ -2332,32 +2363,10 @@ class AutoClassificationEngine:
     ) -> "ProfileAnalyzer":
         """
         Cria um ProfileAnalyzer pré-configurado com o score do modelo.
-
-        O df deve conter uma coluna com as probabilidades preditas. Use
-        predict_proba() para gerá-la antes de chamar este método:
-
-            df_train["prob_target"] = engine.predict_proba(df_train)[pos_label]
-            pa = engine.profile_analyzer(df_train, score_col="prob_target")
-            pa.fit()
-            pa.profile_all(topn=15, min_lift=2.0, one_per_col=True)
-
-        Parâmetros
-        ----------
-        df          : DataFrame com features originais + coluna de score
-        score_col   : nome da coluna de probabilidade predita
-        group_mode  : "decile" | "quantile" | "existing" | "raw"
-        n_quantiles : número de quantis (somente para group_mode="quantile")
-        **kwargs    : quaisquer outros parâmetros aceitos por ProfileAnalyzer
-                      (exclude_cols, label_col, whitelist, blacklist, etc.)
-
-        Retorna
-        -------
-        ProfileAnalyzer (não fitted — chame .fit() em seguida)
         """
         if self.selected_features is None:
             raise RuntimeError("Execute fit() antes de profile_analyzer().")
 
-        # Herda exclusões padrão do engine
         default_exclude = list(kwargs.pop("exclude_cols", []))
         default_exclude += [self.target]
         if score_col not in default_exclude:
@@ -2520,11 +2529,11 @@ class AutoClassificationEngine:
         )
         labels = [f"{k}\n({v['metrica']})" for k, v in sorted_feats]
         values = [v["valor"] for _, v in sorted_feats]
-        colors = [
+        colors_bar = [
             "#d62728" if v > 0.8 else "#ff7f0e" if v > 0.5 else "#1f77b4"
             for v in values
         ]
-        bars = ax.barh(labels[::-1], values[::-1], color=colors[::-1])
+        bars = ax.barh(labels[::-1], values[::-1], color=colors_bar[::-1])
         ax.set_xlabel("Força de Associação")
         ax.set_title(f"Associação Feature → Target '{self.target}'", fontweight="bold")
         ax.axvline(
@@ -2584,7 +2593,17 @@ class AutoClassificationEngine:
 
         results = {}
         pos_label = self._get_positive_class()
-        colors = {"Treino": "#ff7f0e", "Treino (OOF)": "#ff7f0e", "Teste": "#1f77b4"}
+
+        # [v0.1.0] Cores mais distintas e notáveis:
+        #   Treino     → vermelho forte (#E74C3C) — dado visto, quente
+        #   Teste      → azul forte  (#2980B9) — dado novo, frio
+        #   Linhas de referência (mean) ficam mais escuras para contrastar com as barras
+        colors = {
+            "Treino": "#E74C3C",
+            "Treino (OOF)": "#E74C3C",
+            "Teste": "#2980B9",
+        }
+
         thr_strategy = self.params.get("threshold_strategy", "youden")
 
         for name, data in datasets_raw.items():
@@ -3009,7 +3028,6 @@ class AutoClassificationEngine:
         for name, stats in decile_data.items():
             d = stats.copy()
             d["Dataset"] = name
-            # [FIX v0.0.8] isinstance substitui is_categorical_dtype (deprecated pandas 2.1+)
             if not isinstance(d["decile"].dtype, pd.CategoricalDtype):
                 d["decile"] = pd.Categorical(
                     d["decile"], categories=range(1, bins + 1), ordered=True
@@ -3024,6 +3042,9 @@ class AutoClassificationEngine:
         plot_df = pd.concat(all_stats, ignore_index=True)
         hue_order = [h for h in colors.keys() if h in plot_df["Dataset"].unique()]
 
+        # Paleta com cores de borda explícitas para melhor distinção visual
+        bar_palette = {ds: colors[ds] for ds in hue_order}
+
         sns.barplot(
             data=plot_df,
             x="decile",
@@ -3031,42 +3052,83 @@ class AutoClassificationEngine:
             hue="Dataset",
             hue_order=hue_order,
             ax=ax,
-            palette=colors,
+            palette=bar_palette,
+            edgecolor="white",
+            linewidth=0.8,
+            alpha=0.88,
         )
 
         for ds in hue_order:
             if ds in results:
                 mean_pct = results[ds]["y_true"].mean() * 100.0
+                # Linha de média com a cor do dataset, mais escura que as barras
+                line_color = colors[ds]
                 ax.axhline(
                     mean_pct,
-                    color=colors[ds],
+                    color=line_color,
                     linestyle="--",
-                    linewidth=1.5,
+                    linewidth=2.0,
+                    alpha=0.9,
                     label=f"Média {ds} ({mean_pct:.1f}%)",
                 )
 
-        for i, container in enumerate(ax.containers):
+        # [FIX v0.1.0] Labels de barra: iteração correta sobre ALL bars + ALL rows em paralelo.
+        #
+        # Problema original: `zip(valid_bars, valid.iterrows())` filtrava barras com
+        # height==0 e linhas com count==0 SEPARADAMENTE, causando desalinhamento quando
+        # um decil intermediário estava vazio (a barra era ignorada mas a linha também,
+        # porém o índice dentro do zip desincronizava em certos layouts do seaborn).
+        #
+        # Correção: itera ALL bars (sem filtro prévio) junto com TODAS as linhas do
+        # DataFrame em paralelo. A anotação só é escrita quando AMBOS têm dados válidos.
+        # Usa `mcontainer.BarContainer` para ignorar containers de error bars ou outros
+        # objetos que seaborn/matplotlib possam ter adicionado em ax.containers.
+
+        bar_containers = [
+            c for c in ax.containers if isinstance(c, mcontainer.BarContainer)
+        ]
+
+        for i, container in enumerate(bar_containers):
             if i >= len(hue_order):
-                continue
+                break
             ds = hue_order[i]
-            d_lab = (
+
+            # Linhas do DataFrame para esse dataset, na mesma ordem das barras (decile asc)
+            ds_rows = (
                 plot_df[plot_df["Dataset"] == ds]
                 .sort_values("decile")
                 .reset_index(drop=True)
             )
-            valid = d_lab[d_lab["count"] > 0].reset_index(drop=True)
-            valid_bars = [
-                bar
-                for bar in container
-                if bar is not None
-                and bar.get_bbox() is not None
-                and bar.get_height() > 0
-            ]
-            for bar, (_, row) in zip(valid_bars, valid.iterrows()):
+
+            # Ordena barras por posição x para garantir alinhamento com ds_rows
+            all_bars = sorted(container, key=lambda b: b.get_x())
+
+            # Offset relativo ao range do eixo Y — evita sobreposição em diferentes escalas
+            y_lo, y_hi = ax.get_ylim()
+            y_offset = (y_hi - y_lo) * 0.012
+
+            for bar, (_, row) in zip(all_bars, ds_rows.iterrows()):
+                # Só anota quando tanto a barra quanto os dados são válidos
+                if bar is None or row["count"] == 0 or bar.get_height() <= 0:
+                    continue
+
                 x = bar.get_x() + bar.get_width() / 2
                 y = bar.get_height()
-                label = f"{row['pct_positivos']:.1f}%\n{row['intervalo']}\nn={int(row['count'])}"
-                ax.text(x, y + 0.3, label, ha="center", va="bottom", fontsize=7)
+                label = (
+                    f"{row['pct_positivos']:.1f}%\n"
+                    f"{row['intervalo']}\n"
+                    f"n={int(row['count'])}"
+                )
+                ax.text(
+                    x,
+                    y + y_offset,
+                    label,
+                    ha="center",
+                    va="bottom",
+                    fontsize=6.5,
+                    fontweight="bold",
+                    color=colors.get(ds, "black"),
+                )
 
         ks_txt = ""
         if title_mode == "performance" and "Teste" in results:
@@ -3128,7 +3190,7 @@ class AutoClassificationEngine:
         ax.legend(fontsize=8)
 
     # -----------------------------------------------------------------------
-    # 8. SERIALIZAÇÃO  [v0.0.8: cv_results persistido]
+    # 8. SERIALIZAÇÃO
     # -----------------------------------------------------------------------
 
     def save_bundle(self, path: str = "modelo_prod"):
@@ -3147,7 +3209,7 @@ class AutoClassificationEngine:
                 "feature_importance": self.feature_importance,
                 "train_schema": self._train_schema,
                 "train_hash": self._train_hash,
-                "cv_results": self.cv_results,  # [v0.0.8]
+                "cv_results": self.cv_results,
             },
             f"{path}/assets.pkl",
         )
@@ -3187,7 +3249,7 @@ class AutoClassificationEngine:
         engine.feature_importance = assets.get("feature_importance", None)
         engine._train_schema = assets.get("train_schema", {})
         engine._train_hash = assets.get("train_hash", "")
-        engine.cv_results = assets.get("cv_results", {})  # [v0.0.8]
+        engine.cv_results = assets.get("cv_results", {})
         engine.predictor = TabularPredictor.load(ag_path)
 
         print(f"✅ Engine carregado de '{path}/'")
