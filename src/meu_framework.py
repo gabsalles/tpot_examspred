@@ -368,18 +368,20 @@ def _tfidf_group_scores(
     df_work = df_tokens.copy()
     df_work["__group__"] = group_col.values
 
+    # Antes: .apply(lambda x: " ".join(x.values.flatten().astype(str)))
     docs = (
         df_work.groupby("__group__")[feature_cols]
-        .apply(lambda x: " ".join(x.values.flatten().astype(str)))
+        .apply(lambda x: list(x.values.flatten().astype(str)))
         .sort_index()
     )
+
     groups = docs.index.tolist()
     if group_value not in groups:
         return {}
 
     i = groups.index(group_value)
     tv = TfidfVectorizer(
-        token_pattern=r"[^ ]+",
+        analyzer=lambda x: x,  # 🟢 Isso avisa ao TF-IDF que a entrada já é uma lista de tokens inteiros
         lowercase=False,
         norm="l2",
         sublinear_tf=True,
