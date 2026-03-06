@@ -557,7 +557,18 @@ def run_dq_checks(spark: SparkSession, checks: list[dict]) -> DataFrame:
         rule_defs, col_type_map = _build_rule_defs(
             df, columns, skip_rules, column_groups
         )
-        rule_defs += extra_rules
+        # Filtra extra_rules — ignora regras que referenciam colunas inexistentes
+        extra_rules_validas = []
+        for r in extra_rules:
+            col = r.get("column", "")
+            if col and col not in schema_map:
+                print(
+                    f"   ⚠️  extra_rule ignorada — coluna '{col}' não existe em [{table_name}]"
+                )
+            else:
+                extra_rules_validas.append(r)
+
+        rule_defs += extra_rules_validas
 
         for rule_def in rule_defs:
             column = rule_def["column"]
@@ -581,7 +592,7 @@ def run_dq_checks(spark: SparkSession, checks: list[dict]) -> DataFrame:
             )
 
             result["column_type"] = col_type
-            result["quality_dimension"] = _dimension(rule)
+            result["quality_dimension"] = rule_def.get("dimension", _dimension(rule))
             results.append(result)
 
             icon = {"PASS": "✅", "WARN": "⚠️", "FAIL": "❌", "ERROR": "💥"}.get(
