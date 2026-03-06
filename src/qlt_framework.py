@@ -230,13 +230,18 @@ def _build_rule_defs(
         group_cfg = {k: v for k, v in group.items() if k != "columns"}
         for col_name in group["columns"]:
             if col_name not in schema_map:
-                # O DataFrame não possui esta coluna.
-                # Ignoramos silenciosamente para permitir regras globais genéricas.
-                continue
+                continue  # coluna não existe nessa tabela — ignora silenciosamente
             groups_expanded[col_name] = group_cfg
 
     # columns individual tem prioridade sobre groups_expanded
     declared = {**groups_expanded, **columns}
+
+    # Avisa sobre colunas declaradas em `columns` que não existem no schema
+    for col_name in columns:
+        if col_name not in schema_map:
+            print(
+                f"   ⚠️  Coluna '{col_name}' declarada em 'columns' não existe no DataFrame — ignorada."
+            )
 
     for col_name in schema_map.keys():
         skipped = skip.get(col_name, [])
@@ -337,11 +342,15 @@ def _run_rule(
             if max_date is None:
                 failed = total_rows
             else:
-                delta = (
-                    (now - max_date).days
-                    if hasattr(max_date, "days")
-                    else (now.date() - max_date).days
-                )
+                from datetime import date as date_type, datetime as datetime_type
+
+                if isinstance(max_date, datetime_type):
+                    delta = (now - max_date).days
+                elif isinstance(max_date, date_type):
+                    delta = (now.date() - max_date).days
+                else:
+                    # fallback para Timestamp do Spark (pyspark.sql.types)
+                    delta = (now.date() - max_date.date()).days
                 failed = total_rows if delta > params else 0
 
         elif rule == "referential":
