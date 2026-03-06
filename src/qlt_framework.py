@@ -557,11 +557,13 @@ def run_dq_checks(spark: SparkSession, checks: list[dict]) -> DataFrame:
         rule_defs, col_type_map = _build_rule_defs(
             df, columns, skip_rules, column_groups
         )
+
         # Filtra extra_rules — ignora regras que referenciam colunas inexistentes
+        df_columns = set(df.columns)
         extra_rules_validas = []
         for r in extra_rules:
             col = r.get("column", "")
-            if col and col not in schema_map:
+            if col and col not in df_columns:
                 print(
                     f"   ⚠️  extra_rule ignorada — coluna '{col}' não existe em [{table_name}]"
                 )
