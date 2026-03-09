@@ -524,7 +524,9 @@ def _dimension(rule: str) -> str:
 # ──────────────────────────────────────────────────────────────────
 
 
-def run_dq_checks(spark: SparkSession, checks: list[dict]) -> DataFrame:
+def run_dq_checks(
+    spark: SparkSession, checks: list[dict], data_particao: str
+) -> DataFrame:
     """
     Executa todas as verificações de qualidade e retorna um
     DataFrame consolidado com os resultados.
@@ -610,6 +612,7 @@ def run_dq_checks(spark: SparkSession, checks: list[dict]) -> DataFrame:
             print(f"{icon}  {result['pct_passed']}%")
 
     result_df = spark.createDataFrame(results, schema=RESULT_SCHEMA)
+    result_df = result_df.withColumn("cjob_ptcao", F.to_date(F.lit(data_particao)))
     print(f"\n✔ DQ concluído — {len(results)} verificações executadas.")
     return result_df
 
