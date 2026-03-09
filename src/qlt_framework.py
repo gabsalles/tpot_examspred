@@ -230,6 +230,9 @@ def _build_rule_defs(
         group_cfg = {k: v for k, v in group.items() if k != "columns"}
         for col_name in group["columns"]:
             if col_name not in schema_map:
+                print(
+                    f"   ⚠️  column_group '{col_type}' — coluna '{col_name}' não existe no DataFrame — ignorada."
+                )
                 continue  # coluna não existe nessa tabela — ignora silenciosamente
             groups_expanded[col_name] = group_cfg
 
@@ -298,6 +301,7 @@ def _run_rule(
         "table_name": table_name,
         "column_name": column,
         "rule": rule,
+        "rule_name": None,  # preenchido no run_dq_checks via rule_def.get("name")
         "params": str(params) if params is not None and not callable(params) else None,
         "total_rows": total_rows,
         "run_timestamp": now,
@@ -488,6 +492,7 @@ RESULT_SCHEMA = StructType(
         StructField("column_name", StringType(), True),
         StructField("column_type", StringType(), True),
         StructField("rule", StringType(), True),
+        StructField("rule_name", StringType(), True),
         StructField("params", StringType(), True),
         StructField("total_rows", LongType(), True),
         StructField("passed_rows", LongType(), True),
@@ -580,7 +585,8 @@ def run_dq_checks(spark: SparkSession, checks: list[dict]) -> DataFrame:
             ref_col = rule_def.get("ref_column")
             col_type = col_type_map.get(column, "extra")
 
-            print(f"   ├─ {column:<25} [{col_type:<22}]  {rule}", end=" ... ")
+            rule_name = rule_def.get("name", rule)
+            print(f"   ├─ {column:<25} [{col_type:<22}]  {rule_name}", end=" ... ")
 
             result = _run_rule(
                 df,
@@ -594,6 +600,7 @@ def run_dq_checks(spark: SparkSession, checks: list[dict]) -> DataFrame:
             )
 
             result["column_type"] = col_type
+            result["rule_name"] = rule_def.get("name", rule)
             result["quality_dimension"] = rule_def.get("dimension", _dimension(rule))
             results.append(result)
 
