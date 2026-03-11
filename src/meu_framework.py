@@ -1,3 +1,8 @@
+# v0.1.4 Claude
+#   [v0.1.4] NEW: TransformPipeline — pipeline de transformação portável, sem AutoGluon
+#   [v0.1.4] NEW: engine.export_transform_pipeline() — exporta TransformPipeline para .pkl
+#   [v0.1.4] NEW: TransformPipeline.describe() — resumo das etapas e features
+#   [v0.1.4] NEW: warnings distintos para colunas extras e ausentes em transform()
 # v0.1.3 Claude
 # Changelog:
 #   [v0.1.0] FIX: leakage no log-shift do cross_validate — shift calculado só no fold de treino
@@ -92,7 +97,7 @@ try:
 except ImportError:
     _HAS_SMOTE = False
 
-_FRAMEWORK_VERSION = "0.1.1"
+_FRAMEWORK_VERSION = "0.1.4"
 
 # Cores canônicas para treino/teste — alta distinção visual e para daltônicos
 _COLOR_TRAIN = "#F06000"  # laranja-forte
@@ -704,6 +709,234 @@ class ProfileAnalyzer:
             raise RuntimeError(
                 "Chame .fit() antes de .profile_group() ou .profile_all()."
             )
+
+
+# =============================================================================
+# =============================================================================
+# BLOCO 4.5 — TransformPipeline (portável, sem AutoGluon, sem framework)
+# =============================================================================
+
+
+class TransformPipeline:
+    """
+    Pipeline de transformação portável — totalmente independente do
+    AutoClassificationEngine e do AutoGluon.
+
+    Exportada via:
+        engine.export_transform_pipeline("minha_pipeline.pkl")
+
+    Importada e usada em qualquer projeto externo:
+        import joblib
+        pipeline = joblib.load("minha_pipeline.pkl")
+        df_transformado = pipeline.transform(df_bruto)
+
+    Dependências no projeto externo: numpy, pandas, scikit-learn, joblib
+
+    Comportamento com colunas inesperadas:
+        - Coluna EXTRA (no input, não estava no treino): ignorada + warning
+        - Coluna AUSENTE (estava no treino, não está no input): avisada + ignorada
+          (não é inventada; simplesmente não constará no output)
+        - Colunas CORRESPONDENTES: recebem exatamente as transformações do treino
+    """
+
+    _VERSION = "0.1.4"
+
+    def __init__(self):
+        self.params: dict = {}
+        self.selected_features: list = []
+        self._train_schema: dict = {}
+        self._log_cols: list = []
+        self._outlier_bounds: dict = {}
+        self._rare_categories: dict = {}
+        self._agg_values: dict = {}
+        self._profile_features: list = []
+        self.sklearn_pipeline = None
+        self._framework_version: str = ""
+
+    # ------------------------------------------------------------------
+    # Helper interno (copiado do framework para independência total)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _to_token(series: pd.Series) -> pd.Series:
+        s = series.astype("string").fillna("nulo").str.strip()
+        s = s.str.replace(r"^(nan|none|na|null|<na>)$", "nulo", flags=re.I, regex=True)
+        s = s.str.replace(r"[\s\-]+", "_", regex=True)
+        s = s.str.replace(".", "_DOT_", regex=False)
+        return s
+
+    # ------------------------------------------------------------------
+    # Etapas de transformação (espelham o AutoClassificationEngine)
+    # ------------------------------------------------------------------
+
+    def _step_standardize_and_clean(self, df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+        null_patterns = r"(?i)^(na|nan|null|none|n/a|-|\s*|unknown|\?)$"
+        df = df.replace(null_patterns, np.nan, regex=True)
+
+        exclude = self.params.get("features_to_exclude", [])
+        df = df.drop(columns=[c for c in exclude if c in df.columns], errors="ignore")
+
+        type_map = self.params.get("force_types", {})
+        for dtype, patterns in type_map.items():
+            for p in patterns:
+                cols = (
+                    [c for c in df.columns if re.search(p, c)]
+                    if any(x in p for x in "^$*")
+                    else [p]
+                )
+                for c in cols:
+                    if c in df.columns:
+                        if dtype in ["float", "int"]:
+                            df[c] = pd.to_numeric(df[c], errors="coerce")
+                        else:
+                            df[c] = df[c].astype(str).replace("nan", np.nan)
+        return df
+
+    def _step_extract_temporal_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        date_cols = df.select_dtypes(include=["datetime64"]).columns
+        for col in date_cols:
+            df[f"{col}_month"] = df[col].dt.month
+            df[f"{col}_weekday"] = df[col].dt.weekday
+            df[f"{col}_hour_sin"] = np.sin(2 * np.pi * df[col].dt.hour / 24)
+            df = df.drop(columns=[col])
+        return df
+
+    def _step_group_aggregations(self, df: pd.DataFrame) -> pd.DataFrame:
+        pairs = self.params.get("group_aggregation_pairs", [])
+        for pair in pairs:
+            cat_col = pair.get("cat")
+            num_col = pair.get("num")
+            agg_func = pair.get("agg", "mean")
+            feat_name = f"{agg_func}_{num_col}_by_{cat_col}"
+
+            if feat_name not in self._agg_values:
+                continue
+            if cat_col not in df.columns:
+                continue
+
+            info = self._agg_values[feat_name]
+            df[feat_name] = df[cat_col].map(info["map"]).fillna(info["fallback"])
+        return df
+
+    def _step_rare_labels(self, df: pd.DataFrame) -> pd.DataFrame:
+        for col, valid_cats in self._rare_categories.items():
+            if col not in df.columns:
+                continue
+            if isinstance(df[col].dtype, pd.CategoricalDtype):
+                df[col] = df[col].astype(str)
+            df[col] = df[col].where(df[col].isin(valid_cats), other="OTHER")
+        return df
+
+    def _step_outliers_and_log(self, df: pd.DataFrame) -> pd.DataFrame:
+        for col, (lower, upper) in self._outlier_bounds.items():
+            if col in df.columns:
+                df[col] = np.clip(df[col], lower, upper)
+
+        for col in self._log_cols:
+            if col not in df.columns:
+                continue
+            col_min = df[col].min()
+            if col_min < 0:
+                df[col] = df[col] - col_min
+            df[col] = np.log1p(df[col])
+        return df
+
+    def _step_profile_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        if not self._profile_features:
+            return df
+        df = df.copy()
+        for spec in self._profile_features:
+            col = spec["col"]
+            val_token = spec["val_token"]
+            feat_name = spec["feat_name"]
+            if col not in df.columns:
+                df[feat_name] = 0
+                continue
+            col_tokenized = self._to_token(df[col].astype("object"))
+            df[feat_name] = (col_tokenized == val_token).astype(int)
+        return df
+
+    def _step_select_and_warn(self, df: pd.DataFrame) -> pd.DataFrame:
+        expected = set(self.selected_features)
+        input_cols = set(df.columns)
+
+        extra = input_cols - expected
+        for col in sorted(extra):
+            warnings.warn(
+                f"[TransformPipeline] Coluna '{col}' não fez parte do treinamento "
+                f"e não será transformada por esta pipeline.",
+                UserWarning,
+                stacklevel=4,
+            )
+
+        missing = expected - input_cols
+        for col in sorted(missing):
+            warnings.warn(
+                f"[TransformPipeline] Coluna '{col}' era esperada pelo pipeline "
+                f"mas não foi encontrada no input — será tratada como NaN pelo imputer.",
+                UserWarning,
+                stacklevel=4,
+            )
+
+        # Seleciona apenas as features do treino, na mesma ordem
+        # Colunas ausentes são inseridas como NaN para que os imputers atuem normalmente
+        df = df.reindex(columns=self.selected_features)
+        return df
+
+    # ------------------------------------------------------------------
+    # Interface pública
+    # ------------------------------------------------------------------
+
+    def transform(self, data: pd.DataFrame) -> pd.DataFrame:
+        """
+        Aplica todas as transformações do treinamento ao DataFrame de entrada.
+
+        Ordem das etapas:
+            1. Limpeza e padronização (null patterns, force_types, exclusões)
+            2. Extração de features temporais (datetime → month, weekday, hour_sin)
+            3. Group aggregations (usando mapas aprendidos no treino)
+            4. Rare label encoding (categorias raras → "OTHER")
+            5. Outlier clipping + transformação log1p
+            6. Profile features (indicadores binários TF-IDF, se ativados)
+            7. Seleção das features do treino + warnings de colunas extras/ausentes
+            8. Sklearn pipeline (imputers, scalers, encoders fitados no treino)
+
+        Returns:
+            pd.DataFrame transformado, pronto para uso em modelos.
+        """
+        df = data.copy()
+        df = self._step_standardize_and_clean(df)
+        df = self._step_extract_temporal_features(df)
+        df = self._step_group_aggregations(df)
+        df = self._step_rare_labels(df)
+        df = self._step_outliers_and_log(df)
+        df = self._step_profile_features(df)
+        df = self._step_select_and_warn(df)
+
+        if self.sklearn_pipeline is not None:
+            df = self.sklearn_pipeline.transform(df)
+
+        return df
+
+    def describe(self):
+        """Exibe um resumo do pipeline exportado."""
+        print(
+            f"\n📦 TransformPipeline v{self._VERSION}  (framework v{self._framework_version})"
+        )
+        print(f"   Features esperadas  : {len(self.selected_features)}")
+        print(f"   Outlier bounds      : {len(self._outlier_bounds)} colunas")
+        print(f"   Log transform       : {len(self._log_cols)} colunas")
+        print(f"   Rare label cols     : {len(self._rare_categories)} colunas")
+        print(f"   Group aggregations  : {len(self._agg_values)} features")
+        print(f"   Profile features    : {len(self._profile_features)} indicadores")
+        sklearn_status = (
+            "✅ fitado"
+            if self.sklearn_pipeline is not None
+            else "❌ desativado no treino"
+        )
+        print(f"   Sklearn pipeline    : {sklearn_status}")
+        print(f"   Features            : {self.selected_features}")
 
 
 # =============================================================================
@@ -3740,6 +3973,62 @@ class AutoClassificationEngine:
         print(f"   🔑 Hash do treino  : {self._train_hash[:16]}...")
         print(f"   📐 Schema salvo    : {len(self._train_schema)} features")
         print(f"   📊 {cv_tag}")
+
+    def export_transform_pipeline(
+        self, path: str = "transform_pipeline.pkl", overwrite: bool = False
+    ) -> "TransformPipeline":
+        """
+        Exporta a pipeline de transformação como objeto standalone — sem dependência
+        do AutoClassificationEngine nem do AutoGluon.
+
+        O arquivo exportado pode ser carregado em qualquer projeto externo com:
+            import joblib
+            pipeline = joblib.load("transform_pipeline.pkl")
+            df_transformado = pipeline.transform(df_bruto)
+
+        Dependências no projeto externo: numpy, pandas, scikit-learn, joblib
+
+        Parâmetros:
+            path (str)       : caminho do arquivo .pkl a ser salvo.
+            overwrite (bool) : se False (padrão), lança FileExistsError caso já exista.
+
+        Retorna:
+            TransformPipeline — o objeto exportado (já instanciado e pronto para uso).
+        """
+        if self.selected_features is None:
+            raise RuntimeError(
+                "Execute fit() antes de exportar o pipeline de transformação."
+            )
+
+        if os.path.exists(path) and not overwrite:
+            raise FileExistsError(
+                f"Arquivo '{path}' já existe. "
+                f"Use export_transform_pipeline(path, overwrite=True) para sobrescrever."
+            )
+
+        tp = TransformPipeline()
+        tp._framework_version = _FRAMEWORK_VERSION
+        tp.params = self.params
+        tp.selected_features = self.selected_features
+        tp._train_schema = self._train_schema
+        tp._log_cols = self._log_cols
+        tp._outlier_bounds = self._outlier_bounds
+        tp._rare_categories = self._rare_categories
+        tp._agg_values = self._agg_values
+        tp._profile_features = getattr(self, "_profile_features", [])
+        tp.sklearn_pipeline = self.pipeline
+
+        joblib.dump(tp, path)
+
+        print(f"✅ TransformPipeline exportado em '{path}'")
+        print(f"   🔖 Versão framework : v{_FRAMEWORK_VERSION}")
+        print(f"   📐 Features         : {len(tp.selected_features)}")
+        print(f"   📦 Uso externo:")
+        print(f"      import joblib")
+        print(f"      pipeline = joblib.load('{path}')")
+        print(f"      df_out   = pipeline.transform(df_bruto)")
+
+        return tp
 
     @staticmethod
     def load(path: str) -> "AutoClassificationEngine":
