@@ -1,4 +1,8 @@
-# v0.1.4 Claude
+# v0.1.5 Claude
+#   [v0.1.5] FIX: infinity/crash no cross_validate — shift usa min(col_min, lower_bound)
+#   [v0.1.5] FIX: _handle_outliers_and_log usa mesmo shift robusto em fit e inferência
+#   [v0.1.5] FIX: TransformPipeline._step_outliers_and_log recebe mesmo fix
+#   [v0.1.5] NEW: sanitização inf/-inf → NaN após log1p em todos os caminhos
 #   [v0.1.4] NEW: TransformPipeline — pipeline de transformação portável, sem AutoGluon
 #   [v0.1.4] NEW: engine.export_transform_pipeline() — exporta TransformPipeline para .pkl
 #   [v0.1.4] NEW: TransformPipeline.describe() — resumo das etapas e features
@@ -97,7 +101,7 @@ try:
 except ImportError:
     _HAS_SMOTE = False
 
-_FRAMEWORK_VERSION = "0.1.4"
+_FRAMEWORK_VERSION = "0.1.5"
 
 # Cores canônicas para treino/teste — alta distinção visual e para daltônicos
 _COLOR_TRAIN = "#F06000"  # laranja-forte
@@ -672,6 +676,130 @@ class ProfileAnalyzer:
                 print(df_p.to_string(index=False))
         return results
 
+    def profile_all_display(
+        self,
+        topn: int = 20,
+        min_lift: float = 2.0,
+        min_support_pct: float = 0.01,
+        one_per_col: bool = False,
+    ) -> Dict:
+        """
+        Exibe os perfilamentos de forma visual e estruturada no notebook.
+        Compatível com Databricks (display nativo) e Jupyter (IPython.display).
+        Retorna o mesmo dict {grupo: DataFrame} que profile_all().
+        """
+        try:
+            from IPython.display import display as _display, HTML as _HTML
+        except ImportError:
+            _display = print
+            _HTML = lambda x: x
+
+        self._check_fitted()
+        results = {}
+
+        header_colors = [
+            "#0055A8",
+            "#F06000",
+            "#1a7a4a",
+            "#8B0000",
+            "#5B2D8E",
+            "#B8860B",
+            "#1C6E8C",
+            "#A0522D",
+            "#2E8B57",
+            "#8B008B",
+        ]
+
+        for i, g in enumerate(self.groups_):
+            if isinstance(g, numbers.Integral):
+                label = f"Faixa {int(g)+1} — Grupo {g}"
+            else:
+                label = f"Grupo {g}"
+            cor = header_colors[i % len(header_colors)]
+
+            df_p = self.profile_group(
+                g,
+                topn=topn,
+                min_lift=min_lift,
+                min_support_pct=min_support_pct,
+                one_per_col=one_per_col,
+            )
+            results[g] = df_p
+
+            _display(
+                _HTML(
+                    f"<div style='background:{cor};color:white;padding:10px 16px;"
+                    f"border-radius:6px;font-size:15px;font-weight:bold;"
+                    f"margin-top:20px;letter-spacing:0.5px'>"
+                    f"&#128269; PERFIL PREDOMINANTE &mdash; {label}"
+                    f"</div>"
+                )
+            )
+
+            if df_p.empty:
+                _display(
+                    _HTML(
+                        "<p style='color:gray;font-style:italic;margin:6px 0'>Nenhum token acima do threshold.</p>"
+                    )
+                )
+                continue
+
+            fmt = {
+                k: v
+                for k, v in {
+                    "Lift": "{:.2f}",
+                    "TFIDF": "{:.3f}",
+                    "Pct_in": "{:.1%}",
+                    "Pct_out": "{:.1%}",
+                }.items()
+                if k in df_p.columns
+            }
+
+            lift_max = df_p["Lift"].max() if "Lift" in df_p.columns else 1.0
+
+            styled = df_p.style
+            if "Lift" in df_p.columns:
+                styled = styled.background_gradient(
+                    subset=["Lift"], cmap="RdYlGn", vmin=1.0, vmax=lift_max
+                )
+            if "Pct_in" in df_p.columns:
+                styled = styled.background_gradient(subset=["Pct_in"], cmap="Blues")
+            if "TFIDF" in df_p.columns:
+                styled = styled.background_gradient(subset=["TFIDF"], cmap="Purples")
+
+            styled = (
+                styled.format(fmt)
+                .set_properties(
+                    **{
+                        "font-size": "13px",
+                        "border": "1px solid #e0e0e0",
+                        "padding": "5px 10px",
+                    }
+                )
+                .set_table_styles(
+                    [
+                        {
+                            "selector": "thead th",
+                            "props": [
+                                ("background-color", cor),
+                                ("color", "white"),
+                                ("font-weight", "bold"),
+                                ("font-size", "13px"),
+                                ("padding", "8px 10px"),
+                            ],
+                        },
+                        {
+                            "selector": "tbody tr:hover",
+                            "props": [("background-color", "#f5f5f5")],
+                        },
+                    ]
+                )
+                .hide(axis="index")
+            )
+            _display(styled)
+
+        return results
+
     def feature_importance_summary(self) -> pd.DataFrame:
         self._check_fitted()
         rows = []
@@ -837,9 +965,14 @@ class TransformPipeline:
             if col not in df.columns:
                 continue
             col_min = df[col].min()
-            if col_min < 0:
-                df[col] = df[col] - col_min
+            # [FIX v0.1.4] Shift usa min(col_min, lower_bound) — cobre valores de
+            # inferência que podem atingir o lower bound sem que o treino os tivesse
+            lb = self._outlier_bounds.get(col, (col_min, None))[0]
+            shift = min(col_min, lb) if pd.notna(col_min) else 0.0
+            if shift < 0:
+                df[col] = df[col] - shift
             df[col] = np.log1p(df[col])
+            df[col] = df[col].replace([np.inf, -np.inf], np.nan)
         return df
 
     def _step_profile_features(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -1430,9 +1563,14 @@ class AutoClassificationEngine:
 
             if col in self._log_cols:
                 col_min = df[col].min()
-                if col_min < 0:
-                    df[col] = df[col] - col_min
+                # [FIX v0.1.4] Shift usa min(col_min, lower_bound) — cobre valores de
+                # inferência que podem atingir o lower bound sem que o treino os tivesse
+                lb = self._outlier_bounds.get(col, (col_min, None))[0]
+                shift = min(col_min, lb) if pd.notna(col_min) else 0.0
+                if shift < 0:
+                    df[col] = df[col] - shift
                 df[col] = np.log1p(df[col])
+                df[col] = df[col].replace([np.inf, -np.inf], np.nan)
 
         return df
 
@@ -2409,12 +2547,17 @@ class AutoClassificationEngine:
                 X_vl_raw[col] = np.clip(X_vl_raw[col], lo, hi)
 
             # [FIX v0.1.0] Shift calculado APENAS no fold de treino — sem leakage para validação
+            # [FIX v0.1.4] Shift usa min(col_min_train, lo) — validação pode atingir o lower
+            # bound mesmo quando treino não atingiu → pós-shift < -1 → log1p → -inf → crash sklearn
             for col in log_cols_fold:
                 col_min_train = X_tr_raw[col].min()  # estatística só do treino
+                lo = bounds_fold.get(col, (col_min_train, None))[0]
+                shift = min(col_min_train, lo) if pd.notna(col_min_train) else 0.0
                 for split in [X_tr_raw, X_vl_raw]:
-                    if col_min_train < 0:
-                        split[col] = split[col] - col_min_train
+                    if shift < 0:
+                        split[col] = split[col] - shift
                     split[col] = np.log1p(split[col])
+                    split[col] = split[col].replace([np.inf, -np.inf], np.nan)
 
             # [NEW v0.1.1] Profile features por fold — recomputados só com treino do fold
             if self.params.get("use_profile_features", False):
@@ -4005,6 +4148,10 @@ class AutoClassificationEngine:
                 f"Arquivo '{path}' já existe. "
                 f"Use export_transform_pipeline(path, overwrite=True) para sobrescrever."
             )
+
+        dir_path = os.path.dirname(path)
+        if dir_path:
+            os.makedirs(dir_path, exist_ok=True)
 
         tp = TransformPipeline()
         tp._framework_version = _FRAMEWORK_VERSION
