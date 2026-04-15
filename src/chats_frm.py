@@ -99,19 +99,23 @@ class ModelReport:
         y_prob,
         pos_label: Union[int, str] = 1,
         threshold_strategy: str = "youden",
+        beta: float = 1.0,
         feature_importance: Optional[pd.DataFrame] = None,
         train_y_prob=None,
         train_y_true=None,
         dataset_label: str = "Teste",
+        experiment_name: str = "experimento",
         bins: int = 10,
     ):
         self.y_true = np.asarray(y_true, dtype=int)
         self.y_prob = np.asarray(y_prob, dtype=float)
         self.pos_label = pos_label
         self.threshold_strategy = threshold_strategy
+        self.beta = beta
         self.feature_importance = feature_importance
         self.bins = bins
         self.dataset_label = dataset_label
+        self.experiment_name = experiment_name
 
         # Treino / OOF opcional
         self.train_y_true = (
@@ -141,15 +145,15 @@ class ModelReport:
         if self.threshold_strategy == "youden":
             idx = np.argmax(tpr - fpr)
         elif (
-            self.threshold_strategy == "f1"
+            self.threshold_strategy in ("f1", "f_beta")
             and y_true is not None
             and y_prob is not None
         ):
+            beta = self.beta
             prec, rec, thr_pr = precision_recall_curve(y_true, y_prob)
-            f1s = 2 * prec * rec / (prec + rec + 1e-9)
-            best_idx = np.argmax(f1s[:-1])
+            fb = (1 + beta**2) * prec * rec / (beta**2 * prec + rec + 1e-9)
+            best_idx = np.argmax(fb[:-1])
             best_thr = thr_pr[best_idx]
-            # mapeia de volta para o índice em thresholds
             idx = np.argmin(np.abs(thresholds - best_thr))
         else:
             idx = np.argmin(np.abs(thresholds - 0.5))
@@ -244,6 +248,21 @@ class ModelReport:
         y_pred_opt = (y_prob >= opt_thresh).astype(int)
         brier = brier_score_loss(y_true, y_prob)
 
+        # KS contínuo — registro a registro (fonte única de verdade, igual à curva KS)
+        _df_ks = pd.DataFrame({"t": y_true, "p": y_prob}).sort_values(
+            "p", ascending=False
+        )
+        _tp = _df_ks["t"].sum()
+        _tn = len(_df_ks) - _tp
+        ks_cont = float(
+            (
+                _df_ks["t"].cumsum() / max(_tp, 1)
+                - (1 - _df_ks["t"]).cumsum() / max(_tn, 1)
+            )
+            .abs()
+            .max()
+        )
+
         return {
             "name": name,
             "y_true": y_true,
@@ -256,9 +275,11 @@ class ModelReport:
             "youden_thresh": opt_thresh,
             "youden_fpr": opt_fpr,
             "youden_tpr": opt_tpr,
+            "ks_cont": ks_cont,
             "metrics": {
                 "AUC-ROC": roc_auc,
                 "Gini": 2 * roc_auc - 1,
+                "KS": ks_cont,
                 "F1 (thr=0.5)": f1_score(y_true, y_pred, zero_division=0),
                 "F1 (opt)": f1_score(y_true, y_pred_opt, zero_division=0),
                 "Recall (thr=0.5)": recall_score(y_true, y_pred, zero_division=0),
@@ -459,8 +480,8 @@ class ModelReport:
 
         ks_txt = ""
         if title_mode == "performance" and self.dataset_label in results:
-            ks_stat = results[self.dataset_label]["decile_stats"]["ks"].max()
-            ks_txt = f"  |  KS Máximo ({self.dataset_label}): {ks_stat:.4f}"
+            ks_stat = results[self.dataset_label]["ks_cont"]
+            ks_txt = f"  |  KS ({self.dataset_label}): {ks_stat:.4f}"
 
         label_map = {5: "Quintil", 10: "Decil", 4: "Quartil", 20: "Vigésimo"}
         label_type = label_map.get(self.bins, f"{self.bins}-Faixas")
@@ -531,6 +552,140 @@ class ModelReport:
     # Método principal
     # -----------------------------------------------------------------------
 
+    def to_metrics_df(self) -> pd.DataFrame:
+        """
+        Retorna um DataFrame com todas as métricas do experimento em uma única linha.
+
+        Colunas fixas de identificação:
+            experiment_name, dataset_label, data, threshold_strategy,
+            beta, bins, n_total, n_positivos, taxa_positivos, threshold_otimo
+
+        Métricas calculadas (teste e treino/OOF quando disponível):
+            auc_roc, gini, ks, avg_precision,
+            f1_05, f1_1, f1_2,                  ← F-beta com β=0.5, 1.0 e 2.0
+            f1_opt, f1_default,
+            precision_opt, precision_default,
+            recall_opt, recall_default,
+            accuracy_opt, accuracy_default,
+            log_loss, brier_score,
+            mcc                                  ← Matthews Correlation Coefficient
+
+        Se treino/OOF fornecido, repete as mesmas colunas com prefixo "train_".
+
+        Uso:
+            row = report.to_metrics_df()
+            historico = pd.concat([historico, row], ignore_index=True)
+        """
+        from datetime import datetime
+        from sklearn.metrics import matthews_corrcoef
+
+        def _compute_all(y_true, y_prob, label):
+            fpr, tpr, thresholds = roc_curve(y_true, y_prob)
+            roc_auc = auc(fpr, tpr)
+            prec_full, rec_full, thresh_pr = precision_recall_curve(y_true, y_prob)
+            ap = average_precision_score(y_true, y_prob)
+            brier = brier_score_loss(y_true, y_prob)
+            ll = log_loss(y_true, y_prob)
+
+            # KS contínuo (registro a registro)
+            df_ks = pd.DataFrame({"t": y_true, "p": y_prob}).sort_values(
+                "p", ascending=False
+            )
+            tp = df_ks["t"].sum()
+            tn = len(df_ks) - tp
+            ks = (
+                (
+                    df_ks["t"].cumsum() / max(tp, 1)
+                    - (1 - df_ks["t"]).cumsum() / max(tn, 1)
+                )
+                .abs()
+                .max()
+            )
+
+            # Threshold ótimo via estratégia configurada
+            _orig_strategy = self.threshold_strategy
+            opt_thr, _, _ = self._compute_threshold(
+                fpr, tpr, thresholds, y_true, y_prob
+            )
+
+            y_pred_opt = (y_prob >= opt_thr).astype(int)
+            y_pred_def = (y_prob >= 0.5).astype(int)
+
+            # F-beta fixos (independente da estratégia)
+            def _fbeta(beta, y_pred):
+                p = precision_score(y_true, y_pred, zero_division=0)
+                r = recall_score(y_true, y_pred, zero_division=0)
+                return (1 + beta**2) * p * r / (beta**2 * p + r + 1e-9)
+
+            # F-beta no threshold ótimo via pr curve para β=0.5, 1, 2
+            def _fbeta_thr(beta):
+                p_, r_, t_ = precision_recall_curve(y_true, y_prob)
+                fb = (1 + beta**2) * p_ * r_ / (beta**2 * p_ + r_ + 1e-9)
+                best = t_[np.argmax(fb[:-1])]
+                yp = (y_prob >= best).astype(int)
+                return _fbeta(beta, yp)
+
+            prefix = f"{label}_" if label else ""
+            return {
+                f"{prefix}auc_roc": round(roc_auc, 6),
+                f"{prefix}gini": round(2 * roc_auc - 1, 6),
+                f"{prefix}ks": round(float(ks), 6),
+                f"{prefix}avg_precision": round(ap, 6),
+                f"{prefix}log_loss": round(ll, 6),
+                f"{prefix}brier_score": round(brier, 6),
+                f"{prefix}f1_05": round(_fbeta_thr(0.5), 6),
+                f"{prefix}f1_1": round(_fbeta_thr(1.0), 6),
+                f"{prefix}f1_2": round(_fbeta_thr(2.0), 6),
+                f"{prefix}f1_opt": round(
+                    f1_score(y_true, y_pred_opt, zero_division=0), 6
+                ),
+                f"{prefix}f1_default": round(
+                    f1_score(y_true, y_pred_def, zero_division=0), 6
+                ),
+                f"{prefix}precision_opt": round(
+                    precision_score(y_true, y_pred_opt, zero_division=0), 6
+                ),
+                f"{prefix}precision_default": round(
+                    precision_score(y_true, y_pred_def, zero_division=0), 6
+                ),
+                f"{prefix}recall_opt": round(
+                    recall_score(y_true, y_pred_opt, zero_division=0), 6
+                ),
+                f"{prefix}recall_default": round(
+                    recall_score(y_true, y_pred_def, zero_division=0), 6
+                ),
+                f"{prefix}accuracy_opt": round(accuracy_score(y_true, y_pred_opt), 6),
+                f"{prefix}accuracy_default": round(
+                    accuracy_score(y_true, y_pred_def), 6
+                ),
+                f"{prefix}mcc": round(matthews_corrcoef(y_true, y_pred_opt), 6),
+                f"{prefix}threshold_otimo": round(float(opt_thr), 6),
+            }
+
+        # Identificação
+        row = {
+            "experiment_name": self.experiment_name,
+            "dataset_label": self.dataset_label,
+            "data": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "threshold_strategy": self.threshold_strategy,
+            "beta": self.beta,
+            "bins": self.bins,
+            "n_total": len(self.y_true),
+            "n_positivos": int(self.y_true.sum()),
+            "taxa_positivos": round(self.y_true.mean(), 6),
+        }
+
+        # Métricas do conjunto principal (sem prefixo)
+        row.update(_compute_all(self.y_true, self.y_prob, label=""))
+
+        # Métricas do treino/OOF (prefixo "train_")
+        if self.train_y_prob is not None:
+            row.update(
+                _compute_all(self.train_y_true, self.train_y_prob, label="train")
+            )
+
+        return pd.DataFrame([row])
+
     def plot(self):
         """Gera o relatório completo com todos os gráficos."""
 
@@ -559,7 +714,6 @@ class ModelReport:
             )
             decile_indep[name] = stats
             results[name]["decile_stats"] = stats
-            results[name]["metrics"]["KS"] = stats["ks"].max()
             if name == ref_name:
                 train_cut_edges = edges
 
