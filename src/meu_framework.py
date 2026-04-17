@@ -101,7 +101,7 @@ try:
 except ImportError:
     _HAS_SMOTE = False
 
-_FRAMEWORK_VERSION = "0.1.5"
+_FRAMEWORK_VERSION = "0.1.5.1"
 
 # Cores canônicas para treino/teste — alta distinção visual e para daltônicos
 _COLOR_TRAIN = "#F06000"  # laranja-forte
@@ -1104,6 +1104,7 @@ class AutoClassificationEngine:
             "colinearidade": [],
             "constantes_pos_rare": [],
             "importancia_nula": [],
+            "boruta": [],  # <--- ADICIONE AQUI
         }
 
         self.association_report: dict = {}
@@ -1409,6 +1410,95 @@ class AutoClassificationEngine:
             df = df.drop(columns=list(to_drop))
 
         return df
+
+    def _run_boruta_selection(
+        self,
+        X_core: pd.DataFrame,
+        y_core: pd.Series,
+        max_iters: int = 15,
+        hit_threshold_pct: float = 0.40,
+    ) -> list:
+        """
+        Boruta-LightGBM Nativo: Filtro de elite que confronta as features
+        reais contra 'Shadow Features' (cópias embaralhadas) para garantir
+        que apenas o sinal sobreviva ao ruído.
+        """
+        print(f"\n🌪️ --- INICIANDO BORUTA-LGBM (Seleção de Elite) ---")
+
+        from lightgbm import LGBMClassifier
+        import numpy as np
+
+        # 1. Prepara categóricas para o LightGBM
+        X_proc = X_core.copy()
+        cat_cols = X_proc.select_dtypes(include=["object", "category"]).columns.tolist()
+        for c in cat_cols:
+            X_proc[c] = X_proc[c].astype("category")
+
+        hits = {col: 0 for col in X_proc.columns}
+
+        for i in range(max_iters):
+            # 2. Cria as Shadow Features (Embaralhadas)
+            X_shadow = X_proc.copy()
+            X_shadow.columns = [f"shadow_{c}" for c in X_proc.columns]
+
+            for c in X_shadow.columns:
+                # Seed variável garante um embaralhamento único por coluna e por iteração
+                np.random.seed(42 + i + hash(c) % 10000)
+                X_shadow[c] = np.random.permutation(X_shadow[c].values)
+
+            # 3. Arena: Originais vs Impostoras
+            X_arena = pd.concat([X_proc, X_shadow], axis=1)
+
+            # --- FIX: Restaura o dtype 'category' que o numpy permutation destruiu ---
+            arena_cat_cols = X_arena.select_dtypes(include=["object"]).columns
+            for c in arena_cat_cols:
+                X_arena[c] = X_arena[c].astype("category")
+            # -------------------------------------------------------------------------
+
+            # 4. Treina o juiz (Rápido, mas "amarrado" para não decorar ruído)
+            clf = LGBMClassifier(
+                n_estimators=50,  # Menos árvores
+                max_depth=4,  # <--- FIX: Impede a árvore de crescer e decorar o ruído
+                num_leaves=15,  # <--- FIX: Força árvores simples
+                colsample_bytree=0.8,  # <--- FIX: Obriga a árvore a olhar para variáveis diferentes
+                random_state=42 + i,
+                importance_type="gain",
+                verbose=-1,
+                n_jobs=-1,
+            )
+
+            clf.fit(X_arena, y_core)
+
+            # 5. Extrai as importâncias
+            imp_df = pd.DataFrame(
+                {"feature": X_arena.columns, "gain": clf.feature_importances_}
+            )
+
+            # 6. A Régua de Corte: O melhor impostor da rodada
+            max_shadow_gain = imp_df[imp_df["feature"].str.startswith("shadow_")][
+                "gain"
+            ].max()
+
+            # 7. Contabiliza os Hits (Vitórias das originais sobre a melhor impostora)
+            real_imp = imp_df[~imp_df["feature"].str.startswith("shadow_")]
+            for _, row in real_imp.iterrows():
+                if row["gain"] > max_shadow_gain:
+                    hits[row["feature"]] += 1
+
+            print(
+                f"   🔄 Iteração {i+1}/{max_iters} concluída. (Régua: {max_shadow_gain:.2f})"
+            )
+
+        # 8. Decisão Final (Tem que vencer em pelo menos X% das rodadas)
+        threshold_hits = max(1, int(max_iters * hit_threshold_pct))
+        good_features = [col for col, h in hits.items() if h >= threshold_hits]
+
+        removidas = len(X_core.columns) - len(good_features)
+        print(f"\n   🏆 Boruta Finalizado!")
+        print(f"   => Critério de Sobrevivência: {threshold_hits} Hits")
+        print(f"   => Mantidas: {len(good_features)} | Removidas: {removidas}")
+
+        return good_features
 
     # -----------------------------------------------------------------------
     # 2. ENGENHARIA DE FEATURES
@@ -2144,16 +2234,34 @@ class AutoClassificationEngine:
     # 5. FIT
     # -----------------------------------------------------------------------
 
-    def fit(self, train_data: pd.DataFrame, time_limit: int = None):
+    def fit(
+        self,
+        train_data: pd.DataFrame,
+        time_limit: int = None,
+        skip_selection: bool = False,
+    ):
         print(f"\n🚀 --- TREINAMENTO INICIADO (v{_FRAMEWORK_VERSION}) ---")
 
         if time_limit is None:
             time_limit = self.params.get("time_limit", 300)
 
+        # 1. Limpeza Base
         df = self._standardize_and_clean(train_data)
+
+        # 2. Drop Automático Solicitado pelo Usuário
+        drop_cols = self.params.get("drop_features", [])
+        if drop_cols:
+            existing_drop = [c for c in drop_cols if c in df.columns]
+            if existing_drop:
+                df = df.drop(columns=existing_drop)
+                print(
+                    f"   🚫 Drop Automático: {existing_drop} removidas por solicitação."
+                )
+
+        # 3. Features Temporais
         df = self._extract_temporal_features(df)
 
-        # [NEW v0.1.0] Guard multiclasse — engine suporta apenas classificação binária
+        # 4. Guard Multiclasse
         n_classes = df[self.target].nunique()
         if n_classes > 2:
             raise ValueError(
@@ -2164,10 +2272,11 @@ class AutoClassificationEngine:
 
         self._validate_group_agg_pairs(df.columns.tolist())
 
+        # 5. Split de Tuning (se não estivermos no modo CV)
         tuning_frac = self.params.get("tuning_data_fraction", 0.15)
         df_tuning = None
 
-        if tuning_frac > 0:
+        if tuning_frac > 0 and not skip_selection:
             try:
                 df_core, df_tuning = train_test_split(
                     df, test_size=tuning_frac, stratify=df[self.target], random_state=42
@@ -2180,31 +2289,31 @@ class AutoClassificationEngine:
                 df_core = df
                 df_tuning = None
         else:
+            # Se skip_selection for True (CV fold), não dividimos tuning_frac de novo
             df_core = df
 
+        # 6. Hashing
         try:
             sample = df_core.head(10_000)
             hash_str = hashlib.sha256(
                 pd.util.hash_pandas_object(sample, index=True).values.tobytes()
             ).hexdigest()
             self._train_hash = hash_str
-            print(f"\n🔑 Hash do df_core: {hash_str[:16]}...")
+            if not skip_selection:
+                print(f"\n🔑 Hash do df_core: {hash_str[:16]}...")
         except Exception:
             self._train_hash = ""
 
-        print("\n🔧 Criando group aggregations...")
+        # ====================================================================
+        # FASE 1: FEATURE ENGINEERING (RODA SEMPRE, MESMO NO CV)
+        # ====================================================================
+        if not skip_selection:
+            print("\n🔧 Criando group aggregations...")
         df_core = self._create_group_aggregations(df_core, is_train=True)
         if df_tuning is not None:
             df_tuning = self._create_group_aggregations(df_tuning, is_train=False)
 
-        df_core = self._sanity_check(df_core)
-        df_core = self._handle_multicollinearity(df_core)
-
-        if df_tuning is not None:
-            cols_to_keep = [c for c in df_tuning.columns if c in df_core.columns]
-            df_tuning = df_tuning[cols_to_keep]
-
-        # 1. Tratamento de Rare Labels e Outliers (Treino e Tuning)
+        # Rare Labels e Outliers
         df_core = self._handle_rare_labels(df_core, is_train=True)
         if self.params.get("handle_outliers", True):
             df_core = self._handle_outliers_and_log(df_core, is_train=True)
@@ -2214,98 +2323,144 @@ class AutoClassificationEngine:
             if self.params.get("handle_outliers", True):
                 df_tuning = self._handle_outliers_and_log(df_tuning, is_train=False)
 
-        # 2. Profile-based Feature Engineering (AGORA VEM ANTES DA COLINEARIDADE)
+        # Profile Features
         if self.params.get("use_profile_features", False):
-            print("\n🔬 Profile-based Feature Engineering (target-guided)...")
+            if not skip_selection:
+                print("\n🔬 Profile-based Feature Engineering (target-guided)...")
             df_core = self._profile_based_feature_engineering(df_core, is_train=True)
             if df_tuning is not None:
                 df_tuning = self._profile_based_feature_engineering(
                     df_tuning, is_train=False
                 )
 
-        # 3. Tratamento de Leakage e Colinearidade (AGORA VEM DEPOIS DE TUDO)
-        # Assim ele pega a redundância das Profile Features!
-        df_core = self._sanity_check(df_core)
-        df_core = self._handle_multicollinearity(df_core)
+        # ====================================================================
+        # FASE 2: BIFURCAÇÃO DA SELEÇÃO (O CÉREBRO DA PERFORMANCE)
+        # ====================================================================
 
-        # Sincroniza o tuning para remover o que a colinearidade/sanity derrubou
-        if df_tuning is not None:
-            cols_to_keep = [c for c in df_tuning.columns if c in df_core.columns]
-            df_tuning = df_tuning[cols_to_keep]
+        # Zera os dicionários para não misturar logs antigos
+        self.eliminated_features = {
+            "leakage": [],
+            "alta_cardinalidade": [],
+            "colinearidade": [],
+            "constantes_pos_rare": [],
+            "importancia_nula": [],
+            "boruta": [],
+        }
 
-        # Finaliza a seleção
-        self.selected_features = [c for c in df_core.columns if c != self.target]
-        X_core = df_core[self.selected_features]
-        y_core = df_core[self.target]
+        if skip_selection:
+            # === MODO EXPRESSO (Para os Folds de CV) ===
+            print("   ⏩ Pulando seleção de variáveis (modo skip_selection ativo).")
 
-        print("\n🔗 Calculando associações...")
-        self.association_report = self._compute_association_report(df_core)
-        print("   ✅ Relatório pronto.")
+            # Filtra apenas o que sobreviveu à peneira global
+            cols_to_keep = [c for c in self.selected_features if c in df_core.columns]
 
-        chosen_metric = self.params.get("eval_metric", "f1")
-
-        if self.params.get("use_importance_filter", False):
-            print("\n🔍 Importance Filter...")
-            pre_time = min(60, max(20, time_limit // 6))
-            train_imp = X_core.copy()
-            train_imp[self.target] = y_core.values
-
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                logging.disable(logging.CRITICAL)
-                pre_predictor = TabularPredictor(
-                    label=self.target, eval_metric=chosen_metric, verbosity=0
-                ).fit(
-                    train_imp,
-                    time_limit=pre_time,
-                    presets="optimize_for_deployment",
-                    hyperparameters={"GBM": {}, "CAT": {}, "XGB": {}},
-                    ag_args_ensemble={"fold_fitting_strategy": "sequential_local"},
-                    num_cpus=self.params.get("num_cpus", os.cpu_count() or 6),
-                )
-                logging.disable(logging.NOTSET)
+            X_core = df_core[cols_to_keep]
+            y_core = df_core[self.target]
 
             if df_tuning is not None:
-                fi_eval_data = df_tuning[
-                    [c for c in self.selected_features if c in df_tuning.columns]
-                    + [self.target]
-                ].copy()
-                print("   ✅ Avaliando no df_tuning (holdout limpo).")
-            else:
-                fi_eval_data = train_imp
-                print("   ⚠️  df_tuning indisponível — avaliando no df_core (fallback).")
+                df_tuning = df_tuning[cols_to_keep + [self.target]]
 
-            fi = pre_predictor.feature_importance(fi_eval_data)
-            pvalue_thr = self.params.get("importance_pvalue_threshold", 0.05)
+        else:
+            # === MODO COMPLETO (Treino Global - 1ª Passagem) ===
 
-            if pvalue_thr is None:
-                good_features = fi[fi["importance"] > 0].index.tolist()
-                print("   📌 Critério: importância > 0 (p-value desativado)")
-            else:
-                good_features = fi[
-                    (fi["importance"] > 0) & (fi["p_value"] < pvalue_thr)
-                ].index.tolist()
-                print(f"   📌 Critério: importância > 0 AND p_value < {pvalue_thr}")
+            # 1. Tratamento de Leakage e Colinearidade
+            df_core = self._sanity_check(df_core)
+            df_core = self._handle_multicollinearity(df_core)
 
-            removed = set(self.selected_features) - set(good_features)
-            self.eliminated_features["importancia_nula"] = list(removed)
-            self.selected_features = good_features
-            X_core = X_core[self.selected_features]
-            print(f"   => Mantidas: {len(good_features)} | Removidas: {len(removed)}")
+            # Sincroniza o tuning
+            if df_tuning is not None:
+                cols_to_keep = [c for c in df_tuning.columns if c in df_core.columns]
+                df_tuning = df_tuning[cols_to_keep]
 
-        print("\n📋 RESUMO DA FILTRAGEM DE VARIÁVEIS:")
-        label_map = {
-            "leakage": "Removidas por Leakage",
-            "alta_cardinalidade": "Removidas por Alta Cardinalidade",
-            "colinearidade": "Removidas por Colinearidade",
-            "constantes_pos_rare": "Removidas por Constantes pós-RareLabel",
-            "importancia_nula": "Removidas por Importância Nula",
-        }
-        for reason, cols in self.eliminated_features.items():
-            print(f"   => {label_map[reason]}: {cols or 'Nenhuma'}")
-        print(
-            f"   => Features Finais ({len(self.selected_features)}): {self.selected_features}"
-        )
+            # 2. Definição Base
+            self.selected_features = [c for c in df_core.columns if c != self.target]
+            X_core = df_core[self.selected_features]
+            y_core = df_core[self.target]
+
+            print("\n🔗 Calculando associações...")
+            self.association_report = self._compute_association_report(df_core)
+            print("   ✅ Relatório pronto.")
+
+            # 3. Null Importance Filter
+            if self.params.get("use_importance_filter", False):
+                print("\n🔍 Null Importance Filter (LightGBM)...")
+                from lightgbm import LGBMClassifier
+
+                X_imp = X_core.copy()
+                cat_cols = X_imp.select_dtypes(
+                    include=["object", "category"]
+                ).columns.tolist()
+                for c in cat_cols:
+                    X_imp[c] = X_imp[c].astype("category")
+
+                clf = LGBMClassifier(
+                    n_estimators=100,
+                    random_state=42,
+                    importance_type="gain",
+                    verbose=-1,
+                )
+                clf.fit(X_imp, y_core)
+                actual_imp = clf.feature_importances_
+
+                n_runs = 5
+                null_imps = np.zeros((n_runs, X_imp.shape[1]))
+                y_shuffled = y_core.copy().values
+
+                print(f"   🎲 Calculando ruído com {n_runs} permutações do target...")
+                for i in range(n_runs):
+                    np.random.seed(42 + i)
+                    np.random.shuffle(y_shuffled)
+                    clf.fit(X_imp, y_shuffled)
+                    null_imps[i, :] = clf.feature_importances_
+
+                null_p75 = np.percentile(null_imps, 75, axis=0)
+
+                good_features = []
+                for idx, col in enumerate(X_imp.columns):
+                    if actual_imp[idx] > null_p75[idx] and actual_imp[idx] > 0:
+                        good_features.append(col)
+
+                removed = set(self.selected_features) - set(good_features)
+                self.eliminated_features["importancia_nula"] = list(removed)
+                self.selected_features = good_features
+                X_core = X_core[self.selected_features]
+                print(
+                    f"   ✅ Sinal vs Ruído: Mantidas {len(good_features)} | Removidas {len(removed)}"
+                )
+
+            # 4. Boruta-LightGBM
+            if self.params.get("use_boruta_filter", False):
+                good_features = self._run_boruta_selection(
+                    X_core,
+                    y_core,
+                    max_iters=self.params.get("boruta_iters", 15),
+                    hit_threshold_pct=self.params.get("boruta_hit_pct", 0.40),
+                )
+
+                removed = set(self.selected_features) - set(good_features)
+                self.eliminated_features["boruta"] = list(removed)
+                self.selected_features = good_features
+                X_core = X_core[self.selected_features]
+
+            # 5. Imprime Resumo da Filtragem
+            print("\n📋 RESUMO DA FILTRAGEM DE VARIÁVEIS:")
+            label_map = {
+                "leakage": "Removidas por Leakage",
+                "alta_cardinalidade": "Removidas por Alta Cardinalidade",
+                "colinearidade": "Removidas por Colinearidade",
+                "constantes_pos_rare": "Removidas por Constantes pós-RareLabel",
+                "importancia_nula": "Removidas por Importância Nula",
+                "boruta": "Removidas pelo Boruta-LightGBM",
+            }
+            for reason, cols in self.eliminated_features.items():
+                print(f"   => {label_map[reason]}: {cols or 'Nenhuma'}")
+            print(
+                f"   => Features Finais ({len(self.selected_features)}): {self.selected_features}"
+            )
+
+        # ====================================================================
+        # FASE 3: PIPELINE AUTOGLUON (TREINAMENTO DO MODELO FINAL)
+        # ====================================================================
 
         self._train_schema = {
             col: str(X_core[col].dtype) for col in self.selected_features
@@ -2334,22 +2489,25 @@ class AutoClassificationEngine:
             tuning_final = X_tuning_t.copy()
             tuning_final[self.target] = df_tuning[self.target].values
 
+        chosen_metric = self.params.get("eval_metric", "f1")
         chosen_preset = self.params.get("presets", "high_quality")
         thr_strategy = self.params.get("threshold_strategy", "youden")
         corr_method = self.params.get("corr_method", "pearson")
-        print(
-            f"\n🎯 Métrica: {chosen_metric} | Preset: {chosen_preset} | Time: {time_limit}s"
-            f" | Threshold: {thr_strategy} | corr_method: {corr_method}"
-        )
+
+        if not skip_selection:
+            print(
+                f"\n🎯 Métrica: {chosen_metric} | Preset: {chosen_preset} | Time: {time_limit}s"
+                f" | Threshold: {thr_strategy} | corr_method: {corr_method}"
+            )
 
         hyperparams = "default"
         if self.params.get("prune_models", False):
-            hyperparams = {"GBM": {}, "CAT": {}, "XGB": {}, "FASTAI": {}}
+            # Deixa APENAS LightGBM, CatBoost e XGBoost
+            hyperparams = {"GBM": {}, "CAT": {}, "XGB": {}}
 
         fit_kwargs = {
             "time_limit": time_limit,
             "presets": chosen_preset,
-            # [NEW v0.1.0] num_cpus padrão = os.cpu_count() ou 6
             "num_cpus": self.params.get("num_cpus", os.cpu_count() or 6),
             "ag_args_ensemble": self.params.get(
                 "ag_args_ensemble", {"fold_fitting_strategy": "sequential_local"}
@@ -2374,7 +2532,8 @@ class AutoClassificationEngine:
 
         if "feature_generator" in self.params:
             fit_kwargs["feature_generator"] = self.params["feature_generator"]
-            print("   🔧 feature_generator customizado ativo.")
+            if not skip_selection:
+                print("   🔧 feature_generator customizado ativo.")
 
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
@@ -2387,10 +2546,112 @@ class AutoClassificationEngine:
             data=tuning_final if tuning_final is not None else train_final
         )
 
-        print("\n✅ Treinamento concluído!")
-        print(f"   🔑 Train hash : {self._train_hash[:16]}...")
-        print(f"   📐 Threshold  : {thr_strategy}")
-        print(f"   📊 corr_method: {corr_method}")
+        if not skip_selection:
+            print("\n✅ Treinamento concluído!")
+            print(f"   🔑 Train hash : {self._train_hash[:16]}...")
+            print(f"   📐 Threshold  : {thr_strategy}")
+            print(f"   📊 corr_method: {corr_method}")
+
+    def check_adversarial_drift(
+        self,
+        train_data: pd.DataFrame,
+        test_data: pd.DataFrame,
+        sample_size: int = 100000,
+    ) -> pd.DataFrame:
+        """
+        Escudo Temporal: Verifica se os dados de teste/produção sofreram
+        mutação em relação aos dados de treino.
+        """
+        print("\n🛡️ --- INICIANDO ESCUDO TEMPORAL (Adversarial Validation) ---")
+
+        # 1. Prepara as bases com a flag de origem
+        df_tr = train_data.copy()
+        df_te = test_data.copy()
+
+        df_tr["__is_test__"] = 0
+        df_te["__is_test__"] = 1
+
+        df_concat = pd.concat([df_tr, df_te], ignore_index=True)
+
+        # O target do modelo real não pode entrar aqui
+        if self.target in df_concat.columns:
+            df_concat = df_concat.drop(columns=[self.target])
+
+        # Amostragem inteligente para não fritar o cluster do Databricks
+        if len(df_concat) > sample_size:
+            df_concat = df_concat.sample(n=sample_size, random_state=42)
+            print(f"   ⚖️  Amostragem aplicada: reduzido para {sample_size} registros.")
+
+        # Usa as próprias ferramentas do seu framework para limpar o dado
+        df_concat = self._standardize_and_clean(df_concat)
+        df_concat = self._extract_temporal_features(df_concat)
+
+        # Separa X e y
+        X = df_concat.drop(columns=["__is_test__"])
+        y = df_concat["__is_test__"]
+
+        # Prepara categóricas pro LightGBM
+        cat_cols = X.select_dtypes(include=["object", "category"]).columns.tolist()
+        for c in cat_cols:
+            X[c] = X[c].astype("category")
+
+        # 2. Treina o Detector de Mutação usando Cross-Validation
+        from lightgbm import LGBMClassifier
+        from sklearn.model_selection import cross_val_predict
+        from sklearn.metrics import roc_auc_score
+
+        print("   ⚔️  Treinando detector de mutação de dados...")
+        clf = LGBMClassifier(n_estimators=100, random_state=42, verbose=-1)
+
+        # Gera predições out-of-fold para ter um AUC totalmente honesto
+        y_prob = cross_val_predict(clf, X, y, cv=3, method="predict_proba")[:, 1]
+        auc_score = roc_auc_score(y, y_prob)
+
+        # 3. Laudo do Escudo
+        print(f"\n📊 RESULTADO DO ESCUDO:")
+        if auc_score > 0.70:
+            print(f"   🚨 ALERTA VERMELHO! AUC = {auc_score:.4f}")
+            print(
+                "   Os dados sofreram mutação forte no tempo. Risco de quebra de modelo na produção!"
+            )
+        elif auc_score > 0.60:
+            print(f"   ⚠️  Atenção. AUC = {auc_score:.4f}")
+            print(
+                "   Existe um leve drift nos dados. O modelo deve sobreviver, mas fique de olho nas features suspeitas."
+            )
+        else:
+            print(f"   ✅ Base Segura! AUC = {auc_score:.4f}")
+            print(
+                "   Treino e Teste são estatisticamente indistinguíveis. Pode seguir o jogo."
+            )
+
+        # 4. Investigação Criminal: Quem está causando o drift?
+        clf.fit(X, y)
+        importances = clf.feature_importances_
+
+        df_drifters = pd.DataFrame(
+            {"Feature": X.columns, "Drift_Score": importances}
+        ).sort_values("Drift_Score", ascending=False)
+
+        # Normaliza o score pra ficar legível (0 a 100%)
+        max_score = df_drifters["Drift_Score"].max()
+        if max_score > 0:
+            df_drifters["Impacto_Relativo"] = (
+                df_drifters["Drift_Score"] / max_score
+            ) * 100
+        else:
+            df_drifters["Impacto_Relativo"] = 0.0
+
+        top_drifters = df_drifters[df_drifters["Impacto_Relativo"] > 5.0].head(10)
+
+        if auc_score > 0.60 and not top_drifters.empty:
+            print("\n🕵️ Principais suspeitas de mutação (Drifters):")
+            for _, row in top_drifters.iterrows():
+                print(
+                    f"   - {row['Feature']}: {row['Impacto_Relativo']:.1f}% de responsabilidade"
+                )
+
+        return df_drifters[["Feature", "Drift_Score", "Impacto_Relativo"]]
 
     # -----------------------------------------------------------------------
     # 5b. FEATURE IMPORTANCE PÚBLICO
@@ -2414,59 +2675,36 @@ class AutoClassificationEngine:
             print(f"   ⚠️  Falha ao calcular importância: {e}")
             self.feature_importance = None
 
-    # -----------------------------------------------------------------------
-    # 5c. CROSS-VALIDATION EXTERNO
-    # -----------------------------------------------------------------------
-
     def cross_validate(
         self,
         train_data: pd.DataFrame,
         n_folds: int = 5,
         n_repeats: int = 1,
         time_limit_per_fold: int = None,
-        use_smote: bool = False,
-        smote_k_neighbors: int = 5,
+        skip_selection: bool = True,
     ) -> pd.DataFrame:
+        """
+        Executa Cross-Validation estratificado reaproveitando o pipeline do fit().
+        Versão final calibrada para os relatórios visuais (sem erros de KeyError).
+        """
         if self.selected_features is None:
-            raise RuntimeError("Execute fit() antes de cross_validate().")
-
-        if use_smote and not _HAS_SMOTE:
-            warnings.warn(
-                "SMOTE solicitado mas imbalanced-learn não está instalado. Continuando sem SMOTE.",
-                UserWarning,
+            raise RuntimeError(
+                "Execute fit() antes de cross_validate() para selecionar as features."
             )
-            use_smote = False
 
+        # 1. Parâmetros de Tempo e Folds
         total_tl = self.params.get("time_limit", 300)
         if time_limit_per_fold is None:
             time_limit_per_fold = max(60, total_tl // n_folds)
 
         total_folds = n_folds * n_repeats
-        repeat_tag = (
-            f" × {n_repeats} repetições = {total_folds} modelos"
-            if n_repeats > 1
-            else ""
+        print(f"\n🔄 --- CROSS-VALIDATION ({n_folds} folds) ---")
+        print(
+            f"   Time limit por fold: {time_limit_per_fold}s | skip_selection: {skip_selection}"
         )
-        print(f"\n🔄 --- CROSS-VALIDATION ({n_folds} folds{repeat_tag}) ---")
-        print(f"   Time limit por fold: {time_limit_per_fold}s")
 
-        pairs = self.params.get("group_aggregation_pairs", [])
-        agg_feat_names = {
-            f"{p.get('agg','mean')}_{p['num']}_by_{p['cat']}"
-            for p in pairs
-            if "cat" in p and "num" in p
-        }
-        base_selected = [c for c in self.selected_features if c not in agg_feat_names]
-        agg_source_cols = set()
-        for p in pairs:
-            if "cat" in p:
-                agg_source_cols.add(p["cat"])
-            if "num" in p:
-                agg_source_cols.add(p["num"])
-
+        # 2. Preparação do Dataset Base
         df_base = self._standardize_and_clean(train_data)
-        cols_needed = set(base_selected) | {self.target} | agg_source_cols
-        df_base = df_base[[c for c in df_base.columns if c in cols_needed]]
         df_base = self._extract_temporal_features(df_base)
 
         y_raw = df_base[self.target]
@@ -2480,23 +2718,14 @@ class AutoClassificationEngine:
         else:
             skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
 
-        n_classes = y_raw.nunique()
-        if use_smote and n_classes > 2:
-            warnings.warn(
-                f"SMOTE desativado: detectadas {n_classes} classes. Suporta apenas binário.",
-                UserWarning,
-            )
-            use_smote = False
-
+        # 3. Estruturas de Dados para Métricas
         fold_metrics = []
         fold_curves = []
         oof_probs = np.zeros(len(y_raw))
         oof_counts = np.zeros(len(y_raw))
         oof_true = np.zeros(len(y_raw))
 
-        chosen_metric = self.params.get("eval_metric", "f1")
-        chosen_preset = self.params.get("presets", "high_quality")
-
+        # 4. Loop de Folds (O Motor)
         for fold_idx, (train_idx, val_idx) in enumerate(skf.split(df_base, y_strat)):
             print(
                 f"\n   📂 Fold {fold_idx + 1}/{total_folds} (treino={len(train_idx)}, val={len(val_idx)})"
@@ -2505,219 +2734,72 @@ class AutoClassificationEngine:
             df_tr_fold = df_base.iloc[train_idx].copy()
             df_vl_fold = df_base.iloc[val_idx].copy()
 
-            if pairs:
-                local_agg_map = self._compute_agg_map_local(df_tr_fold, pairs)
-                df_tr_fold = self._apply_agg_map_local(df_tr_fold, pairs, local_agg_map)
-                df_vl_fold = self._apply_agg_map_local(df_vl_fold, pairs, local_agg_map)
+            # Treina o fold pulando a seleção pesada (Boruta/Null Importance)
+            self.fit(
+                df_tr_fold,
+                time_limit=time_limit_per_fold,
+                skip_selection=skip_selection,
+            )
 
-            fold_features = [
-                c for c in self.selected_features if c in df_tr_fold.columns
-            ]
-            X_tr_raw = df_tr_fold[fold_features].copy()
-            X_vl_raw = df_vl_fold[fold_features].copy()
-            y_tr = df_tr_fold[self.target]
-            y_vl = df_vl_fold[self.target]
-
-            cat_cols = X_tr_raw.select_dtypes(include=["object", "category"]).columns
-            for col in cat_cols:
-                X_tr_raw[col] = X_tr_raw[col].astype(str)
-                X_vl_raw[col] = X_vl_raw[col].astype(str)
-                freq = X_tr_raw[col].value_counts(normalize=True)
-                rare_keep = freq[
-                    freq >= self.params.get("rare_label_min_freq", 0.01)
-                ].index.tolist()
-                X_tr_raw[col] = X_tr_raw[col].where(
-                    X_tr_raw[col].isin(rare_keep), "OTHER"
-                )
-                X_vl_raw[col] = X_vl_raw[col].where(
-                    X_vl_raw[col].isin(rare_keep), "OTHER"
-                )
-
-            log_cols_fold, bounds_fold = [], {}
-            for col in X_tr_raw.select_dtypes(include=[np.number]).columns:
-                Q1, Q3 = X_tr_raw[col].quantile([0.25, 0.75])
-                IQR = Q3 - Q1
-                if IQR > 0:
-                    bounds_fold[col] = (Q1 - 1.5 * IQR, Q3 + 1.5 * IQR)
-                if abs(skew(X_tr_raw[col].dropna())) > 0.75:
-                    log_cols_fold.append(col)
-
-            for col, (lo, hi) in bounds_fold.items():
-                X_tr_raw[col] = np.clip(X_tr_raw[col], lo, hi)
-                X_vl_raw[col] = np.clip(X_vl_raw[col], lo, hi)
-
-            # [FIX v0.1.0] Shift calculado APENAS no fold de treino — sem leakage para validação
-            # [FIX v0.1.4] Shift usa min(col_min_train, lo) — validação pode atingir o lower
-            # bound mesmo quando treino não atingiu → pós-shift < -1 → log1p → -inf → crash sklearn
-            for col in log_cols_fold:
-                col_min_train = X_tr_raw[col].min()  # estatística só do treino
-                lo = bounds_fold.get(col, (col_min_train, None))[0]
-                shift = min(col_min_train, lo) if pd.notna(col_min_train) else 0.0
-                for split in [X_tr_raw, X_vl_raw]:
-                    if shift < 0:
-                        split[col] = split[col] - shift
-                    split[col] = np.log1p(split[col])
-                    split[col] = split[col].replace([np.inf, -np.inf], np.nan)
-
-            # [NEW v0.1.1] Profile features por fold — recomputados só com treino do fold
-            if self.params.get("use_profile_features", False):
-                df_tr_pf = X_tr_raw.copy()
-                df_tr_pf[self.target] = y_tr.values
-                fold_profile_specs = self._compute_profile_features(df_tr_pf)
-                X_tr_raw = self._apply_profile_features(X_tr_raw, fold_profile_specs)
-                X_vl_raw = self._apply_profile_features(X_vl_raw, fold_profile_specs)
-                if fold_profile_specs:
-                    print(
-                        f"      🔬 Profile features no fold: {len(fold_profile_specs)}"
-                    )
-
-            # ====================================================================
-            # --- INSIRA ESTE BLOCO AQUI ---
-            # Combate a colinearidade recriada pelas novas profile features do fold
-            df_tr_colin = X_tr_raw.copy()
-            df_tr_colin[self.target] = y_tr.values
-
-            # Backup do dicionário de features eliminadas para não poluir o global
-            import copy
-
-            _bkp_elim = copy.deepcopy(self.eliminated_features)
-
-            df_tr_colin = self._sanity_check(df_tr_colin)
-            df_tr_colin = self._handle_multicollinearity(df_tr_colin)
-
-            self.eliminated_features = _bkp_elim  # Restaura o dicionário global
-
-            # Sincroniza as colunas limpas para treino e validação do fold
-            surviving_fold_cols = [c for c in df_tr_colin.columns if c != self.target]
-            X_tr_raw = df_tr_colin[surviving_fold_cols]
-            X_vl_raw = X_vl_raw[surviving_fold_cols]
-            # ====================================================================
-
-            # [FIX v0.1.0] Respeita use_sklearn_pipeline=False
-            if self.params.get("use_sklearn_pipeline", True):
-                pipe_fold = self._build_sklearn_pipeline(X_tr_raw, y=y_tr)
-                X_tr_t = pipe_fold.fit_transform(X_tr_raw, y_tr)
-                X_vl_t = pipe_fold.transform(X_vl_raw)
-            else:
-                X_tr_t = X_tr_raw.copy()
-                X_vl_t = X_vl_raw.copy()
-
-            y_bin_tr = (y_tr.astype(str) == str(pos_label)).astype(int)
-
-            if use_smote:
-                try:
-                    n_minority = y_bin_tr.value_counts().min()
-                    k = min(smote_k_neighbors, n_minority - 1)
-                    if k < 1:
-                        print(
-                            f"      ⚠️  SMOTE ignorado no fold {fold_idx+1}: minoria pequena ({n_minority})."
-                        )
-                    else:
-                        smote = SMOTE(k_neighbors=k, random_state=42)
-                        X_tr_arr, y_bin_arr = smote.fit_resample(X_tr_t, y_bin_tr)
-                        X_tr_t = pd.DataFrame(X_tr_arr, columns=X_tr_t.columns)
-                        neg_labels = [
-                            l for l in y_tr.unique() if str(l) != str(pos_label)
-                        ]
-                        neg_label = neg_labels[0] if neg_labels else 0
-                        y_tr = pd.Series(
-                            [pos_label if v == 1 else neg_label for v in y_bin_arr],
-                            name=self.target,
-                            dtype=y_raw.dtype,
-                        )
-                        print(f"      🔄 SMOTE: {len(y_bin_tr)} → {len(y_tr)} amostras")
-                except Exception as e:
-                    print(
-                        f"      ⚠️  SMOTE falhou no fold {fold_idx+1}: {e}. Sem SMOTE."
-                    )
-
-            train_ag = X_tr_t.copy()
-            train_ag[self.target] = y_tr.values
-
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                logging.disable(logging.CRITICAL)
-                pred_fold = TabularPredictor(
-                    label=self.target,
-                    eval_metric=chosen_metric,
-                    verbosity=0,
-                ).fit(
-                    train_ag,
-                    time_limit=time_limit_per_fold,
-                    presets=chosen_preset,
-                    num_cpus=self.params.get("num_cpus", os.cpu_count() or 6),
-                    dynamic_stacking=self.params.get("dynamic_stacking", False),
-                    ag_args_ensemble=self.params.get(
-                        "ag_args_ensemble",
-                        {"fold_fitting_strategy": "sequential_local"},
-                    ),
-                )
-                logging.disable(logging.NOTSET)
-
-            y_prob_df = pred_fold.predict_proba(X_vl_t)
+            # Predições do Fold
+            y_prob_df = self.predict_proba(df_vl_fold)
             y_prob_pos = y_prob_df[pos_label]
-            y_pred = pred_fold.predict(X_vl_t)
-            y_bin = (y_vl.astype(str) == str(pos_label)).astype(int)
-            y_pred = (y_pred.astype(str) == str(pos_label)).astype(int)
+            y_pred_raw = self.predict(df_vl_fold)
 
+            # Formatação de alvos (binário 0/1)
+            y_bin_vl = (df_vl_fold[self.target].astype(str) == str(pos_label)).astype(
+                int
+            )
+            y_pred_bin = (y_pred_raw.astype(str) == str(pos_label)).astype(int)
+
+            # Acumulação OOF
             oof_probs[val_idx] += y_prob_pos.values
             oof_counts[val_idx] += 1
-            oof_true[val_idx] = y_bin.values
+            oof_true[val_idx] = y_bin_vl.values
 
-            fpr, tpr, thresh_roc = roc_curve(y_bin, y_prob_pos)
+            # Cálculo de Curvas e Thresholds
+            fpr, tpr, thresh_roc = roc_curve(y_bin_vl, y_prob_pos)
             roc_auc = auc(fpr, tpr)
-            pr_auc = average_precision_score(y_bin, y_prob_pos)
+            pr_auc = average_precision_score(y_bin_vl, y_prob_pos)
 
             opt_t, _, _ = self.get_threshold(
-                fpr, tpr, thresh_roc, y_true=y_bin.values, y_prob=y_prob_pos.values
+                fpr, tpr, thresh_roc, y_true=y_bin_vl.values, y_prob=y_prob_pos.values
             )
             y_pred_opt = (y_prob_pos >= opt_t).astype(int)
 
-            # [NEW v0.1.0] Brier Score adicionado ao CV
-            brier = brier_score_loss(y_bin, y_prob_pos)
-
+            # Métricas do Fold (Nomes de chaves exatos para o plot_cv_report)
             fold_metrics.append(
                 {
                     "Fold": fold_idx + 1,
                     "AUC-ROC": round(roc_auc, 4),
                     "Gini": round(2 * roc_auc - 1, 4),
                     "Avg Precision": round(pr_auc, 4),
-                    "F1 (thr=0.5)": round(f1_score(y_bin, y_pred, zero_division=0), 4),
-                    "F1 (opt)": round(f1_score(y_bin, y_pred_opt, zero_division=0), 4),
-                    "Precision (opt)": round(
-                        precision_score(y_bin, y_pred_opt, zero_division=0), 4
+                    "F1 (thr=0.5)": round(
+                        f1_score(y_bin_vl, y_pred_bin, zero_division=0), 4
                     ),
-                    "Recall (opt)": round(
-                        recall_score(y_bin, y_pred_opt, zero_division=0), 4
+                    "F1 (opt)": round(
+                        f1_score(y_bin_vl, y_pred_opt, zero_division=0), 4
                     ),
-                    "Recall (0.5)": round(
-                        recall_score(y_bin, y_pred, zero_division=0), 4
-                    ),
-                    "Log-Loss": round(log_loss(y_bin, y_prob_pos), 4),
-                    "Brier Score": round(brier, 4),
-                    "Accuracy": round(accuracy_score(y_bin, y_pred), 4),
+                    "Accuracy": round(accuracy_score(y_bin_vl, y_pred_bin), 4),
+                    "Brier": round(brier_score_loss(y_bin_vl, y_prob_pos), 4),
+                    "Log-Loss": round(log_loss(y_bin_vl, y_prob_pos), 4),
                 }
             )
+
             fold_curves.append(
                 {"fpr": fpr, "tpr": tpr, "auc": roc_auc, "fold": fold_idx + 1}
             )
+            print(f"      ✅ AUC={roc_auc:.4f} | Brier={fold_metrics[-1]['Brier']:.4f}")
 
-            # [NEW v0.1.0] Libera memória do predictor do fold
-            del pred_fold
-            gc.collect()
-
-            print(
-                f"      AUC={roc_auc:.4f} | AP={pr_auc:.4f}"
-                f" | F1(0.5)={fold_metrics[-1]['F1 (thr=0.5)']:.4f}"
-                f" | Brier={brier:.4f}"
-            )
-
+        # 5. Consolidação Global (Onde os KeyErrors morrem)
         oof_probs_final = oof_probs / np.maximum(oof_counts, 1)
 
         fpr_oof, tpr_oof, _ = roc_curve(oof_true, oof_probs_final)
         oof_auc = auc(fpr_oof, tpr_oof)
         oof_ap = average_precision_score(oof_true, oof_probs_final)
-        oof_brier = brier_score_loss(oof_true, oof_probs_final)
+        oof_brier = brier_score_loss(
+            oof_true, oof_probs_final
+        )  # <--- O FIX DO ERRO ATUAL
 
         metrics_df = pd.DataFrame(fold_metrics).set_index("Fold")
         mean_row = metrics_df.mean().rename("Média")
@@ -2726,22 +2808,7 @@ class AutoClassificationEngine:
             [metrics_df, mean_row.to_frame().T, std_row.to_frame().T]
         )
 
-        thr_strategy = self.params.get("threshold_strategy", "youden")
-        print(f"\n📊 RESUMO ({total_folds} folds):")
-        print(f"   AUC-ROC  : {mean_row['AUC-ROC']:.4f} ± {std_row['AUC-ROC']:.4f}")
-        print(
-            f"   Avg Prec : {mean_row['Avg Precision']:.4f} ± {std_row['Avg Precision']:.4f}"
-        )
-        print(
-            f"   F1(0.5)  : {mean_row['F1 (thr=0.5)']:.4f} ± {std_row['F1 (thr=0.5)']:.4f}"
-        )
-        print(
-            f"   Brier    : {mean_row['Brier Score']:.4f} ± {std_row['Brier Score']:.4f}"
-        )
-        print(f"   AUC OOF  : {oof_auc:.4f}")
-        print(f"   AP  OOF  : {oof_ap:.4f}")
-        print(f"   Brier OOF: {oof_brier:.4f}")
-
+        # Armazenamento Final (Alimentação do Plotter)
         self.cv_results = {
             "summary_df": summary_df,
             "fold_curves": fold_curves,
@@ -2751,13 +2818,13 @@ class AutoClassificationEngine:
             "tpr_oof": tpr_oof,
             "oof_auc": oof_auc,
             "oof_ap": oof_ap,
-            "oof_brier": oof_brier,
+            "oof_brier": oof_brier,  # <--- AGORA O PLOT VAI ACHAR
             "n_folds": n_folds,
             "n_repeats": n_repeats,
             "pos_label": pos_label,
-            "use_smote": use_smote,
-            "thr_strategy": thr_strategy,
+            "thr_strategy": self.params.get("threshold_strategy", "youden"),
         }
+
         return summary_df
 
     # -----------------------------------------------------------------------
