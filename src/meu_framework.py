@@ -1,3 +1,11 @@
+# v0.1.9 Claude
+#   [v0.1.9] NEW: feature_whitelist — features protegidas de todos os filtros de seleção
+#   [v0.1.9] NEW: log de features resgatadas pela whitelist no resumo final
+# v0.1.8 Claude
+#   [v0.1.8] NEW: fit_selection() — seleção com dataset completo, sem AutoGluon
+#   [v0.1.8] NEW: fit_model() — treina AutoGluon com features já selecionadas
+#   [v0.1.8] REFACTOR: fit() vira wrapper backward-compatible (fit_selection + fit_model)
+#   [v0.1.8] FIX: Boruta agora vê o dataset completo antes do split treino/holdout
 # v0.1.7 Claude
 #   [v0.1.7] NEW: null_importance_percentile exposto como parâmetro (default 50, era hardcoded 75)
 #   [v0.1.7] TUNE: Null Importance agora filtra lixo, não sinal — Boruta faz a seleção fina
@@ -101,7 +109,7 @@ try:
 except ImportError:
     _HAS_TARGET_ENCODER = False
 
-_FRAMEWORK_VERSION = "0.1.7"
+_FRAMEWORK_VERSION = "0.1.9"
 
 # Cores canônicas para treino/teste — alta distinção visual e para daltônicos
 _COLOR_TRAIN = "#F06000"  # laranja-forte
@@ -2231,24 +2239,25 @@ class AutoClassificationEngine:
         )
 
     # -----------------------------------------------------------------------
-    # 5. FIT
+    # 5. FIT — fit_selection / fit_model / fit (wrapper)
     # -----------------------------------------------------------------------
 
-    def fit(
-        self,
-        train_data: pd.DataFrame,
-        time_limit: int = None,
-        skip_selection: bool = False,
-    ):
-        print(f"\n🚀 --- TREINAMENTO INICIADO (v{_FRAMEWORK_VERSION}) ---")
+    def fit_selection(self, selection_data: pd.DataFrame):
+        """
+        [v0.1.8] Fase 1+2: Feature engineering + seleção de variáveis.
+        NÃO treina o AutoGluon — chame fit_model() em seguida.
 
-        if time_limit is None:
-            time_limit = self.params.get("time_limit", 300)
+        Fluxo recomendado:
+            engine.fit_selection(df_completo)    # Boruta vê todos os dados
+            engine.fit_model(df_train)           # AutoGluon treina no split
+            engine.plot_complete_report(df_test)
+        """
+        print(f"\n🔍 --- SELEÇÃO DE VARIÁVEIS (v{_FRAMEWORK_VERSION}) ---")
 
         # 1. Limpeza Base
-        df = self._standardize_and_clean(train_data)
+        df = self._standardize_and_clean(selection_data)
 
-        # 2. Drop Automático Solicitado pelo Usuário
+        # 2. Drop Automático
         drop_cols = self.params.get("drop_features", [])
         if drop_cols:
             existing_drop = [c for c in drop_cols if c in df.columns]
@@ -2266,78 +2275,41 @@ class AutoClassificationEngine:
         if n_classes > 2:
             raise ValueError(
                 f"AutoClassificationEngine suporta apenas classificação BINÁRIA. "
-                f"Target '{self.target}' possui {n_classes} classes. "
-                f"Para multiclasse, use AutoGluon diretamente com TabularPredictor."
+                f"Target '{self.target}' possui {n_classes} classes."
             )
 
         self._validate_group_agg_pairs(df.columns.tolist())
 
-        # 5. Split de Tuning (se não estivermos no modo CV)
-        tuning_frac = self.params.get("tuning_data_fraction", 0.15)
-        df_tuning = None
-
-        if tuning_frac > 0 and not skip_selection:
-            try:
-                df_core, df_tuning = train_test_split(
-                    df, test_size=tuning_frac, stratify=df[self.target], random_state=42
-                )
-                print(
-                    f"\n✂️  Split: train_core={len(df_core)} | tuning={len(df_tuning)} (fração={tuning_frac:.0%})"
-                )
-            except ValueError:
-                print("⚠️  Split estratificado falhou. Usando dataset completo.")
-                df_core = df
-                df_tuning = None
-        else:
-            # Se skip_selection for True (CV fold), não dividimos tuning_frac de novo
-            df_core = df
-
-        # 6. Hashing
+        # 5. Hashing
         try:
-            sample = df_core.head(10_000)
+            sample = df.head(10_000)
             hash_str = hashlib.sha256(
                 pd.util.hash_pandas_object(sample, index=True).values.tobytes()
             ).hexdigest()
             self._train_hash = hash_str
-            if not skip_selection:
-                print(f"\n🔑 Hash do df_core: {hash_str[:16]}...")
+            print(f"\n🔑 Hash dos dados de seleção: {hash_str[:16]}...")
         except Exception:
             self._train_hash = ""
 
-        # ====================================================================
-        # FASE 1: FEATURE ENGINEERING (RODA SEMPRE, MESMO NO CV)
-        # ====================================================================
-        if not skip_selection:
-            print("\n🔧 Criando group aggregations...")
-        df_core = self._create_group_aggregations(df_core, is_train=True)
-        if df_tuning is not None:
-            df_tuning = self._create_group_aggregations(df_tuning, is_train=False)
+        print(
+            f"📊 Dados de seleção: {len(df)} registros × {len(df.columns)-1} features"
+        )
 
-        # Rare Labels e Outliers
-        df_core = self._handle_rare_labels(df_core, is_train=True)
+        # ====================================================================
+        # FASE 1: FEATURE ENGINEERING
+        # ====================================================================
+        print("\n🔧 Criando group aggregations...")
+        df = self._create_group_aggregations(df, is_train=True)
+        df = self._handle_rare_labels(df, is_train=True)
         if self.params.get("handle_outliers", True):
-            df_core = self._handle_outliers_and_log(df_core, is_train=True)
-
-        if df_tuning is not None:
-            df_tuning = self._handle_rare_labels(df_tuning, is_train=False)
-            if self.params.get("handle_outliers", True):
-                df_tuning = self._handle_outliers_and_log(df_tuning, is_train=False)
-
-        # Profile Features
+            df = self._handle_outliers_and_log(df, is_train=True)
         if self.params.get("use_profile_features", False):
-            if not skip_selection:
-                print("\n🔬 Profile-based Feature Engineering (target-guided)...")
-            df_core = self._profile_based_feature_engineering(df_core, is_train=True)
-            if df_tuning is not None:
-                df_tuning = self._profile_based_feature_engineering(
-                    df_tuning, is_train=False
-                )
+            print("\n🔬 Profile-based Feature Engineering (target-guided)...")
+            df = self._profile_based_feature_engineering(df, is_train=True)
 
         # ====================================================================
-        # FASE 2: BIFURCAÇÃO DA SELEÇÃO (O CÉREBRO DA PERFORMANCE)
+        # FASE 2: SELEÇÃO DE VARIÁVEIS
         # ====================================================================
-
-        # Zera os dicionários para não misturar logs antigos
         self.eliminated_features = {
             "leakage": [],
             "alta_cardinalidade": [],
@@ -2347,128 +2319,207 @@ class AutoClassificationEngine:
             "boruta": [],
         }
 
-        if skip_selection:
-            # === MODO EXPRESSO (Para os Folds de CV) ===
-            print("   ⏩ Pulando seleção de variáveis (modo skip_selection ativo).")
+        df = self._sanity_check(df)
+        df = self._handle_multicollinearity(df)
 
-            # Filtra apenas o que sobreviveu à peneira global
-            cols_to_keep = [c for c in self.selected_features if c in df_core.columns]
+        self.selected_features = [c for c in df.columns if c != self.target]
+        X = df[self.selected_features]
+        y = df[self.target]
 
-            X_core = df_core[cols_to_keep]
-            y_core = df_core[self.target]
+        print("\n🔗 Calculando associações...")
+        self.association_report = self._compute_association_report(df)
+        print("   ✅ Relatório pronto.")
 
-            if df_tuning is not None:
-                df_tuning = df_tuning[cols_to_keep + [self.target]]
+        # Null Importance Filter
+        if self.params.get("use_importance_filter", False):
+            print("\n🔍 Null Importance Filter (LightGBM)...")
+            from lightgbm import LGBMClassifier
 
-        else:
-            # === MODO COMPLETO (Treino Global - 1ª Passagem) ===
+            X_imp = X.copy()
+            cat_cols = X_imp.select_dtypes(
+                include=["object", "category"]
+            ).columns.tolist()
+            for c in cat_cols:
+                X_imp[c] = X_imp[c].astype("category")
 
-            # 1. Tratamento de Leakage e Colinearidade
-            df_core = self._sanity_check(df_core)
-            df_core = self._handle_multicollinearity(df_core)
+            clf = LGBMClassifier(
+                n_estimators=100,
+                random_state=42,
+                importance_type="gain",
+                verbose=-1,
+            )
+            clf.fit(X_imp, y)
+            actual_imp = clf.feature_importances_
 
-            # Sincroniza o tuning
-            if df_tuning is not None:
-                cols_to_keep = [c for c in df_tuning.columns if c in df_core.columns]
-                df_tuning = df_tuning[cols_to_keep]
-
-            # 2. Definição Base
-            self.selected_features = [c for c in df_core.columns if c != self.target]
-            X_core = df_core[self.selected_features]
-            y_core = df_core[self.target]
-
-            print("\n🔗 Calculando associações...")
-            self.association_report = self._compute_association_report(df_core)
-            print("   ✅ Relatório pronto.")
-
-            # 3. Null Importance Filter
-            if self.params.get("use_importance_filter", False):
-                print("\n🔍 Null Importance Filter (LightGBM)...")
-                from lightgbm import LGBMClassifier
-
-                X_imp = X_core.copy()
-                cat_cols = X_imp.select_dtypes(
-                    include=["object", "category"]
-                ).columns.tolist()
-                for c in cat_cols:
-                    X_imp[c] = X_imp[c].astype("category")
-
-                clf = LGBMClassifier(
-                    n_estimators=100,
-                    random_state=42,
-                    importance_type="gain",
-                    verbose=-1,
-                )
-                clf.fit(X_imp, y_core)
-                actual_imp = clf.feature_importances_
-
-                n_runs = 5
-                null_imps = np.zeros((n_runs, X_imp.shape[1]))
-                y_shuffled = y_core.copy().values
-
-                null_pct = self.params.get("null_importance_percentile", 50)
-                print(
-                    f"   🎲 Calculando ruído com {n_runs} permutações do target (percentil={null_pct})..."
-                )
-                for i in range(n_runs):
-                    np.random.seed(42 + i)
-                    np.random.shuffle(y_shuffled)
-                    clf.fit(X_imp, y_shuffled)
-                    null_imps[i, :] = clf.feature_importances_
-
-                null_threshold = np.percentile(null_imps, null_pct, axis=0)
-
-                good_features = []
-                for idx, col in enumerate(X_imp.columns):
-                    if actual_imp[idx] > null_threshold[idx] and actual_imp[idx] > 0:
-                        good_features.append(col)
-
-                removed = set(self.selected_features) - set(good_features)
-                self.eliminated_features["importancia_nula"] = list(removed)
-                self.selected_features = good_features
-                X_core = X_core[self.selected_features]
-                print(
-                    f"   ✅ Sinal vs Ruído (p{null_pct}): Mantidas {len(good_features)} | Removidas {len(removed)}"
-                )
-
-            # 4. Boruta-LightGBM
-            if self.params.get("use_boruta_filter", False):
-                good_features = self._run_boruta_selection(
-                    X_core,
-                    y_core,
-                    max_iters=self.params.get("boruta_iters", 20),
-                    hit_threshold_pct=self.params.get("boruta_hit_pct", 0.55),
-                )
-
-                removed = set(self.selected_features) - set(good_features)
-                self.eliminated_features["boruta"] = list(removed)
-                self.selected_features = good_features
-                X_core = X_core[self.selected_features]
-
-            # 5. Imprime Resumo da Filtragem
-            print("\n📋 RESUMO DA FILTRAGEM DE VARIÁVEIS:")
-            label_map = {
-                "leakage": "Removidas por Leakage",
-                "alta_cardinalidade": "Removidas por Alta Cardinalidade",
-                "colinearidade": "Removidas por Colinearidade",
-                "constantes_pos_rare": "Removidas por Constantes pós-RareLabel",
-                "importancia_nula": "Removidas por Importância Nula",
-                "boruta": "Removidas pelo Boruta-LightGBM",
-            }
-            for reason, cols in self.eliminated_features.items():
-                print(f"   => {label_map[reason]}: {cols or 'Nenhuma'}")
+            n_runs = 5
+            null_imps = np.zeros((n_runs, X_imp.shape[1]))
+            y_shuffled = y.copy().values
+            null_pct = self.params.get("null_importance_percentile", 50)
             print(
-                f"   => Features Finais ({len(self.selected_features)}): {self.selected_features}"
+                f"   🎲 Calculando ruído com {n_runs} permutações do target (percentil={null_pct})..."
+            )
+            for i in range(n_runs):
+                np.random.seed(42 + i)
+                np.random.shuffle(y_shuffled)
+                clf.fit(X_imp, y_shuffled)
+                null_imps[i, :] = clf.feature_importances_
+
+            null_threshold = np.percentile(null_imps, null_pct, axis=0)
+            good_features = [
+                col
+                for idx, col in enumerate(X_imp.columns)
+                if actual_imp[idx] > null_threshold[idx] and actual_imp[idx] > 0
+            ]
+            removed = set(self.selected_features) - set(good_features)
+            self.eliminated_features["importancia_nula"] = list(removed)
+            self.selected_features = good_features
+            X = X[self.selected_features]
+            print(
+                f"   ✅ Sinal vs Ruído (p{null_pct}): Mantidas {len(good_features)} | Removidas {len(removed)}"
             )
 
-        # ====================================================================
-        # FASE 3: PIPELINE AUTOGLUON (TREINAMENTO DO MODELO FINAL)
-        # ====================================================================
+        # Boruta-LightGBM
+        if self.params.get("use_boruta_filter", False):
+            good_features = self._run_boruta_selection(
+                X,
+                y,
+                max_iters=self.params.get("boruta_iters", 20),
+                hit_threshold_pct=self.params.get("boruta_hit_pct", 0.55),
+            )
+            removed = set(self.selected_features) - set(good_features)
+            self.eliminated_features["boruta"] = list(removed)
+            self.selected_features = good_features
+            X = X[self.selected_features]
 
-        self._train_schema = {
-            col: str(X_core[col].dtype) for col in self.selected_features
+        # Whitelist — resgata features protegidas que qualquer filtro tenha derrubado
+        whitelist = self.params.get("feature_whitelist", [])
+        rescued = []
+        if whitelist:
+            all_cols = df.columns.tolist()
+            for feat in whitelist:
+                if (
+                    feat in all_cols
+                    and feat != self.target
+                    and feat not in self.selected_features
+                ):
+                    self.selected_features.append(feat)
+                    rescued.append(feat)
+            if rescued:
+                X = df[self.selected_features]
+                # Remove das listas de eliminados para não confundir o log
+                for reason in self.eliminated_features:
+                    self.eliminated_features[reason] = [
+                        c for c in self.eliminated_features[reason] if c not in rescued
+                    ]
+
+        # Resumo
+        print("\n📋 RESUMO DA FILTRAGEM DE VARIÁVEIS:")
+        label_map = {
+            "leakage": "Removidas por Leakage",
+            "alta_cardinalidade": "Removidas por Alta Cardinalidade",
+            "colinearidade": "Removidas por Colinearidade",
+            "constantes_pos_rare": "Removidas por Constantes pós-RareLabel",
+            "importancia_nula": "Removidas por Importância Nula",
+            "boruta": "Removidas pelo Boruta-LightGBM",
         }
+        for reason, cols in self.eliminated_features.items():
+            print(f"   => {label_map[reason]}: {cols or 'Nenhuma'}")
+        if rescued:
+            print(f"   => Resgatadas pela Whitelist ({len(rescued)}): {rescued}")
+        print(
+            f"   => Features Finais ({len(self.selected_features)}): {self.selected_features}"
+        )
 
+        self._train_schema = {col: str(X[col].dtype) for col in self.selected_features}
+        print(
+            f"\n✅ Seleção concluída! {len(self.selected_features)} features prontas para fit_model()."
+        )
+
+    def fit_model(self, train_data: pd.DataFrame, time_limit: int = None):
+        """
+        [v0.1.8] Fase 3: Treina o AutoGluon com as features selecionadas.
+        Requer que fit_selection() tenha sido executado antes.
+
+        Fluxo recomendado:
+            engine.fit_selection(df_completo)    # Boruta vê todos os dados
+            engine.fit_model(df_train)           # AutoGluon treina no split
+            engine.plot_complete_report(df_test)
+        """
+        if self.selected_features is None:
+            raise RuntimeError(
+                "Execute fit_selection() antes de fit_model(). "
+                "Ou use fit() para rodar ambos automaticamente no mesmo dataset."
+            )
+
+        if time_limit is None:
+            time_limit = self.params.get("time_limit", 300)
+
+        print(f"\n🚀 --- TREINAMENTO DO MODELO (v{_FRAMEWORK_VERSION}) ---")
+        print(f"   📊 Dados de treino: {len(train_data)} registros")
+        print(f"   🎯 Features selecionadas: {len(self.selected_features)}")
+
+        # 1. Preprocessing usando transformadores fitados pelo fit_selection
+        df = self._standardize_and_clean(train_data)
+        drop_cols = self.params.get("drop_features", [])
+        if drop_cols:
+            existing_drop = [c for c in drop_cols if c in df.columns]
+            if existing_drop:
+                df = df.drop(columns=existing_drop)
+        df = self._extract_temporal_features(df)
+        df = self._create_group_aggregations(df, is_train=False)
+        df = self._handle_rare_labels(df, is_train=False)
+        if self.params.get("handle_outliers", True):
+            df = self._handle_outliers_and_log(df, is_train=False)
+        if self.params.get("use_profile_features", False):
+            df = self._profile_based_feature_engineering(df, is_train=False)
+
+        # 2. Hashing
+        try:
+            sample = df.head(10_000)
+            hash_str = hashlib.sha256(
+                pd.util.hash_pandas_object(sample, index=True).values.tobytes()
+            ).hexdigest()
+            self._train_hash = hash_str
+            print(f"   🔑 Hash do treino: {hash_str[:16]}...")
+        except Exception:
+            self._train_hash = ""
+
+        # 3. Filtra pelas features selecionadas
+        available = [c for c in self.selected_features if c in df.columns]
+        missing = set(self.selected_features) - set(df.columns)
+        if missing:
+            warnings.warn(
+                f"[fit_model] {len(missing)} feature(s) ausente(s) no train_data: {missing}",
+                UserWarning,
+            )
+
+        # 4. Split de tuning para o AutoGluon
+        tuning_frac = self.params.get("tuning_data_fraction", 0.15)
+        df_temp = df[available + [self.target]].copy()
+        df_tuning = None
+
+        if tuning_frac > 0:
+            try:
+                df_core, df_tuning = train_test_split(
+                    df_temp,
+                    test_size=tuning_frac,
+                    stratify=df_temp[self.target],
+                    random_state=42,
+                )
+                print(
+                    f"\n✂️  Split AutoGluon: train_core={len(df_core)} | "
+                    f"tuning={len(df_tuning)} (fração={tuning_frac:.0%})"
+                )
+            except ValueError:
+                print("⚠️  Split estratificado falhou. Usando dataset completo.")
+                df_core = df_temp
+        else:
+            df_core = df_temp
+
+        X_core = df_core[available]
+        y_core = df_core[self.target]
+
+        # 5. Sklearn pipeline
         if self.params.get("use_sklearn_pipeline", True):
             self.pipeline = self._build_sklearn_pipeline(X_core, y=y_core)
             X_core_t = self.pipeline.fit_transform(X_core, y_core)
@@ -2481,9 +2532,7 @@ class AutoClassificationEngine:
 
         tuning_final = None
         if df_tuning is not None:
-            X_tuning = df_tuning[
-                [c for c in self.selected_features if c in df_tuning.columns]
-            ]
+            X_tuning = df_tuning[[c for c in available if c in df_tuning.columns]]
             X_tuning_t = (
                 self.pipeline.transform(X_tuning)
                 if self.pipeline is not None
@@ -2492,20 +2541,19 @@ class AutoClassificationEngine:
             tuning_final = X_tuning_t.copy()
             tuning_final[self.target] = df_tuning[self.target].values
 
+        # 6. AutoGluon
         chosen_metric = self.params.get("eval_metric", "f1")
         chosen_preset = self.params.get("presets", "high_quality")
         thr_strategy = self.params.get("threshold_strategy", "youden")
         corr_method = self.params.get("corr_method", "pearson")
 
-        if not skip_selection:
-            print(
-                f"\n🎯 Métrica: {chosen_metric} | Preset: {chosen_preset} | Time: {time_limit}s"
-                f" | Threshold: {thr_strategy} | corr_method: {corr_method}"
-            )
+        print(
+            f"\n🎯 Métrica: {chosen_metric} | Preset: {chosen_preset} | Time: {time_limit}s"
+            f" | Threshold: {thr_strategy} | corr_method: {corr_method}"
+        )
 
         hyperparams = "default"
         if self.params.get("prune_models", False):
-            # Deixa APENAS LightGBM, CatBoost e XGBoost
             hyperparams = {"GBM": {}, "CAT": {}, "XGB": {}}
 
         fit_kwargs = {
@@ -2535,8 +2583,7 @@ class AutoClassificationEngine:
 
         if "feature_generator" in self.params:
             fit_kwargs["feature_generator"] = self.params["feature_generator"]
-            if not skip_selection:
-                print("   🔧 feature_generator customizado ativo.")
+            print("   🔧 feature_generator customizado ativo.")
 
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
@@ -2549,11 +2596,123 @@ class AutoClassificationEngine:
             data=tuning_final if tuning_final is not None else train_final
         )
 
+        print("\n✅ Modelo treinado!")
+        print(f"   📐 Threshold  : {thr_strategy}")
+        print(f"   📊 corr_method: {corr_method}")
+
+    def fit(
+        self,
+        train_data: pd.DataFrame,
+        time_limit: int = None,
+        skip_selection: bool = False,
+    ):
+        """
+        Wrapper backward-compatible.
+
+        - skip_selection=False (padrão): chama fit_selection() + fit_model()
+          no mesmo dataset. Comportamento idêntico às versões anteriores.
+
+        - skip_selection=True: modo CV — re-fita transformadores no fold,
+          pula seleção pesada, treina AutoGluon. Uso interno do cross_validate().
+
+        Para máxima performance do Boruta, prefira o novo fluxo explícito:
+            engine.fit_selection(df_completo)
+            engine.fit_model(df_train)
+        """
         if not skip_selection:
-            print("\n✅ Treinamento concluído!")
-            print(f"   🔑 Train hash : {self._train_hash[:16]}...")
-            print(f"   📐 Threshold  : {thr_strategy}")
-            print(f"   📊 corr_method: {corr_method}")
+            self.fit_selection(train_data)
+            self.fit_model(train_data, time_limit=time_limit)
+            return
+
+        # === MODO EXPRESSO (folds de CV) ===
+        # Re-fita transformadores no fold e treina AutoGluon direto,
+        # sem rodar seleção pesada (Boruta/Null Importance).
+        if time_limit is None:
+            time_limit = self.params.get("time_limit", 300)
+
+        df = self._standardize_and_clean(train_data)
+        drop_cols = self.params.get("drop_features", [])
+        if drop_cols:
+            existing_drop = [c for c in drop_cols if c in df.columns]
+            if existing_drop:
+                df = df.drop(columns=existing_drop)
+        df = self._extract_temporal_features(df)
+
+        # Hashing
+        try:
+            self._train_hash = hashlib.sha256(
+                pd.util.hash_pandas_object(df.head(10_000), index=True).values.tobytes()
+            ).hexdigest()
+        except Exception:
+            self._train_hash = ""
+
+        # Feature Engineering com is_train=True no fold
+        df = self._create_group_aggregations(df, is_train=True)
+        df = self._handle_rare_labels(df, is_train=True)
+        if self.params.get("handle_outliers", True):
+            df = self._handle_outliers_and_log(df, is_train=True)
+        if self.params.get("use_profile_features", False):
+            df = self._profile_based_feature_engineering(df, is_train=True)
+
+        # Zera eliminated_features sem perder o log global
+        self.eliminated_features = {
+            "leakage": [],
+            "alta_cardinalidade": [],
+            "colinearidade": [],
+            "constantes_pos_rare": [],
+            "importancia_nula": [],
+            "boruta": [],
+        }
+
+        print("   ⏩ Pulando seleção de variáveis (modo skip_selection ativo).")
+        cols_to_keep = [c for c in self.selected_features if c in df.columns]
+        X_core = df[cols_to_keep]
+        y_core = df[self.target]
+
+        # Sklearn pipeline
+        if self.params.get("use_sklearn_pipeline", True):
+            self.pipeline = self._build_sklearn_pipeline(X_core, y=y_core)
+            X_core_t = self.pipeline.fit_transform(X_core, y_core)
+        else:
+            self.pipeline = None
+            X_core_t = X_core.copy()
+
+        train_final = X_core_t.copy()
+        train_final[self.target] = y_core.values
+
+        chosen_metric = self.params.get("eval_metric", "f1")
+        chosen_preset = self.params.get("presets", "high_quality")
+
+        hyperparams = "default"
+        if self.params.get("prune_models", False):
+            hyperparams = {"GBM": {}, "CAT": {}, "XGB": {}}
+
+        fit_kwargs = {
+            "time_limit": time_limit,
+            "presets": chosen_preset,
+            "num_cpus": self.params.get("num_cpus", os.cpu_count() or 6),
+            "ag_args_ensemble": self.params.get(
+                "ag_args_ensemble", {"fold_fitting_strategy": "sequential_local"}
+            ),
+            "hyperparameters": hyperparams,
+            "dynamic_stacking": self.params.get("dynamic_stacking", False),
+        }
+
+        for key in ["num_bag_folds", "num_bag_sets", "save_space", "keep_only_best"]:
+            if key in self.params:
+                fit_kwargs[key] = self.params[key]
+
+        if "feature_generator" in self.params:
+            fit_kwargs["feature_generator"] = self.params["feature_generator"]
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            self.predictor = TabularPredictor(
+                label=self.target,
+                eval_metric=chosen_metric,
+            ).fit(train_final, **fit_kwargs)
+
+        self.compute_feature_importance(data=train_final)
 
     def check_adversarial_drift(
         self,
