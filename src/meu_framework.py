@@ -1,3 +1,10 @@
+# v0.1.7 Claude
+#   [v0.1.7] NEW: null_importance_percentile exposto como parâmetro (default 50, era hardcoded 75)
+#   [v0.1.7] TUNE: Null Importance agora filtra lixo, não sinal — Boruta faz a seleção fina
+# v0.1.6 Claude
+#   [v0.1.6] REMOVE: SMOTE removido completamente (import + _HAS_SMOTE + smote_tag no plot)
+#   [v0.1.6] TUNE: boruta_iters default 15 → 20 (decisão mais estável)
+#   [v0.1.6] TUNE: boruta_hit_pct default 0.40 → 0.55 (filtro mais seletivo)
 # v0.1.5 Claude
 #   [v0.1.5] FIX: infinity/crash no cross_validate — shift usa min(col_min, lower_bound)
 #   [v0.1.5] FIX: _handle_outliers_and_log usa mesmo shift robusto em fit e inferência
@@ -94,14 +101,7 @@ try:
 except ImportError:
     _HAS_TARGET_ENCODER = False
 
-try:
-    from imblearn.over_sampling import SMOTE
-
-    _HAS_SMOTE = True
-except ImportError:
-    _HAS_SMOTE = False
-
-_FRAMEWORK_VERSION = "0.1.5.1"
+_FRAMEWORK_VERSION = "0.1.7"
 
 # Cores canônicas para treino/teste — alta distinção visual e para daltônicos
 _COLOR_TRAIN = "#F06000"  # laranja-forte
@@ -1415,8 +1415,8 @@ class AutoClassificationEngine:
         self,
         X_core: pd.DataFrame,
         y_core: pd.Series,
-        max_iters: int = 15,
-        hit_threshold_pct: float = 0.40,
+        max_iters: int = 20,
+        hit_threshold_pct: float = 0.55,
     ) -> list:
         """
         Boruta-LightGBM Nativo: Filtro de elite que confronta as features
@@ -2406,18 +2406,21 @@ class AutoClassificationEngine:
                 null_imps = np.zeros((n_runs, X_imp.shape[1]))
                 y_shuffled = y_core.copy().values
 
-                print(f"   🎲 Calculando ruído com {n_runs} permutações do target...")
+                null_pct = self.params.get("null_importance_percentile", 50)
+                print(
+                    f"   🎲 Calculando ruído com {n_runs} permutações do target (percentil={null_pct})..."
+                )
                 for i in range(n_runs):
                     np.random.seed(42 + i)
                     np.random.shuffle(y_shuffled)
                     clf.fit(X_imp, y_shuffled)
                     null_imps[i, :] = clf.feature_importances_
 
-                null_p75 = np.percentile(null_imps, 75, axis=0)
+                null_threshold = np.percentile(null_imps, null_pct, axis=0)
 
                 good_features = []
                 for idx, col in enumerate(X_imp.columns):
-                    if actual_imp[idx] > null_p75[idx] and actual_imp[idx] > 0:
+                    if actual_imp[idx] > null_threshold[idx] and actual_imp[idx] > 0:
                         good_features.append(col)
 
                 removed = set(self.selected_features) - set(good_features)
@@ -2425,7 +2428,7 @@ class AutoClassificationEngine:
                 self.selected_features = good_features
                 X_core = X_core[self.selected_features]
                 print(
-                    f"   ✅ Sinal vs Ruído: Mantidas {len(good_features)} | Removidas {len(removed)}"
+                    f"   ✅ Sinal vs Ruído (p{null_pct}): Mantidas {len(good_features)} | Removidas {len(removed)}"
                 )
 
             # 4. Boruta-LightGBM
@@ -2433,8 +2436,8 @@ class AutoClassificationEngine:
                 good_features = self._run_boruta_selection(
                     X_core,
                     y_core,
-                    max_iters=self.params.get("boruta_iters", 15),
-                    hit_threshold_pct=self.params.get("boruta_hit_pct", 0.40),
+                    max_iters=self.params.get("boruta_iters", 20),
+                    hit_threshold_pct=self.params.get("boruta_hit_pct", 0.55),
                 )
 
                 removed = set(self.selected_features) - set(good_features)
@@ -2866,10 +2869,9 @@ class AutoClassificationEngine:
         for j in range(len(df_table.columns)):
             table[n_rows - 1, j].set_facecolor("#d4edda")
             table[n_rows, j].set_facecolor("#fff3cd")
-        smote_tag = " | SMOTE" if cv.get("use_smote") else ""
         repeat_tag = f" × {n_repeats}rep" if n_repeats > 1 else ""
         ax.set_title(
-            f"Métricas por Fold (n={n}{repeat_tag}{smote_tag})",
+            f"Métricas por Fold (n={n}{repeat_tag})",
             fontweight="bold",
             fontsize=12,
         )
