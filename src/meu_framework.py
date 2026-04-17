@@ -1,3 +1,9 @@
+# v0.2.1 Claude
+#   [v0.2.1] FIX: _compute_profile_features ignora colunas categóricas binárias (2 únicos)
+#   [v0.2.1] TUNE: profile defaults ajustados — topn=5, one_per_col=True, max_features=20
+# v0.2.0 Claude
+#   [v0.2.0] FIX: feature_whitelist protege em TODOS os filtros — colinearidade, Null Importance e Boruta
+#   [v0.2.0] FIX: features da whitelist nunca são removidas do df, chegam intactas ao fit_model
 # v0.1.9 Claude
 #   [v0.1.9] NEW: feature_whitelist — features protegidas de todos os filtros de seleção
 #   [v0.1.9] NEW: log de features resgatadas pela whitelist no resumo final
@@ -109,7 +115,7 @@ try:
 except ImportError:
     _HAS_TARGET_ENCODER = False
 
-_FRAMEWORK_VERSION = "0.1.9"
+_FRAMEWORK_VERSION = "0.2.1"
 
 # Cores canônicas para treino/teste — alta distinção visual e para daltônicos
 _COLOR_TRAIN = "#F06000"  # laranja-forte
@@ -1322,6 +1328,7 @@ class AutoClassificationEngine:
                 target_assoc[col] = 0.0
 
         to_drop = set()
+        _whitelist = set(self.params.get("feature_whitelist", []))
 
         # [NEW v0.1.0] Pares numérico-numérico via df.corr() — O(n) em vez de O(n²)
         if len(num_cols) > 1:
@@ -1351,7 +1358,12 @@ class AutoClassificationEngine:
                             )
                         else:
                             loser = col_b if assoc_a >= assoc_b else col_a
-                        to_drop.add(loser)
+                        # Whitelist: se o loser for protegido, derruba o outro
+                        if loser in _whitelist:
+                            loser = col_b if loser == col_a else col_a
+                        # Se ambos forem protegidos, não derruba nenhum
+                        if loser not in _whitelist:
+                            to_drop.add(loser)
 
         # Pares envolvendo ao menos uma coluna categórica (mantém loop, menos custoso)
         for i, col_a in enumerate(all_feat):
@@ -1393,7 +1405,12 @@ class AutoClassificationEngine:
                         )
                     else:
                         loser = col_b if assoc_a >= assoc_b else col_a
-                    to_drop.add(loser)
+                    # Whitelist: se o loser for protegido, derruba o outro
+                    if loser in _whitelist:
+                        loser = col_b if loser == col_a else col_a
+                    # Se ambos forem protegidos, não derruba nenhum
+                    if loser not in _whitelist:
+                        to_drop.add(loser)
 
         if to_drop:
             pairs = self.params.get("group_aggregation_pairs", [])
@@ -2047,28 +2064,34 @@ class AutoClassificationEngine:
         Restringe análise a colunas categóricas/object — comparações de
         igualdade exata em numéricas contínuas não fazem sentido.
 
+        Colunas binárias (<=2 valores únicos) são ignoradas — criar pf__ de uma
+        coluna binária seria redundante pois a coluna original já carrega a info.
+
         Parâmetros consumidos de self.params
         ------------------------------------
-        profile_min_lift         : float = 2.5
-        profile_topn_per_group   : int   = 10
+        profile_min_lift         : float = 2.0
+        profile_topn_per_group   : int   = 5
         profile_min_support_pct  : float = 0.05
-        profile_one_per_col      : bool  = False
-        profile_max_features     : int   = 50
+        profile_one_per_col      : bool  = True
+        profile_max_features     : int   = 20
         """
-        min_lift = self.params.get("profile_min_lift", 2.5)
-        topn = self.params.get("profile_topn_per_group", 10)
+        min_lift = self.params.get("profile_min_lift", 2.0)
+        topn = self.params.get("profile_topn_per_group", 5)
         min_sup = self.params.get("profile_min_support_pct", 0.05)
-        one_per_col = self.params.get("profile_one_per_col", False)
-        max_feats = self.params.get("profile_max_features", 50)
+        one_per_col = self.params.get("profile_one_per_col", True)
+        max_feats = self.params.get("profile_max_features", 20)
 
         cat_cols = df_with_target.select_dtypes(
             include=["object", "category"]
         ).columns.tolist()
         cat_cols = [c for c in cat_cols if c != self.target]
 
+        # [v0.2.1] Ignora colunas binárias — criar pf__ seria redundante
+        cat_cols = [c for c in cat_cols if df_with_target[c].nunique(dropna=True) > 2]
+
         if not cat_cols:
             warnings.warn(
-                "[ProfileFeatures] Nenhuma coluna categórica encontrada. "
+                "[ProfileFeatures] Nenhuma coluna categórica não-binária encontrada. "
                 "Nenhuma feature de perfil será criada.",
                 UserWarning,
             )
@@ -2319,6 +2342,9 @@ class AutoClassificationEngine:
             "boruta": [],
         }
 
+        # Whitelist — carregada uma vez e usada em todos os filtros
+        _whitelist = set(self.params.get("feature_whitelist", []))
+
         df = self._sanity_check(df)
         df = self._handle_multicollinearity(df)
 
@@ -2368,7 +2394,9 @@ class AutoClassificationEngine:
             good_features = [
                 col
                 for idx, col in enumerate(X_imp.columns)
-                if actual_imp[idx] > null_threshold[idx] and actual_imp[idx] > 0
+                if actual_imp[idx] > null_threshold[idx]
+                and actual_imp[idx] > 0
+                or col in _whitelist  # whitelist nunca cai aqui
             ]
             removed = set(self.selected_features) - set(good_features)
             self.eliminated_features["importancia_nula"] = list(removed)
@@ -2386,33 +2414,17 @@ class AutoClassificationEngine:
                 max_iters=self.params.get("boruta_iters", 20),
                 hit_threshold_pct=self.params.get("boruta_hit_pct", 0.55),
             )
+            # Whitelist nunca cai no Boruta
+            good_features = list(
+                set(good_features) | (_whitelist & set(self.selected_features))
+            )
             removed = set(self.selected_features) - set(good_features)
             self.eliminated_features["boruta"] = list(removed)
             self.selected_features = good_features
             X = X[self.selected_features]
 
-        # Whitelist — resgata features protegidas que qualquer filtro tenha derrubado
-        whitelist = self.params.get("feature_whitelist", [])
-        rescued = []
-        if whitelist:
-            all_cols = df.columns.tolist()
-            for feat in whitelist:
-                if (
-                    feat in all_cols
-                    and feat != self.target
-                    and feat not in self.selected_features
-                ):
-                    self.selected_features.append(feat)
-                    rescued.append(feat)
-            if rescued:
-                X = df[self.selected_features]
-                # Remove das listas de eliminados para não confundir o log
-                for reason in self.eliminated_features:
-                    self.eliminated_features[reason] = [
-                        c for c in self.eliminated_features[reason] if c not in rescued
-                    ]
-
         # Resumo
+        rescued = [f for f in _whitelist if f in self.selected_features]
         print("\n📋 RESUMO DA FILTRAGEM DE VARIÁVEIS:")
         label_map = {
             "leakage": "Removidas por Leakage",
@@ -2424,8 +2436,8 @@ class AutoClassificationEngine:
         }
         for reason, cols in self.eliminated_features.items():
             print(f"   => {label_map[reason]}: {cols or 'Nenhuma'}")
-        if rescued:
-            print(f"   => Resgatadas pela Whitelist ({len(rescued)}): {rescued}")
+        if _whitelist:
+            print(f"   => Protegidas pela Whitelist ({len(rescued)}): {rescued}")
         print(
             f"   => Features Finais ({len(self.selected_features)}): {self.selected_features}"
         )
