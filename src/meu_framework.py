@@ -1,3 +1,8 @@
+# v0.2.3 Claude
+#   [v0.2.3] NEW: get_boruta_report() — DataFrame com hits/hit_rate/status de todas
+#                 as features avaliadas pelo Boruta. Permite ver as "tentative" que
+#                 ficaram perto do threshold (candidatas a feature_whitelist).
+#   [v0.2.3] NEW: self.boruta_report_ persistido no save_bundle/load
 # v0.2.2 Claude
 #   [v0.2.2] NEW: feature_engineering_only — drop tardio de features após o FE,
 #                 antes da fase de seleção. Permite que categóricas de alta cardinalidade
@@ -120,7 +125,7 @@ try:
 except ImportError:
     _HAS_TARGET_ENCODER = False
 
-_FRAMEWORK_VERSION = "0.2.2"
+_FRAMEWORK_VERSION = "0.2.3"
 
 # Cores canônicas para treino/teste — alta distinção visual e para daltônicos
 _COLOR_TRAIN = "#F06000"  # laranja-forte
@@ -1129,6 +1134,9 @@ class AutoClassificationEngine:
         self.association_report: dict = {}
         self.cv_results: dict = {}
         self._profile_features: list = []  # [NEW v0.1.1]
+        self.boruta_report_: dict = (
+            {}
+        )  # [NEW v0.2.3] hits, hit_rate, threshold, max_iters
 
     # -----------------------------------------------------------------------
     # 0. VALIDAÇÃO DE PARÂMETROS
@@ -1523,12 +1531,94 @@ class AutoClassificationEngine:
         threshold_hits = max(1, int(max_iters * hit_threshold_pct))
         good_features = [col for col, h in hits.items() if h >= threshold_hits]
 
+        # [v0.2.3] Persiste relatório completo para inspeção posterior
+        self.boruta_report_ = {
+            "hits": dict(hits),
+            "max_iters": max_iters,
+            "threshold_hits": threshold_hits,
+            "hit_threshold_pct": hit_threshold_pct,
+        }
+
         removidas = len(X_core.columns) - len(good_features)
         print(f"\n   🏆 Boruta Finalizado!")
         print(f"   => Critério de Sobrevivência: {threshold_hits} Hits")
         print(f"   => Mantidas: {len(good_features)} | Removidas: {removidas}")
 
         return good_features
+
+    # -----------------------------------------------------------------------
+    # 1.b BORUTA — Inspeção do relatório [NEW v0.2.3]
+    # -----------------------------------------------------------------------
+
+    def get_boruta_report(
+        self,
+        top_n: Optional[int] = None,
+        only_rejected: bool = False,
+    ) -> pd.DataFrame:
+        """
+        DataFrame com o ranking de hits do Boruta-LightGBM.
+
+        Útil pra identificar features "tentative" — rejeitadas que ficaram
+        perto do threshold e poderiam ser candidatas ao feature_whitelist.
+
+        Parâmetros
+        ----------
+        top_n : int, opcional
+            Limita ao top-N por hits. Default: todas.
+        only_rejected : bool
+            Se True, mostra apenas features que NÃO sobreviveram ao Boruta.
+            Útil pra ver "as melhores rejeitadas".
+
+        Colunas do retorno
+        ------------------
+        feature, hits, hit_rate, threshold, status
+
+        Status
+        ------
+        'mantida'   : hits >= threshold
+        'tentative' : hits entre 50% e 100% do threshold (zona cinzenta)
+        'rejeitada' : hits < 50% do threshold (rejeição clara)
+        """
+        if not self.boruta_report_:
+            raise RuntimeError(
+                "Nenhum relatório do Boruta disponível. "
+                "Execute fit_selection() com use_boruta_filter=True antes."
+            )
+
+        hits = self.boruta_report_["hits"]
+        max_iters = self.boruta_report_["max_iters"]
+        threshold = self.boruta_report_["threshold_hits"]
+
+        rows = []
+        for feat, h in hits.items():
+            hit_rate = h / max_iters if max_iters > 0 else 0.0
+            if h >= threshold:
+                status = "mantida"
+            elif h >= threshold * 0.5:
+                status = "tentative"
+            else:
+                status = "rejeitada"
+            rows.append(
+                {
+                    "feature": feat,
+                    "hits": h,
+                    "hit_rate": round(hit_rate, 3),
+                    "threshold": threshold,
+                    "status": status,
+                }
+            )
+
+        df_rep = pd.DataFrame(rows).sort_values(
+            "hits", ascending=False, ignore_index=True
+        )
+
+        if only_rejected:
+            df_rep = df_rep[df_rep["status"] != "mantida"].reset_index(drop=True)
+
+        if top_n is not None:
+            df_rep = df_rep.head(top_n).reset_index(drop=True)
+
+        return df_rep
 
     # -----------------------------------------------------------------------
     # 2. ENGENHARIA DE FEATURES
@@ -2497,6 +2587,27 @@ class AutoClassificationEngine:
         print(
             f"   => Features Finais ({len(self.selected_features)}): {self.selected_features}"
         )
+
+        # [v0.2.3] Top rejeitadas pelo Boruta — visível direto no log
+        if self.boruta_report_:
+            df_rej = self.get_boruta_report(top_n=10, only_rejected=True)
+            if not df_rej.empty:
+                print(
+                    f"\n   🔍 Top-{len(df_rej)} Rejeitadas pelo Boruta "
+                    f"(threshold = {self.boruta_report_['threshold_hits']} hits "
+                    f"de {self.boruta_report_['max_iters']}):"
+                )
+                for _, r in df_rej.iterrows():
+                    flag = "⚠️ " if r["status"] == "tentative" else "   "
+                    print(
+                        f"      {flag}{r['feature']:<40} "
+                        f"hits={int(r['hits']):>3}/{self.boruta_report_['max_iters']}  "
+                        f"({r['hit_rate']:.0%})  [{r['status']}]"
+                    )
+                print(
+                    "   💡 'tentative' = ficou perto do threshold "
+                    "(candidata a feature_whitelist se você tiver razão de domínio)."
+                )
 
         self._train_schema = {col: str(X[col].dtype) for col in self.selected_features}
         print(
@@ -4398,6 +4509,7 @@ class AutoClassificationEngine:
                 "train_hash": self._train_hash,
                 "cv_results": self.cv_results,
                 "profile_features": self._profile_features,  # [NEW v0.1.1]
+                "boruta_report": self.boruta_report_,  # [NEW v0.2.3]
             },
             f"{path}/assets.pkl",
         )
@@ -4517,6 +4629,7 @@ class AutoClassificationEngine:
         engine._train_hash = assets.get("train_hash", "")
         engine.cv_results = assets.get("cv_results", {})
         engine._profile_features = assets.get("profile_features", [])  # [NEW v0.1.1]
+        engine.boruta_report_ = assets.get("boruta_report", {})  # [NEW v0.2.3]
         engine.predictor = TabularPredictor.load(ag_path)
 
         print(f"✅ Engine carregado de '{path}/'")
