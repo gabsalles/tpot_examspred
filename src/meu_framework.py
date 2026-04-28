@@ -1,3 +1,10 @@
+# v0.2.4 Claude
+#   [v0.2.4] NEW: oot_psi_filter — filtro de estabilidade vs Out-of-Time.
+#                 Aplica FE no OOT, faz split interno do treino, calcula PSI por
+#                 feature e elimina as acima do threshold antes do Boruta.
+#                 Suporta numéricas (binning por quantis) e categóricas.
+#                 Boruta usa 100% das linhas (split 70% é só pra cálculo de PSI).
+#   [v0.2.4] NEW: get_oot_psi_report() + boruta_report_ persistido em save/load
 # v0.2.3 Claude
 #   [v0.2.3] NEW: get_boruta_report() — DataFrame com hits/hit_rate/status de todas
 #                 as features avaliadas pelo Boruta. Permite ver as "tentative" que
@@ -125,7 +132,7 @@ try:
 except ImportError:
     _HAS_TARGET_ENCODER = False
 
-_FRAMEWORK_VERSION = "0.2.3"
+_FRAMEWORK_VERSION = "0.2.4"
 
 # Cores canônicas para treino/teste — alta distinção visual e para daltônicos
 _COLOR_TRAIN = "#F06000"  # laranja-forte
@@ -1129,6 +1136,7 @@ class AutoClassificationEngine:
             "constantes_pos_rare": [],
             "importancia_nula": [],
             "boruta": [],  # <--- ADICIONE AQUI
+            "oot_psi": [],  # [NEW v0.2.4]
         }
 
         self.association_report: dict = {}
@@ -1137,6 +1145,7 @@ class AutoClassificationEngine:
         self.boruta_report_: dict = (
             {}
         )  # [NEW v0.2.3] hits, hit_rate, threshold, max_iters
+        self.oot_psi_report_: dict = {}  # [NEW v0.2.4] psi por feature vs OOT
 
     # -----------------------------------------------------------------------
     # 0. VALIDAÇÃO DE PARÂMETROS
@@ -1448,6 +1457,263 @@ class AutoClassificationEngine:
             df = df.drop(columns=list(to_drop))
 
         return df
+
+    # -----------------------------------------------------------------------
+    # 1.a OOT PSI FILTER — Estabilidade vs Out-of-Time [NEW v0.2.4]
+    # -----------------------------------------------------------------------
+
+    def _load_oot_data(self, oot_data) -> pd.DataFrame:
+        """Aceita DataFrame ou caminho (.csv, .parquet, .xlsx)."""
+        if isinstance(oot_data, pd.DataFrame):
+            return oot_data.copy()
+        if isinstance(oot_data, str):
+            ext = oot_data.lower().rsplit(".", 1)[-1]
+            if ext == "csv":
+                return pd.read_csv(oot_data)
+            if ext in ("parquet", "pq"):
+                return pd.read_parquet(oot_data)
+            if ext in ("xlsx", "xls"):
+                return pd.read_excel(oot_data)
+            raise ValueError(
+                f"Extensão '.{ext}' não suportada. Use .csv, .parquet ou .xlsx."
+            )
+        raise TypeError(
+            f"oot_psi_data deve ser DataFrame ou caminho (str). "
+            f"Recebido: {type(oot_data).__name__}"
+        )
+
+    def _apply_pre_selection_transformations(
+        self, df_oot: pd.DataFrame
+    ) -> pd.DataFrame:
+        """
+        Aplica no OOT as MESMAS transformações que o df principal sofreu antes
+        da Fase 2 (seleção). Reusa os mappings já aprendidos com is_train=False.
+
+        IMPORTANTE: deve ser chamado APÓS o df principal ter passado por todo
+        o FE no fit_selection — caso contrário os estados (_agg_values,
+        _rare_categories, _outlier_bounds, _profile_features) estarão vazios.
+        """
+        df = df_oot.copy()
+
+        # 1. Mesmas colunas dropadas no início
+        drop_cols = self.params.get("drop_features", [])
+        existing_drop = [c for c in drop_cols if c in df.columns]
+        if existing_drop:
+            df = df.drop(columns=existing_drop)
+
+        # 2. Features temporais (sem estado, derminístico)
+        df = self._extract_temporal_features(df)
+
+        # 3. FE replicando fit_selection com is_train=False
+        df = self._create_group_aggregations(df, is_train=False)
+        df = self._handle_rare_labels(df, is_train=False)
+        if self.params.get("handle_outliers", True):
+            df = self._handle_outliers_and_log(df, is_train=False)
+        if self.params.get("use_profile_features", False):
+            df = self._profile_based_feature_engineering(df, is_train=False)
+
+        # 4. Drop tardio
+        fe_only = self.params.get("feature_engineering_only", [])
+        existing_fe_only = [c for c in fe_only if c in df.columns]
+        if existing_fe_only:
+            df = df.drop(columns=existing_fe_only)
+
+        return df
+
+    @staticmethod
+    def _compute_psi(
+        expected: pd.Series,
+        actual: pd.Series,
+        n_bins: int = 10,
+        eps: float = 1e-6,
+    ) -> float:
+        """
+        PSI = Σ (actual% - expected%) * ln(actual% / expected%)
+
+        - Numéricas: bins por quantis do `expected`, aplicados em ambos.
+        - Categóricas (object/category/bool): cada categoria é um bin.
+        - NaN tratado como bin separado em ambos os casos.
+        - Retorna 0.0 se a coluna for constante ou tiver dados insuficientes.
+        """
+        expected_clean = expected.dropna()
+        if len(expected_clean) == 0 or expected_clean.nunique() < 2:
+            return 0.0
+
+        # Detecção robusta: numérica = numeric & not bool. Resto = categórica.
+        is_numeric = pd.api.types.is_numeric_dtype(
+            expected
+        ) and not pd.api.types.is_bool_dtype(expected)
+        is_categorical = not is_numeric
+
+        if is_categorical:
+            e = expected.fillna("__NaN__").astype(str)
+            a = actual.fillna("__NaN__").astype(str)
+            all_cats = pd.Index(pd.concat([e, a]).unique())
+            e_pct = e.value_counts(normalize=True).reindex(all_cats, fill_value=0.0)
+            a_pct = a.value_counts(normalize=True).reindex(all_cats, fill_value=0.0)
+        else:
+            try:
+                qs = np.linspace(0, 1, n_bins + 1)
+                cutoffs = np.unique(expected_clean.quantile(qs).values)
+                if len(cutoffs) < 2:
+                    return 0.0
+                # Bordas amplas pra capturar outliers do OOT
+                cutoffs[0] = -np.inf
+                cutoffs[-1] = np.inf
+            except Exception:
+                return 0.0
+
+            e_binned = pd.cut(expected, bins=cutoffs, include_lowest=True)
+            a_binned = pd.cut(actual, bins=cutoffs, include_lowest=True)
+
+            e_pct = e_binned.value_counts(normalize=True, sort=False, dropna=False)
+            a_pct = a_binned.value_counts(normalize=True, sort=False, dropna=False)
+            all_bins = e_pct.index.union(a_pct.index)
+            e_pct = e_pct.reindex(all_bins, fill_value=0.0)
+            a_pct = a_pct.reindex(all_bins, fill_value=0.0)
+
+        e_pct = e_pct + eps
+        a_pct = a_pct + eps
+        psi = ((a_pct - e_pct) * np.log(a_pct / e_pct)).sum()
+        return float(psi)
+
+    def _run_oot_psi_filter(
+        self,
+        df: pd.DataFrame,
+        df_oot_raw,
+        threshold: float = 0.25,
+        n_bins: int = 10,
+        train_size: float = 0.7,
+        random_state: int = 42,
+    ) -> tuple:
+        """
+        Calcula PSI feature a feature comparando split interno do treino vs OOT.
+
+        Retorna
+        -------
+        (features_to_drop, psi_dict)
+        """
+        from sklearn.model_selection import train_test_split
+
+        print(f"\n📐 --- OOT PSI FILTER (threshold={threshold}, bins={n_bins}) ---")
+
+        # 1. Carrega OOT
+        df_oot = self._load_oot_data(df_oot_raw)
+        print(
+            f"   📂 OOT carregado: {len(df_oot)} registros × {len(df_oot.columns)} cols"
+        )
+
+        # 2. Aplica mesmas transformações no OOT
+        df_oot_proc = self._apply_pre_selection_transformations(df_oot)
+
+        # 3. Split 70% interno do treino (só pra cálculo de PSI)
+        df_baseline, _ = train_test_split(
+            df, train_size=train_size, random_state=random_state, shuffle=True
+        )
+        print(
+            f"   ✂️  Split interno: {len(df_baseline)} ({train_size:.0%}) "
+            f"como baseline vs {len(df_oot_proc)} OOT"
+        )
+
+        # 4. Features comuns (exclui target)
+        feats_train = set(df_baseline.columns) - {self.target}
+        feats_oot = set(df_oot_proc.columns) - {self.target}
+        common_feats = feats_train & feats_oot
+        only_train = feats_train - feats_oot
+        only_oot = feats_oot - feats_train
+
+        if only_train:
+            warnings.warn(
+                f"[oot_psi] {len(only_train)} feature(s) ausente(s) no OOT (puladas): "
+                f"{sorted(only_train)[:5]}{'...' if len(only_train) > 5 else ''}",
+                UserWarning,
+            )
+        if only_oot:
+            print(f"   ℹ️  {len(only_oot)} coluna(s) extras no OOT (ignoradas).")
+
+        # 5. PSI feature a feature
+        psi_dict = {}
+        for col in sorted(common_feats):
+            try:
+                psi = self._compute_psi(
+                    df_baseline[col], df_oot_proc[col], n_bins=n_bins
+                )
+                psi_dict[col] = psi
+            except Exception as e:
+                warnings.warn(
+                    f"[oot_psi] Erro calculando PSI de '{col}': {e}", UserWarning
+                )
+                psi_dict[col] = np.nan
+
+        # 6. Decisão
+        features_to_drop = [
+            c for c, p in psi_dict.items() if not np.isnan(p) and p > threshold
+        ]
+        print(
+            f"   ✅ Avaliadas {len(psi_dict)} features | "
+            f"Estáveis: {len(psi_dict) - len(features_to_drop)} | "
+            f"Removidas: {len(features_to_drop)}"
+        )
+
+        return features_to_drop, psi_dict
+
+    def get_oot_psi_report(
+        self,
+        top_n: Optional[int] = None,
+        only_dropped: bool = False,
+    ) -> pd.DataFrame:
+        """
+        DataFrame com PSI de cada feature vs OOT, ordenado do mais instável
+        para o mais estável.
+
+        Status
+        ------
+        'estavel'    : PSI < 0.10
+        'moderado'   : 0.10 <= PSI < 0.25 (zona amarela)
+        'instavel'   : PSI >= 0.25 (acima do padrão da indústria)
+        'eliminada'  : PSI > threshold do experimento (foi removida)
+        """
+        if not self.oot_psi_report_:
+            raise RuntimeError(
+                "Nenhum relatório de PSI disponível. "
+                "Execute fit_selection() com oot_psi_filter=True antes."
+            )
+
+        psi = self.oot_psi_report_["psi_per_feature"]
+        threshold = self.oot_psi_report_["threshold"]
+        dropped = set(self.oot_psi_report_["dropped_features"])
+
+        rows = []
+        for feat, p in psi.items():
+            if np.isnan(p):
+                status = "erro"
+            elif feat in dropped:
+                status = "eliminada"
+            elif p >= 0.25:
+                status = "instavel"
+            elif p >= 0.10:
+                status = "moderado"
+            else:
+                status = "estavel"
+            rows.append(
+                {
+                    "feature": feat,
+                    "psi": round(p, 4) if not np.isnan(p) else np.nan,
+                    "threshold": threshold,
+                    "status": status,
+                }
+            )
+
+        df_rep = pd.DataFrame(rows).sort_values(
+            "psi", ascending=False, na_position="last", ignore_index=True
+        )
+
+        if only_dropped:
+            df_rep = df_rep[df_rep["status"] == "eliminada"].reset_index(drop=True)
+        if top_n is not None:
+            df_rep = df_rep.head(top_n).reset_index(drop=True)
+
+        return df_rep
 
     def _run_boruta_selection(
         self,
@@ -2477,6 +2743,43 @@ class AutoClassificationEngine:
                 )
 
         # ====================================================================
+        # OOT PSI FILTER — Estabilidade vs Out-of-Time [v0.2.4]
+        # ====================================================================
+        # Roda APÓS todo o FE (features brutas + derivadas) e ANTES da seleção.
+        # Aplica as mesmas transformações no OOT, calcula PSI feature a feature
+        # contra um split interno do treino, e elimina as instáveis.
+        # IMPORTANTE: o df que segue pra Fase 2 mantém TODAS as linhas — o split
+        # 70% é usado SÓ pra cálculo do PSI (não pro Boruta).
+        psi_dropped = []
+        if self.params.get("oot_psi_filter", False):
+            oot_data = self.params.get("oot_psi_data")
+            if oot_data is None:
+                raise ValueError(
+                    "oot_psi_filter=True requer oot_psi_data (DataFrame ou caminho)."
+                )
+            psi_dropped, psi_dict = self._run_oot_psi_filter(
+                df=df,
+                df_oot_raw=oot_data,
+                threshold=self.params.get("oot_psi_threshold", 0.25),
+                n_bins=self.params.get("oot_psi_n_bins", 10),
+                train_size=self.params.get("oot_psi_train_size", 0.7),
+                random_state=self.params.get("oot_psi_random_state", 42),
+            )
+            self.oot_psi_report_ = {
+                "psi_per_feature": psi_dict,
+                "threshold": self.params.get("oot_psi_threshold", 0.25),
+                "n_bins": self.params.get("oot_psi_n_bins", 10),
+                "train_size": self.params.get("oot_psi_train_size", 0.7),
+                "dropped_features": psi_dropped,
+            }
+            if psi_dropped:
+                df = df.drop(columns=psi_dropped)
+                print(
+                    f"   🚫 PSI > {self.params.get('oot_psi_threshold', 0.25)}: "
+                    f"{len(psi_dropped)} feature(s) eliminada(s) — não vão para o Boruta."
+                )
+
+        # ====================================================================
         # FASE 2: SELEÇÃO DE VARIÁVEIS
         # ====================================================================
         self.eliminated_features = {
@@ -2486,6 +2789,7 @@ class AutoClassificationEngine:
             "constantes_pos_rare": [],
             "importancia_nula": [],
             "boruta": [],
+            "oot_psi": list(psi_dropped),  # [v0.2.4] já populado acima
         }
 
         # Whitelist — carregada uma vez e usada em todos os filtros
@@ -2579,6 +2883,7 @@ class AutoClassificationEngine:
             "constantes_pos_rare": "Removidas por Constantes pós-RareLabel",
             "importancia_nula": "Removidas por Importância Nula",
             "boruta": "Removidas pelo Boruta-LightGBM",
+            "oot_psi": "Removidas por PSI vs OOT",  # [v0.2.4]
         }
         for reason, cols in self.eliminated_features.items():
             print(f"   => {label_map[reason]}: {cols or 'Nenhuma'}")
@@ -2607,6 +2912,34 @@ class AutoClassificationEngine:
                 print(
                     "   💡 'tentative' = ficou perto do threshold "
                     "(candidata a feature_whitelist se você tiver razão de domínio)."
+                )
+
+        # [v0.2.4] Top piores PSI vs OOT — visível direto no log
+        if self.oot_psi_report_:
+            df_psi = self.get_oot_psi_report(top_n=10)
+            if not df_psi.empty:
+                thr = self.oot_psi_report_["threshold"]
+                print(
+                    f"\n   📐 Top-{len(df_psi)} Piores PSI vs OOT "
+                    f"(threshold = {thr}):"
+                )
+                for _, r in df_psi.iterrows():
+                    if r["status"] == "eliminada":
+                        flag = "🚫 "
+                    elif r["status"] == "instavel":
+                        flag = "⚠️ "
+                    elif r["status"] == "moderado":
+                        flag = "🟡 "
+                    else:
+                        flag = "   "
+                    psi_str = f"{r['psi']:.4f}" if not pd.isna(r["psi"]) else "  N/A "
+                    print(
+                        f"      {flag}{r['feature']:<40} "
+                        f"PSI={psi_str}  [{r['status']}]"
+                    )
+                print(
+                    "   💡 PSI < 0.10 estável | 0.10-0.25 moderado | "
+                    "≥ 0.25 instável (padrão da indústria)."
                 )
 
         self._train_schema = {col: str(X[col].dtype) for col in self.selected_features}
@@ -4510,6 +4843,7 @@ class AutoClassificationEngine:
                 "cv_results": self.cv_results,
                 "profile_features": self._profile_features,  # [NEW v0.1.1]
                 "boruta_report": self.boruta_report_,  # [NEW v0.2.3]
+                "oot_psi_report": self.oot_psi_report_,  # [NEW v0.2.4]
             },
             f"{path}/assets.pkl",
         )
@@ -4630,6 +4964,7 @@ class AutoClassificationEngine:
         engine.cv_results = assets.get("cv_results", {})
         engine._profile_features = assets.get("profile_features", [])  # [NEW v0.1.1]
         engine.boruta_report_ = assets.get("boruta_report", {})  # [NEW v0.2.3]
+        engine.oot_psi_report_ = assets.get("oot_psi_report", {})  # [NEW v0.2.4]
         engine.predictor = TabularPredictor.load(ag_path)
 
         print(f"✅ Engine carregado de '{path}/'")
