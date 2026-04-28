@@ -1,3 +1,8 @@
+# v0.2.2 Claude
+#   [v0.2.2] NEW: feature_engineering_only — drop tardio de features após o FE,
+#                 antes da fase de seleção. Permite que categóricas de alta cardinalidade
+#                 (ex: comarca, uf) sirvam ao ProfileAnalyzer sem entrar no Boruta/modelo.
+#   [v0.2.2] NEW: validação de conflito entre feature_whitelist e feature_engineering_only
 # v0.2.1 Claude
 #   [v0.2.1] FIX: _compute_profile_features ignora colunas categóricas binárias (2 únicos)
 #   [v0.2.1] TUNE: profile defaults ajustados — topn=5, one_per_col=True, max_features=20
@@ -115,7 +120,7 @@ try:
 except ImportError:
     _HAS_TARGET_ENCODER = False
 
-_FRAMEWORK_VERSION = "0.2.1"
+_FRAMEWORK_VERSION = "0.2.2"
 
 # Cores canônicas para treino/teste — alta distinção visual e para daltônicos
 _COLOR_TRAIN = "#F06000"  # laranja-forte
@@ -2282,6 +2287,33 @@ class AutoClassificationEngine:
 
         # 2. Drop Automático
         drop_cols = self.params.get("drop_features", [])
+
+        # [v0.2.2] Validação de conflitos entre listas de controle de features
+        wl_set = set(self.params.get("feature_whitelist", []))
+        fe_only_set = set(self.params.get("feature_engineering_only", []))
+        drop_set = set(drop_cols)
+
+        conflict_wl_fe = wl_set & fe_only_set
+        if conflict_wl_fe:
+            raise ValueError(
+                f"Conflito: {sorted(conflict_wl_fe)} estão em feature_whitelist "
+                f"E feature_engineering_only. Whitelist força inclusão no modelo; "
+                f"feature_engineering_only força exclusão. Escolha um dos dois."
+            )
+        conflict_drop_fe = drop_set & fe_only_set
+        if conflict_drop_fe:
+            raise ValueError(
+                f"Conflito: {sorted(conflict_drop_fe)} estão em drop_features "
+                f"E feature_engineering_only. drop_features remove ANTES do FE; "
+                f"feature_engineering_only remove DEPOIS do FE. Escolha um dos dois."
+            )
+        conflict_wl_drop = wl_set & drop_set
+        if conflict_wl_drop:
+            raise ValueError(
+                f"Conflito: {sorted(conflict_wl_drop)} estão em feature_whitelist "
+                f"E drop_features. Escolha um dos dois."
+            )
+
         if drop_cols:
             existing_drop = [c for c in drop_cols if c in df.columns]
             if existing_drop:
@@ -2329,6 +2361,30 @@ class AutoClassificationEngine:
         if self.params.get("use_profile_features", False):
             print("\n🔬 Profile-based Feature Engineering (target-guided)...")
             df = self._profile_based_feature_engineering(df, is_train=True)
+
+        # ====================================================================
+        # DROP TARDIO — features que servem só ao Feature Engineering [v0.2.2]
+        # ====================================================================
+        # Estas features participaram do ProfileAnalyzer (criação dos pf__*)
+        # mas NÃO devem ir para a fase de seleção nem para o modelo final.
+        # Útil para categóricas de alta cardinalidade (comarca, uf, etc.) que
+        # geram bom sinal via tokens TF-IDF mas teriam CSI ruim como feature crua.
+        fe_only = self.params.get("feature_engineering_only", [])
+        if fe_only:
+            existing_fe_only = [c for c in fe_only if c in df.columns]
+            if existing_fe_only:
+                df = df.drop(columns=existing_fe_only)
+                print(
+                    f"   🎯 Feature-Engineering-Only: {existing_fe_only} "
+                    f"removidas após FE (não vão para seleção nem para o modelo)."
+                )
+            missing_fe_only = [c for c in fe_only if c not in existing_fe_only]
+            if missing_fe_only:
+                warnings.warn(
+                    f"[feature_engineering_only] Colunas não encontradas no df: "
+                    f"{missing_fe_only}. Verifique nomes ou se já foram dropadas.",
+                    UserWarning,
+                )
 
         # ====================================================================
         # FASE 2: SELEÇÃO DE VARIÁVEIS
