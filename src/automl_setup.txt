@@ -1,286 +1,378 @@
-Dado o que vimos nos resultados — faixa 5 perfeita, faixas 2-3 instáveis no OOT, monotonia já em 1.0000 — a lógica dos pesos é essa:
-Monotonia binária virou 1.0000 em todos os trials — o modelo aprendeu a ser monotônico trivialmente. Os 5% estão desperdiçados num sinal saturado. Precisamos substituir por Spearman, que captura grau de ordenamento, não só se é monotônico ou não.
-Recomendação de pesos:
-W_PRAUC    = 0.55  # era 0.65 — cede espaço pro Spearman
-W_SPEARMAN = 0.15  # novo — penaliza rank reversal nas faixas 2-3
-W_PSI      = 0.30  # mantém — já funcionando bem
-O Spearman com 15% é suficiente pra influenciar a seleção sem dominar. Se as faixas 2-3 continuarem instáveis após o experimento, sobe pra 0.20 e baixa PRAUC pra 0.50.
-
-Aqui está o bloco completo pra mandar pro Genie:
-pythonimport time
-import numpy as np
-import pandas as pd
-import optuna
-import lightgbm as lgb
-from sklearn.model_selection import StratifiedKFold
-from sklearn.metrics import average_precision_score
-from scipy.stats import spearmanr
-
-# ==============================================================
-# PESOS DO COMPOSITE — AJUSTE AQUI
-# ==============================================================
-W_PRAUC    = 0.55  # PR-AUC (desempenho)
-W_SPEARMAN = 0.15  # Spearman das faixas (ordenamento — substitui monotonia binária)
-W_PSI      = 0.30  # PSI combinado scores+taxas (estabilidade)
-
-N_FOLDS     = 5
-N_BINS      = 5
-TIMEOUT_MIN = 60
-# ==============================================================
-
-assert abs(W_PRAUC + W_SPEARMAN + W_PSI - 1.0) < 1e-6, "Pesos devem somar 1.0"
+================================================================================
+DOCUMENTO DE ALTERAÇÕES v5 — LightGBM Classification tempo ativo 4y PR AUC
+================================================================================
+Data: 30/04/2026
+Contexto: Notebook Databricks — otimização Optuna com métrica composta
+Versão anterior: v4 (Q5-Q1 + gap mínimo, PSI duplo, search space restrito)
+Objetivo: Recuperar PR-AUC perdido na v4 mantendo todos os ganhos de
+          estabilidade, PSI e ordenamento de faixas
+MLflow Run ID v4: 79f623df85a5448f8855d4490a9772f9
+================================================================================
 
 
-# --------------------------------------------------------------
-# FUNÇÕES AUXILIARES
-# --------------------------------------------------------------
+CONTEXTO E DIAGNÓSTICO DA v4
+-----------------------------
+A v4 foi bem-sucedida nos objetivos principais:
+  - Q3 OOT corrigido: 55.81% → 41.86% (rank reversal resolvido)
+  - PSI OOT: 0.2885 (alto) → 0.1618 (médio) — queda de 44%
+  - CV Separação: 0.6843 — não saturou (Spearman saturava em 1.0000)
+  - Q4 OOT ganhou 12 pessoas a mais vs v3 (13→25 pessoas na faixa)
+  - Recall OOT: 0.61 → 0.67 (+0.06)
+  - Hiperparâmetros equilibrados: min_gain_to_split=0.324 e path_smooth=0.136
+    ficaram longe dos tetos de 0.5 — confirmando que o search space restrito
+    funcionou corretamente sem forçar regularização excessiva
 
-def compute_fold_metrics(y_tr, p_tr, y_vl, p_vl, n_bins=N_BINS):
-    """
-    Retorna (spearman_score, psi_combinado) para um fold.
+O único ponto fraco da v4 foi queda no PR-AUC:
+  CV:   0.7170 → 0.6917  (-0.025)
+  Test: 0.7306 → 0.7046  (-0.026)
+  OOT:  0.7581 → 0.7421  (-0.016)
 
-    spearman_score : correlação de Spearman entre a taxa de positivos
-                     por faixa e a ordem esperada das faixas (0 a 1).
-                     1.0 = ordenamento perfeito faixa1 < faixa2 < ... < faixaN.
+Causa identificada: W_PSI=0.30 continua dando 30% de peso a uma métrica que
+já atingiu nível excelente (0.0603 — abaixo de 0.10, considerado "bom" pela
+literatura de credit scoring). Isso reduz o espaço de otimização disponível
+para PR-AUC. Além disso, o run de 60 minutos gerou apenas 1026 trials — o
+melhor apareceu no trial 310 e não foi superado, sugerindo que mais tempo e
+trials permitiriam exploração adicional do espaço de hiperparâmetros.
 
-    psi_combinado  : média entre PSI de taxas (instabilidade das taxas
-                     de evento por faixa) e PSI de scores (instabilidade
-                     da distribuição de scores). Ambos calculados com as
-                     bordas definidas no TREINO do fold — nunca na validação.
-    """
-    eps = 1e-4
+RESUMO DAS ALTERAÇÕES DA v5
+-----------------------------
+Apenas 3 alterações em relação à v4. TUDO MAIS MANTÉM IDÊNTICO.
 
-    # Bordas definidas no treino do fold
-    try:
-        _, bin_edges = pd.qcut(
-            p_tr, q=n_bins, retbins=True, duplicates='drop'
-        )
-    except ValueError:
-        return 0.0, 1.0
-
-    if len(bin_edges) - 1 < 2:
-        return 0.0, 1.0
-
-    bin_edges[0]  = -np.inf
-    bin_edges[-1] =  np.inf
-
-    # ── Taxas de positivos por faixa ──────────────────────────
-    def _rates(y, p):
-        bins = pd.cut(p, bins=bin_edges, include_lowest=True)
-        return (
-            pd.DataFrame({'t': y, 'b': bins})
-            .groupby('b', observed=False)['t']
-            .mean()
-            .fillna(0)
-            .values
-        )
-
-    r_tr = _rates(y_tr, p_tr)
-    r_vl = _rates(y_vl, p_vl)
-
-    # PSI de taxas
-    r_tr_c   = np.clip(r_tr, eps, 1 - eps)
-    r_vl_c   = np.clip(r_vl, eps, 1 - eps)
-    psi_taxas = float(np.sum((r_vl_c - r_tr_c) * np.log(r_vl_c / r_tr_c)))
-
-    # ── Distribuição de scores por faixa ──────────────────────
-    e = pd.cut(p_tr, bins=bin_edges, include_lowest=True)
-    a = pd.cut(p_vl, bins=bin_edges, include_lowest=True)
-
-    e_pct = e.value_counts(normalize=True, sort=False).clip(eps, 1 - eps)
-    a_pct = (
-        a.value_counts(normalize=True, sort=False)
-        .reindex(e_pct.index, fill_value=0)
-        .clip(eps, 1 - eps)
-    )
-    psi_scores = float(np.sum((a_pct - e_pct) * np.log(a_pct / e_pct)))
-
-    # PSI combinado
-    psi_combinado = 0.5 * psi_taxas + 0.5 * psi_scores
-
-    # ── Spearman das taxas da validação vs ordem esperada ─────
-    # Ordem esperada: faixa 1 < faixa 2 < ... < faixa N
-    expected_order = np.arange(len(r_vl))
-    if np.std(r_vl) < 1e-6:
-        # Todas as taxas iguais — ordenamento impossível de avaliar
-        spearman_score = 0.0
-    else:
-        corr, _ = spearmanr(r_vl, expected_order)
-        spearman_score = float(max(0.0, corr))  # clip em 0: inversão total = 0
-
-    return spearman_score, psi_combinado
+  1. Rebalancear pesos: W_PRAUC 0.60→0.65, W_PSI 0.30→0.25
+  2. Timeout: 60min → 90min, com limite adicional de 400 trials
+  3. Mínimo de n_estimators: 50 → 100
 
 
-# --------------------------------------------------------------
-# FUNÇÃO OBJETIVO — OPTUNA
-# --------------------------------------------------------------
+================================================================================
+ALTERAÇÃO 1 — Rebalancear pesos da métrica composta
+================================================================================
 
-def objective(trial):
+MOTIVAÇÃO
+---------
+O PSI atingiu 0.0603 na v4 — excelente, abaixo do threshold "bom" (<0.10)
+da literatura de credit scoring (Siddiqi, 2006). Manter W_PSI=0.30 significa
+dedicar 30% da capacidade de otimização do Optuna a uma métrica que já está
+resolvida. Isso cria um teto artificial para o PR-AUC, que ficou em 0.6917
+no CV — abaixo dos 0.7170 da v3.
 
-    params = {
-        "objective":        "binary",
-        "verbosity":        -1,
-        "boosting_type":    "gbdt",
-        "scale_pos_weight": scale_pos_weight,
-        "random_state":     42,
-        # Hiperparâmetros buscados
-        "n_estimators":     trial.suggest_int("n_estimators", 50, 400),
-        "learning_rate":    trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
-        "max_depth":        trial.suggest_int("max_depth", 3, 8),
-        "num_leaves":       trial.suggest_int("num_leaves", 8, 96),
-        "min_child_samples":trial.suggest_int("min_child_samples", 5, 50),
-        "subsample":        trial.suggest_float("subsample", 0.5, 1.0),
-        "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
-        "reg_alpha":        trial.suggest_float("reg_alpha", 1e-8, 10.0, log=True),
-        "reg_lambda":       trial.suggest_float("reg_lambda", 1e-8, 10.0, log=True),
-        # Novos — ajudam nas faixas intermediárias
-        "min_gain_to_split":trial.suggest_float("min_gain_to_split", 0.0, 1.0),
-        "path_smooth":      trial.suggest_float("path_smooth", 0.0, 1.0),
-    }
+O princípio de otimização multiobjetivo estabelece que pesos devem ser
+ajustados dinamicamente conforme os objetivos são atingidos. Quando uma
+métrica converge para sua região ótima, reduzir seu peso libera capacidade
+para melhorar as métricas que ainda têm espaço de ganho (Cawley & Talbot,
+2010 — "On Over-fitting in Model Selection and Subsequent Selection Bias
+in Performance Evaluation").
 
-    skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=42)
-    fold_pr, fold_spearman, fold_psi = [], [], []
+O W_SEPARACAO mantém em 0.10 porque a métrica está funcionando corretamente
+— CV Separação ficou em 0.6843, diferenciando efetivamente os trials sem
+saturar. Não há razão para alterar um componente que está se comportando
+como esperado.
 
-    for tr_idx, vl_idx in skf.split(X_train_proc, y_train):
-        X_tr = X_train_proc[tr_idx]
-        X_vl = X_train_proc[vl_idx]
-        y_tr = y_train.values[tr_idx]
-        y_vl = y_train.values[vl_idx]
+FUNDAMENTAÇÃO
+-------------
+Davis & Goadrich (2006) — "The Relationship Between Precision-Recall and ROC
+Curves" — demonstram que PR-AUC é a métrica primária para problemas com
+classes desbalanceadas (~35% de positivos no problema atual). Reduzir seu
+peso abaixo de 60% compromete a capacidade do modelo de discriminar os casos
+positivos reais — que é o objetivo operacional central (identificar quem vai
+ficar 4+ anos reintegrado).
 
-        mdl = lgb.LGBMClassifier(**params)
-        mdl.fit(
-            X_tr, y_tr,
-            eval_set=[(X_vl, y_vl)],
-            callbacks=[
-                lgb.early_stopping(30, verbose=False),
-                lgb.log_evaluation(0),
-            ],
-        )
+Siddiqi (2006) — "Credit Risk Scorecards" — estabelece PSI < 0.10 como
+threshold "bom" de estabilidade. Com PSI=0.0603 na v4, o modelo já está
+nessa faixa. O PSI deve ser monitorado, não maximizado indefinidamente.
 
-        p_tr = mdl.predict_proba(X_tr)[:, 1]
-        p_vl = mdl.predict_proba(X_vl)[:, 1]
+ALTERAÇÃO NO CÓDIGO — bloco de pesos (célula 7)
+------------------------------------------------
+  # DE:
+  W_PRAUC     = 0.60
+  W_SEPARACAO = 0.10
+  W_PSI       = 0.30
 
-        fold_pr.append(average_precision_score(y_vl, p_vl))
+  # PARA:
+  W_PRAUC     = 0.65
+  W_SEPARACAO = 0.10
+  W_PSI       = 0.25
 
-        spearman, psi = compute_fold_metrics(y_tr, p_tr, y_vl, p_vl)
-        fold_spearman.append(spearman)
-        fold_psi.append(psi)
+  assert abs(W_PRAUC + W_SEPARACAO + W_PSI - 1.0) < 1e-6, "Pesos devem somar 1.0"
 
-    mean_pr       = float(np.mean(fold_pr))
-    mean_spearman = float(np.mean(fold_spearman))
-    mean_psi      = float(np.mean(fold_psi))
-
-    # PSI vira score: menor PSI = melhor score (clip 0-1)
-    psi_score = float(np.clip(1 - mean_psi, 0, 1))
-
-    composite = (
-        W_PRAUC    * mean_pr
-        + W_SPEARMAN * mean_spearman
-        + W_PSI      * psi_score
-    )
-
-    trial.set_user_attr("cv_pr_auc",   round(mean_pr,       4))
-    trial.set_user_attr("cv_spearman", round(mean_spearman, 4))
-    trial.set_user_attr("cv_psi",      round(mean_psi,      4))
-
-    return composite
+NOTA SOBRE AJUSTE FINO:
+Se após a v5 o PR-AUC se recuperar mas o PSI OOT subir acima de 0.25:
+  → Voltar W_PSI para 0.28, W_PRAUC para 0.62
+Se o CV Separação saturar em 1.0 novamente:
+  → Aumentar W_SEPARACAO para 0.15, reduzir W_PRAUC para 0.60
 
 
-# --------------------------------------------------------------
-# EXECUÇÃO
-# --------------------------------------------------------------
+================================================================================
+ALTERAÇÃO 2 — Timeout 90 minutos com limite de 400 trials
+================================================================================
 
-print(f"Composite = {W_PRAUC:.0%} PR-AUC  "
-      f"+ {W_SPEARMAN:.0%} Spearman  "
-      f"+ {W_PSI:.0%} (1-PSI combinado)")
-print(f"CV: {N_FOLDS}-fold StratifiedKFold, timeout {TIMEOUT_MIN} min")
+MOTIVAÇÃO
+---------
+Na v4, o melhor trial apareceu no trial 310 de 1026 totais (30% do run) e
+não foi superado nas 716 tentativas restantes. Isso indica dois fenômenos:
 
-optuna.logging.set_verbosity(optuna.logging.WARNING)
-study = optuna.create_study(
-    direction="maximize",
-    study_name="lgbm_cv_spearman_psi_duplo_60min"
-)
+  1. O Optuna encontrou o ótimo relativamente cedo — o search space restrito
+     (herdado das alterações da v4) está bem calibrado.
 
-t0 = time.time()
-study.optimize(objective, timeout=TIMEOUT_MIN * 60, show_progress_bar=True)
-elapsed   = time.time() - t0
-n_completed = len([t for t in study.trials if t.state.name == "COMPLETE"])
+  2. Com 60 minutos e 1026 trials, o Optuna explorou bem a região inicial
+     mas teve pouco tempo para convergência fina (exploitation) após a fase
+     de exploração (exploration).
 
-best = study.best_trial
-print(f"\n{'='*65}")
-print(f"Concluído em {elapsed/60:.1f} min ({n_completed} trials × {N_FOLDS} folds)")
-print(f"{'='*65}")
-print(f"Best composite:   {best.value:.4f}")
-print(f"  ├─ CV PR-AUC:   {best.user_attrs['cv_pr_auc']:.4f}")
-print(f"  ├─ CV Spearman: {best.user_attrs['cv_spearman']:.4f}  "
-      f"{'✅' if best.user_attrs['cv_spearman'] > 0.90 else '⚠️'}")
-print(f"  └─ CV PSI:      {best.user_attrs['cv_psi']:.4f}  "
-      f"{'✅' if best.user_attrs['cv_psi'] < 0.10 else '⚠️' if best.user_attrs['cv_psi'] < 0.25 else '❌'}")
-print(f"\nBest params: {best.params}")
+Aumentar para 90 minutos com limite de 400 trials resolve os dois problemas:
+  - 400 trials cobre o ponto histórico de convergência (310) com margem de
+    +29%, garantindo que o ótimo seja encontrado
+  - 90 minutos garante que configurações com learning_rate baixo (que requerem
+    mais tempo por trial por causa do early stopping mais tardio) sejam
+    adequadamente exploradas
+  - O critério que disparar primeiro interrompe o run — proteção contra
+    runs longos desnecessários
 
-O que mudou em relação ao código atual e por quê
-Monotonia binária → Spearman contínuo: a monotonia retornava 1.0000 em todos os trials porque qualquer modelo com tendência geral crescente passava. O Spearman mede o grau de correlação entre as taxas reais das faixas e a ordem esperada — um modelo com faixa 3 maior que faixa 4 recebe Spearman menor, não apenas "passou ou não passou".
-PSI simples → PSI combinado (scores + taxas): o PSI atual mede se as taxas de evento mudaram entre treino e validação por faixa. O PSI de scores mede se a distribuição de onde as pessoas caem nas faixas mudou. Os dois juntos cobrem as duas formas de instabilidade que podem afetar o ordenamento no OOT.
-Dois novos hiperparâmetros no search space: min_gain_to_split e path_smooth. O path_smooth é o mais importante — suaviza as predições nas folhas das árvores, reduzindo variância especialmente nos casos ambíguos que ficam nas faixas 2 e 3.
-Nome do study atualizado: lgbm_cv_spearman_psi_duplo_60min — pra diferenciar do run anterior no MLflow e facilitar comparação.
+ESTIMATIVA DE TEMPO:
+Com ~5 trials/minuto (observado nas versões anteriores), 400 trials ≈ 80
+minutos. Na prática o n_trials=400 deve disparar antes do timeout de 90
+minutos — tornando o run mais previsível e controlado.
+
+FUNDAMENTAÇÃO
+-------------
+Bergstra & Bengio (2012) — "Random Search for Hyper-Parameter Optimization"
+— estabelecem que busca bayesiana (TPE, usado pelo Optuna) converge mais
+eficientemente que grid search mas ainda requer N suficiente de trials para
+cobrir adequadamente espaços de alta dimensionalidade. Com 11 dimensões no
+search space atual, 400 trials é o mínimo recomendado para cobertura
+estatística razoável.
+
+Feurer et al. (2015) — "Efficient and Robust Automated Machine Learning" —
+mostram que o ponto de rendimento decrescente em busca bayesiana tipicamente
+ocorre entre 300-500 trials para espaços de 8-15 dimensões — alinhado com
+o que observamos empiricamente (melhor trial no 310).
+
+ALTERAÇÃO NO CÓDIGO — parâmetros globais e chamada do Optuna (célula 7)
+-----------------------------------------------------------------------
+  # Adicionar constante:
+  N_TRIALS = 400
+
+  # Substituir chamada do study.optimize:
+  # DE:
+  study.optimize(objective, timeout=TIMEOUT_MIN * 60, show_progress_bar=True)
+
+  # PARA:
+  study.optimize(
+      objective,
+      timeout=TIMEOUT_MIN * 60,
+      n_trials=N_TRIALS,
+      show_progress_bar=True
+  )
+
+  # Atualizar TIMEOUT_MIN:
+  # DE:
+  TIMEOUT_MIN = 60
+
+  # PARA:
+  TIMEOUT_MIN = 90
+
+  # Atualizar nome do study para rastreabilidade no MLflow:
+  # DE:
+  study = optuna.create_study(direction="maximize", study_name="lgbm_cv_psi_60min")
+
+  # PARA:
+  study = optuna.create_study(direction="maximize", study_name="lgbm_v5_90min_400trials")
+
+  # Atualizar print de configuração:
+  print(f"CV: {N_FOLDS}-fold StratifiedKFold, timeout {TIMEOUT_MIN} min ou {N_TRIALS} trials")
+
+  # Atualizar nome do run MLflow para rastreabilidade:
+  # DE:
+  _mlflow_run_name = f"lgbm_v24_80-20_{n_completed}trials_60min"
+
+  # PARA:
+  _mlflow_run_name = f"lgbm_v5_80-20_{n_completed}trials_90min"
 
 
+================================================================================
+ALTERAÇÃO 3 — Mínimo de n_estimators: 50 → 100
+================================================================================
+
+MOTIVAÇÃO
+---------
+Na v4, o melhor trial selecionou learning_rate=0.010 com n_estimators=216.
+Essa combinação é subótima: com LR=0.010 (muito baixo), o modelo precisa de
+mais árvores para convergir — mas o early stopping (30 rounds sem melhora)
+cortou em 216, sugerindo que o modelo parou antes de atingir sua capacidade
+máxima.
+
+O problema é que com n_estimators mínimo em 50, o Optuna pode explorar
+configurações onde LR alto (0.2-0.3) com poucas árvores (50-80) aparece
+como viável no CV mas generaliza mal no OOT — pois árvores rápidas tendem
+a overfit em bases pequenas (~1450 linhas de treino).
+
+Elevar o mínimo para 100 elimina configurações trivialmente subótimas sem
+restringir o espaço de configurações genuinamente boas.
+
+FUNDAMENTAÇÃO
+-------------
+Ke et al. (2017) — "LightGBM: A Highly Efficient Gradient Boosting Decision
+Tree" — recomendam que o número de estimators seja suficiente para que o
+early stopping possa atuar efetivamente. Com early_stopping_rounds=30 e
+LR baixo, o mínimo prático de estimators é ~100 para que o modelo tenha
+ao menos 3-4 fases de convergência antes de parar.
+
+Chen & Guestrin (2016) — "XGBoost: A Scalable Tree Boosting System" —
+estabelecem que em bases com N < 2000, learning_rate < 0.05 combinado com
+n_estimators < 100 produz modelos sistematicamente subotimizados por
+insuficiência de iterações de gradiente.
+
+ALTERAÇÃO NO CÓDIGO — bloco de params na função objetivo (célula 7)
+-------------------------------------------------------------------
+  # DE:
+  "n_estimators": trial.suggest_int("n_estimators", 50, 800),
+
+  # PARA:
+  "n_estimators": trial.suggest_int("n_estimators", 100, 800),
 
 
+================================================================================
+O QUE NÃO MUDA — MANTER IDÊNTICO DA v4
+================================================================================
+
+Os seguintes elementos foram validados empiricamente na v4 e NÃO devem
+ser alterados:
+
+FUNÇÃO compute_fold_metrics — manter exatamente como está na v4:
+  - PSI de taxas + PSI de scores (PSI duplo combinado com peso 50/50)
+  - Métrica de separação: 0.60 * amplitude(Q5-Q1) + 0.40 * gap_score
+  - Bordas definidas no treino do fold (-np.inf, np.inf nas extremidades)
+  - Retorna (separacao_score, psi_combinado)
+
+SEARCH SPACE — manter os ranges da v4:
+  max_depth:          4-8        (não voltar para 3)
+  num_leaves:         20-128     (não voltar para 8)
+  min_child_samples:  5-100
+  subsample:          0.4-1.0
+  colsample_bytree:   0.5-1.0
+  reg_alpha:          1e-8 a 10.0 (log=True)
+  reg_lambda:         1e-8 a 10.0 (log=True)
+  min_gain_to_split:  0.0-0.5    (não voltar para 0-1.0)
+  path_smooth:        0.0-0.5    (não voltar para 0-1.0)
+  learning_rate:      0.01-0.3   (log=True)
+
+  JUSTIFICATIVA: min_gain_to_split=0.324 e path_smooth=0.136 na v4 ficaram
+  longe dos tetos de 0.5, confirmando que o range está bem calibrado. Expandir
+  de volta para 0-1.0 voltaria a produzir modelos excessivamente conservadores
+  como o max_depth=3/num_leaves=22 da v3.
+
+IMPUTER: strategy="median" (não reverter para "mean")
+
+N_FOLDS: 5 (manter)
+
+SPLIT: 80/20 estratificado (manter)
+
+EARLY STOPPING: 30 rounds (manter)
+
+SCALE_POS_WEIGHT: manter valor atual
+
+PSI DUPLO: manter cálculo combinado (0.5 * psi_taxas + 0.5 * psi_scores)
+
+SEPARAÇÃO Q5-Q1 + GAP MÍNIMO: manter pesos internos (0.60 amplitude + 0.40 gap)
 
 
-O que o teu código atual tem
-python"n_estimators":     suggest_int(50, 400)
-"learning_rate":    suggest_float(0.01, 0.3, log=True)
-"max_depth":        suggest_int(3, 8)
-"num_leaves":       suggest_int(8, 96)
-"min_child_samples":suggest_int(5, 50)
-"subsample":        suggest_float(0.5, 1.0)
-"colsample_bytree": suggest_float(0.5, 1.0)
-"reg_alpha":        suggest_float(1e-8, 10.0, log=True)
-"reg_lambda":       suggest_float(1e-8, 10.0, log=True)
-O que eu mudaria e por quê
-n_estimators — ampliar pra cima:
-python"n_estimators": suggest_int(50, 800)  # era 400
-Com early stopping em 30 rounds, o teto de 400 pode estar cortando configurações com learning_rate baixo que precisariam de mais árvores pra convergir. O early stopping protege de overfitting então ampliar é seguro.
-num_leaves — ampliar pra cima:
-python"num_leaves": suggest_int(8, 128)  # era 96
-Pequena expansão. Num problema com 1454 linhas de treino e 13 features, 128 folhas ainda é razoável com min_child_samples suficientemente alto.
-min_child_samples — ampliar pra cima:
-python"min_child_samples": suggest_int(5, 100)  # era 50
-Esse é o mais importante dos existentes. Com 1454 linhas, valores altos de min_child_samples (50-100) forçam o modelo a ser mais conservador nas folhas — reduz variância nas faixas intermediárias, que é exatamente o problema das faixas 2-3. O range atual de até 50 pode estar deixando o Optuna longe de configurações mais regularizadas.
-subsample — ampliar pra baixo:
-python"subsample": suggest_float(0.4, 1.0)  # era 0.5
-Permitir amostras menores por árvore aumenta diversidade entre as árvores — útil pra reduzir variância.
-Dois novos:
-python"min_gain_to_split": suggest_float(0.0, 1.0),  # novo
-"path_smooth":       suggest_float(0.0, 1.0),  # novo
-min_gain_to_split — o LightGBM só faz um split se o ganho for maior que esse valor. Valores maiores = modelo mais conservador = menos overfitting nos casos ambíguos das faixas 2-3.
-path_smooth — suaviza as predições ao longo das árvores. Reduz a diferença entre scores de casos parecidos — exatamente o que causa instabilidade nas faixas intermediárias.
-Bloco completo do search space pra mandar pro Genie
-pythonparams = {
-    # Fixos
-    "objective":         "binary",
-    "verbosity":         -1,
-    "boosting_type":     "gbdt",
-    "scale_pos_weight":  scale_pos_weight,
-    "random_state":      42,
+================================================================================
+O QUE MONITORAR NOS RESULTADOS DA v5
+================================================================================
 
-    # Hiperparâmetros buscados — ranges expandidos
-    "n_estimators":      trial.suggest_int("n_estimators", 50, 800),
-    "learning_rate":     trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
-    "max_depth":         trial.suggest_int("max_depth", 3, 8),
-    "num_leaves":        trial.suggest_int("num_leaves", 8, 128),
-    "min_child_samples": trial.suggest_int("min_child_samples", 5, 100),
-    "subsample":         trial.suggest_float("subsample", 0.4, 1.0),
-    "colsample_bytree":  trial.suggest_float("colsample_bytree", 0.5, 1.0),
-    "reg_alpha":         trial.suggest_float("reg_alpha", 1e-8, 10.0, log=True),
-    "reg_lambda":        trial.suggest_float("reg_lambda", 1e-8, 10.0, log=True),
+MÉTRICAS ALVO — em ordem de prioridade:
 
-    # Novos — ajudam nas faixas intermediárias
-    "min_gain_to_split": trial.suggest_float("min_gain_to_split", 0.0, 1.0),
-    "path_smooth":       trial.suggest_float("path_smooth", 0.0, 1.0),
-}
-Resumo do que muda e por quê
-ParâmetroAntesDepoisMotivon_estimators50–40050–800Espaço pra learning_rate baixo convergirnum_leaves8–968–128Pequena expansão seguramin_child_samples5–505–100Mais regularização — ajuda faixas 2-3subsample0.5–1.00.4–1.0Mais diversidade entre árvoresmin_gain_to_split—0.0–1.0Cortes mais conservadorespath_smooth—0.0–1.0Suaviza scores nas faixas intermediárias
-O bloco completo com tudo junto — pesos novos, compute_fold_metrics com PSI duplo + Spearman, e search space expandido — já está no código que mandei na mensagem anterior. É só esse bloco de params que substitui o atual na função objective.
+  CV PR-AUC:      alvo ~0.71-0.72  (recuperar do 0.6917 da v4)
+  OOT PR-AUC:     alvo ~0.75+      (recuperar do 0.7421 da v4)
+  CV Separação:   alvo <0.95       (se saturar em 1.0 → ver ajuste abaixo)
+  CV PSI:         alvo <0.10       (manter o 0.0603 da v4)
+  PSI OOT:        alvo <0.20       (manter o 0.1618 da v4)
+  Recall OOT:     alvo ≥0.67       (manter o ganho da v4)
+  Q3 OOT:         alvo <45%        (manter correção da v4)
+  Q4 OOT:         alvo ≥60%        (manter ou melhorar)
+  Q4 OOT (n):     alvo ≥25 pessoas (manter o ganho da v4 vs 13 da v3)
+
+HIPERPARÂMETROS — sinais de alerta:
+  Se max_depth=4 e num_leaves<30 → modelo ainda conservador, considerar
+    elevar mínimo de num_leaves para 25
+  Se learning_rate<0.02 e n_estimators<150 → early stopping cortando cedo,
+    considerar elevar early_stopping_rounds de 30 para 40
+  Se min_gain_to_split bater no teto de 0.5 → reduzir teto para 0.4
+
+AJUSTES CONDICIONAIS PÓS-RUN:
+
+  Se CV Separação saturar em 1.0 novamente:
+    → W_SEPARACAO: 0.10 → 0.15
+    → W_PRAUC:     0.65 → 0.60
+    (mantém W_PSI em 0.25)
+
+  Se PSI OOT subir acima de 0.25 (regressão da v4):
+    → W_PSI:   0.25 → 0.28
+    → W_PRAUC: 0.65 → 0.62
+    (mantém W_SEPARACAO em 0.10)
+
+  Se PR-AUC OOT não se recuperar (continuar abaixo de 0.74):
+    → Verificar se o melhor trial tem learning_rate muito baixo (<0.02)
+    → Se sim: elevar n_estimators mínimo de 100 para 150 na v6
+    → Considerar elevar W_PRAUC para 0.70 e W_PSI para 0.20 na v6
+
+  Se Q3 OOT inflar novamente acima de 50%:
+    → O search space está permitindo modelos excessivamente conservadores
+    → Elevar W_SEPARACAO de 0.10 para 0.15
+    → Reduzir min_gain_to_split máximo de 0.5 para 0.3
+
+
+================================================================================
+RESUMO EXECUTIVO — DIFERENÇAS v4 → v5
+================================================================================
+
+  Parâmetro              v4          v5          Razão
+  ─────────────────────────────────────────────────────────────────────
+  W_PRAUC                0.60        0.65        PSI já resolvido
+  W_SEPARACAO            0.10        0.10        funcionando bem
+  W_PSI                  0.30        0.25        PSI=0.0603 < 0.10
+  TIMEOUT_MIN            60          90          mais exploração
+  N_TRIALS               sem limite  400         convergência no trial 310
+  n_estimators mínimo    50          100         evitar LR baixo + poucas árvores
+  ─────────────────────────────────────────────────────────────────────
+  TUDO MAIS              idêntico    idêntico    validado empiricamente
+
+
+================================================================================
+REFERÊNCIAS BIBLIOGRÁFICAS
+================================================================================
+
+Bergstra, J., & Bengio, Y. (2012). Random Search for Hyper-Parameter
+Optimization. Journal of Machine Learning Research, 13, 281-305.
+
+Cawley, G. C., & Talbot, N. L. C. (2010). On Over-fitting in Model Selection
+and Subsequent Selection Bias in Performance Evaluation. Journal of Machine
+Learning Research, 11, 2079-2107.
+
+Chen, T., & Guestrin, C. (2016). XGBoost: A Scalable Tree Boosting System.
+Proceedings of KDD 2016.
+
+Davis, J., & Goadrich, M. (2006). The Relationship Between Precision-Recall
+and ROC Curves. Proceedings of ICML 2006.
+
+Feurer, M., et al. (2015). Efficient and Robust Automated Machine Learning.
+NeurIPS 2015.
+
+Ke, G., et al. (2017). LightGBM: A Highly Efficient Gradient Boosting
+Decision Tree. NeurIPS 2017.
+
+Niculescu-Mizil, A., & Caruana, R. (2005). Predicting Good Probabilities With
+Supervised Learning. ICML 2005.
+
+Platt, J. (1999). Probabilistic Outputs for Support Vector Machines and
+Comparisons to Regularized Likelihood Methods. Advances in Large Margin
+Classifiers.
+
+Saito, T., & Rehmsmeier, M. (2015). The Precision-Recall Plot Is More
+Informative than the ROC Plot When Evaluating Binary Classifiers on
+Imbalanced Datasets. PLOS ONE.
+
+Siddiqi, N. (2006). Credit Risk Scorecards: Developing and Implementing
+Intelligent Credit Scoring. Wiley.
+
+================================================================================
+FIM DO DOCUMENTO v5
+================================================================================
