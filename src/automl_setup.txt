@@ -223,3 +223,64 @@ Monotonia binária → Spearman contínuo: a monotonia retornava 1.0000 em todos
 PSI simples → PSI combinado (scores + taxas): o PSI atual mede se as taxas de evento mudaram entre treino e validação por faixa. O PSI de scores mede se a distribuição de onde as pessoas caem nas faixas mudou. Os dois juntos cobrem as duas formas de instabilidade que podem afetar o ordenamento no OOT.
 Dois novos hiperparâmetros no search space: min_gain_to_split e path_smooth. O path_smooth é o mais importante — suaviza as predições nas folhas das árvores, reduzindo variância especialmente nos casos ambíguos que ficam nas faixas 2 e 3.
 Nome do study atualizado: lgbm_cv_spearman_psi_duplo_60min — pra diferenciar do run anterior no MLflow e facilitar comparação.
+
+
+
+
+
+
+O que o teu código atual tem
+python"n_estimators":     suggest_int(50, 400)
+"learning_rate":    suggest_float(0.01, 0.3, log=True)
+"max_depth":        suggest_int(3, 8)
+"num_leaves":       suggest_int(8, 96)
+"min_child_samples":suggest_int(5, 50)
+"subsample":        suggest_float(0.5, 1.0)
+"colsample_bytree": suggest_float(0.5, 1.0)
+"reg_alpha":        suggest_float(1e-8, 10.0, log=True)
+"reg_lambda":       suggest_float(1e-8, 10.0, log=True)
+O que eu mudaria e por quê
+n_estimators — ampliar pra cima:
+python"n_estimators": suggest_int(50, 800)  # era 400
+Com early stopping em 30 rounds, o teto de 400 pode estar cortando configurações com learning_rate baixo que precisariam de mais árvores pra convergir. O early stopping protege de overfitting então ampliar é seguro.
+num_leaves — ampliar pra cima:
+python"num_leaves": suggest_int(8, 128)  # era 96
+Pequena expansão. Num problema com 1454 linhas de treino e 13 features, 128 folhas ainda é razoável com min_child_samples suficientemente alto.
+min_child_samples — ampliar pra cima:
+python"min_child_samples": suggest_int(5, 100)  # era 50
+Esse é o mais importante dos existentes. Com 1454 linhas, valores altos de min_child_samples (50-100) forçam o modelo a ser mais conservador nas folhas — reduz variância nas faixas intermediárias, que é exatamente o problema das faixas 2-3. O range atual de até 50 pode estar deixando o Optuna longe de configurações mais regularizadas.
+subsample — ampliar pra baixo:
+python"subsample": suggest_float(0.4, 1.0)  # era 0.5
+Permitir amostras menores por árvore aumenta diversidade entre as árvores — útil pra reduzir variância.
+Dois novos:
+python"min_gain_to_split": suggest_float(0.0, 1.0),  # novo
+"path_smooth":       suggest_float(0.0, 1.0),  # novo
+min_gain_to_split — o LightGBM só faz um split se o ganho for maior que esse valor. Valores maiores = modelo mais conservador = menos overfitting nos casos ambíguos das faixas 2-3.
+path_smooth — suaviza as predições ao longo das árvores. Reduz a diferença entre scores de casos parecidos — exatamente o que causa instabilidade nas faixas intermediárias.
+Bloco completo do search space pra mandar pro Genie
+pythonparams = {
+    # Fixos
+    "objective":         "binary",
+    "verbosity":         -1,
+    "boosting_type":     "gbdt",
+    "scale_pos_weight":  scale_pos_weight,
+    "random_state":      42,
+
+    # Hiperparâmetros buscados — ranges expandidos
+    "n_estimators":      trial.suggest_int("n_estimators", 50, 800),
+    "learning_rate":     trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
+    "max_depth":         trial.suggest_int("max_depth", 3, 8),
+    "num_leaves":        trial.suggest_int("num_leaves", 8, 128),
+    "min_child_samples": trial.suggest_int("min_child_samples", 5, 100),
+    "subsample":         trial.suggest_float("subsample", 0.4, 1.0),
+    "colsample_bytree":  trial.suggest_float("colsample_bytree", 0.5, 1.0),
+    "reg_alpha":         trial.suggest_float("reg_alpha", 1e-8, 10.0, log=True),
+    "reg_lambda":        trial.suggest_float("reg_lambda", 1e-8, 10.0, log=True),
+
+    # Novos — ajudam nas faixas intermediárias
+    "min_gain_to_split": trial.suggest_float("min_gain_to_split", 0.0, 1.0),
+    "path_smooth":       trial.suggest_float("path_smooth", 0.0, 1.0),
+}
+Resumo do que muda e por quê
+ParâmetroAntesDepoisMotivon_estimators50–40050–800Espaço pra learning_rate baixo convergirnum_leaves8–968–128Pequena expansão seguramin_child_samples5–505–100Mais regularização — ajuda faixas 2-3subsample0.5–1.00.4–1.0Mais diversidade entre árvoresmin_gain_to_split—0.0–1.0Cortes mais conservadorespath_smooth—0.0–1.0Suaviza scores nas faixas intermediárias
+O bloco completo com tudo junto — pesos novos, compute_fold_metrics com PSI duplo + Spearman, e search space expandido — já está no código que mandei na mensagem anterior. É só esse bloco de params que substitui o atual na função objective.
