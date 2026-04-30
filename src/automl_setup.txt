@@ -1,0 +1,225 @@
+Dado o que vimos nos resultados — faixa 5 perfeita, faixas 2-3 instáveis no OOT, monotonia já em 1.0000 — a lógica dos pesos é essa:
+Monotonia binária virou 1.0000 em todos os trials — o modelo aprendeu a ser monotônico trivialmente. Os 5% estão desperdiçados num sinal saturado. Precisamos substituir por Spearman, que captura grau de ordenamento, não só se é monotônico ou não.
+Recomendação de pesos:
+W_PRAUC    = 0.55  # era 0.65 — cede espaço pro Spearman
+W_SPEARMAN = 0.15  # novo — penaliza rank reversal nas faixas 2-3
+W_PSI      = 0.30  # mantém — já funcionando bem
+O Spearman com 15% é suficiente pra influenciar a seleção sem dominar. Se as faixas 2-3 continuarem instáveis após o experimento, sobe pra 0.20 e baixa PRAUC pra 0.50.
+
+Aqui está o bloco completo pra mandar pro Genie:
+pythonimport time
+import numpy as np
+import pandas as pd
+import optuna
+import lightgbm as lgb
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import average_precision_score
+from scipy.stats import spearmanr
+
+# ==============================================================
+# PESOS DO COMPOSITE — AJUSTE AQUI
+# ==============================================================
+W_PRAUC    = 0.55  # PR-AUC (desempenho)
+W_SPEARMAN = 0.15  # Spearman das faixas (ordenamento — substitui monotonia binária)
+W_PSI      = 0.30  # PSI combinado scores+taxas (estabilidade)
+
+N_FOLDS     = 5
+N_BINS      = 5
+TIMEOUT_MIN = 60
+# ==============================================================
+
+assert abs(W_PRAUC + W_SPEARMAN + W_PSI - 1.0) < 1e-6, "Pesos devem somar 1.0"
+
+
+# --------------------------------------------------------------
+# FUNÇÕES AUXILIARES
+# --------------------------------------------------------------
+
+def compute_fold_metrics(y_tr, p_tr, y_vl, p_vl, n_bins=N_BINS):
+    """
+    Retorna (spearman_score, psi_combinado) para um fold.
+
+    spearman_score : correlação de Spearman entre a taxa de positivos
+                     por faixa e a ordem esperada das faixas (0 a 1).
+                     1.0 = ordenamento perfeito faixa1 < faixa2 < ... < faixaN.
+
+    psi_combinado  : média entre PSI de taxas (instabilidade das taxas
+                     de evento por faixa) e PSI de scores (instabilidade
+                     da distribuição de scores). Ambos calculados com as
+                     bordas definidas no TREINO do fold — nunca na validação.
+    """
+    eps = 1e-4
+
+    # Bordas definidas no treino do fold
+    try:
+        _, bin_edges = pd.qcut(
+            p_tr, q=n_bins, retbins=True, duplicates='drop'
+        )
+    except ValueError:
+        return 0.0, 1.0
+
+    if len(bin_edges) - 1 < 2:
+        return 0.0, 1.0
+
+    bin_edges[0]  = -np.inf
+    bin_edges[-1] =  np.inf
+
+    # ── Taxas de positivos por faixa ──────────────────────────
+    def _rates(y, p):
+        bins = pd.cut(p, bins=bin_edges, include_lowest=True)
+        return (
+            pd.DataFrame({'t': y, 'b': bins})
+            .groupby('b', observed=False)['t']
+            .mean()
+            .fillna(0)
+            .values
+        )
+
+    r_tr = _rates(y_tr, p_tr)
+    r_vl = _rates(y_vl, p_vl)
+
+    # PSI de taxas
+    r_tr_c   = np.clip(r_tr, eps, 1 - eps)
+    r_vl_c   = np.clip(r_vl, eps, 1 - eps)
+    psi_taxas = float(np.sum((r_vl_c - r_tr_c) * np.log(r_vl_c / r_tr_c)))
+
+    # ── Distribuição de scores por faixa ──────────────────────
+    e = pd.cut(p_tr, bins=bin_edges, include_lowest=True)
+    a = pd.cut(p_vl, bins=bin_edges, include_lowest=True)
+
+    e_pct = e.value_counts(normalize=True, sort=False).clip(eps, 1 - eps)
+    a_pct = (
+        a.value_counts(normalize=True, sort=False)
+        .reindex(e_pct.index, fill_value=0)
+        .clip(eps, 1 - eps)
+    )
+    psi_scores = float(np.sum((a_pct - e_pct) * np.log(a_pct / e_pct)))
+
+    # PSI combinado
+    psi_combinado = 0.5 * psi_taxas + 0.5 * psi_scores
+
+    # ── Spearman das taxas da validação vs ordem esperada ─────
+    # Ordem esperada: faixa 1 < faixa 2 < ... < faixa N
+    expected_order = np.arange(len(r_vl))
+    if np.std(r_vl) < 1e-6:
+        # Todas as taxas iguais — ordenamento impossível de avaliar
+        spearman_score = 0.0
+    else:
+        corr, _ = spearmanr(r_vl, expected_order)
+        spearman_score = float(max(0.0, corr))  # clip em 0: inversão total = 0
+
+    return spearman_score, psi_combinado
+
+
+# --------------------------------------------------------------
+# FUNÇÃO OBJETIVO — OPTUNA
+# --------------------------------------------------------------
+
+def objective(trial):
+
+    params = {
+        "objective":        "binary",
+        "verbosity":        -1,
+        "boosting_type":    "gbdt",
+        "scale_pos_weight": scale_pos_weight,
+        "random_state":     42,
+        # Hiperparâmetros buscados
+        "n_estimators":     trial.suggest_int("n_estimators", 50, 400),
+        "learning_rate":    trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
+        "max_depth":        trial.suggest_int("max_depth", 3, 8),
+        "num_leaves":       trial.suggest_int("num_leaves", 8, 96),
+        "min_child_samples":trial.suggest_int("min_child_samples", 5, 50),
+        "subsample":        trial.suggest_float("subsample", 0.5, 1.0),
+        "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
+        "reg_alpha":        trial.suggest_float("reg_alpha", 1e-8, 10.0, log=True),
+        "reg_lambda":       trial.suggest_float("reg_lambda", 1e-8, 10.0, log=True),
+        # Novos — ajudam nas faixas intermediárias
+        "min_gain_to_split":trial.suggest_float("min_gain_to_split", 0.0, 1.0),
+        "path_smooth":      trial.suggest_float("path_smooth", 0.0, 1.0),
+    }
+
+    skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=42)
+    fold_pr, fold_spearman, fold_psi = [], [], []
+
+    for tr_idx, vl_idx in skf.split(X_train_proc, y_train):
+        X_tr = X_train_proc[tr_idx]
+        X_vl = X_train_proc[vl_idx]
+        y_tr = y_train.values[tr_idx]
+        y_vl = y_train.values[vl_idx]
+
+        mdl = lgb.LGBMClassifier(**params)
+        mdl.fit(
+            X_tr, y_tr,
+            eval_set=[(X_vl, y_vl)],
+            callbacks=[
+                lgb.early_stopping(30, verbose=False),
+                lgb.log_evaluation(0),
+            ],
+        )
+
+        p_tr = mdl.predict_proba(X_tr)[:, 1]
+        p_vl = mdl.predict_proba(X_vl)[:, 1]
+
+        fold_pr.append(average_precision_score(y_vl, p_vl))
+
+        spearman, psi = compute_fold_metrics(y_tr, p_tr, y_vl, p_vl)
+        fold_spearman.append(spearman)
+        fold_psi.append(psi)
+
+    mean_pr       = float(np.mean(fold_pr))
+    mean_spearman = float(np.mean(fold_spearman))
+    mean_psi      = float(np.mean(fold_psi))
+
+    # PSI vira score: menor PSI = melhor score (clip 0-1)
+    psi_score = float(np.clip(1 - mean_psi, 0, 1))
+
+    composite = (
+        W_PRAUC    * mean_pr
+        + W_SPEARMAN * mean_spearman
+        + W_PSI      * psi_score
+    )
+
+    trial.set_user_attr("cv_pr_auc",   round(mean_pr,       4))
+    trial.set_user_attr("cv_spearman", round(mean_spearman, 4))
+    trial.set_user_attr("cv_psi",      round(mean_psi,      4))
+
+    return composite
+
+
+# --------------------------------------------------------------
+# EXECUÇÃO
+# --------------------------------------------------------------
+
+print(f"Composite = {W_PRAUC:.0%} PR-AUC  "
+      f"+ {W_SPEARMAN:.0%} Spearman  "
+      f"+ {W_PSI:.0%} (1-PSI combinado)")
+print(f"CV: {N_FOLDS}-fold StratifiedKFold, timeout {TIMEOUT_MIN} min")
+
+optuna.logging.set_verbosity(optuna.logging.WARNING)
+study = optuna.create_study(
+    direction="maximize",
+    study_name="lgbm_cv_spearman_psi_duplo_60min"
+)
+
+t0 = time.time()
+study.optimize(objective, timeout=TIMEOUT_MIN * 60, show_progress_bar=True)
+elapsed   = time.time() - t0
+n_completed = len([t for t in study.trials if t.state.name == "COMPLETE"])
+
+best = study.best_trial
+print(f"\n{'='*65}")
+print(f"Concluído em {elapsed/60:.1f} min ({n_completed} trials × {N_FOLDS} folds)")
+print(f"{'='*65}")
+print(f"Best composite:   {best.value:.4f}")
+print(f"  ├─ CV PR-AUC:   {best.user_attrs['cv_pr_auc']:.4f}")
+print(f"  ├─ CV Spearman: {best.user_attrs['cv_spearman']:.4f}  "
+      f"{'✅' if best.user_attrs['cv_spearman'] > 0.90 else '⚠️'}")
+print(f"  └─ CV PSI:      {best.user_attrs['cv_psi']:.4f}  "
+      f"{'✅' if best.user_attrs['cv_psi'] < 0.10 else '⚠️' if best.user_attrs['cv_psi'] < 0.25 else '❌'}")
+print(f"\nBest params: {best.params}")
+
+O que mudou em relação ao código atual e por quê
+Monotonia binária → Spearman contínuo: a monotonia retornava 1.0000 em todos os trials porque qualquer modelo com tendência geral crescente passava. O Spearman mede o grau de correlação entre as taxas reais das faixas e a ordem esperada — um modelo com faixa 3 maior que faixa 4 recebe Spearman menor, não apenas "passou ou não passou".
+PSI simples → PSI combinado (scores + taxas): o PSI atual mede se as taxas de evento mudaram entre treino e validação por faixa. O PSI de scores mede se a distribuição de onde as pessoas caem nas faixas mudou. Os dois juntos cobrem as duas formas de instabilidade que podem afetar o ordenamento no OOT.
+Dois novos hiperparâmetros no search space: min_gain_to_split e path_smooth. O path_smooth é o mais importante — suaviza as predições nas folhas das árvores, reduzindo variância especialmente nos casos ambíguos que ficam nas faixas 2 e 3.
+Nome do study atualizado: lgbm_cv_spearman_psi_duplo_60min — pra diferenciar do run anterior no MLflow e facilitar comparação.
