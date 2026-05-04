@@ -454,3 +454,63 @@ Intelligent Credit Scoring. Wiley.
 ================================================================================
 FIM DO DOCUMENTO v6
 ================================================================================
+
+import pandas as pd
+
+def add_lift_features(df_fit: pd.DataFrame, target_col: str, df_transform: pd.DataFrame = None, cat_cols: list = None):
+    """
+    Gera as colunas pf__{col}__lift para uso fora do framework (ex: Databricks AutoML).
+    
+    Parâmetros:
+    - df_fit: DataFrame usado para APRENDER as regras de Lift (idealmente seu conjunto de treino).
+    - target_col: Nome da variável resposta.
+    - df_transform: DataFrame onde as colunas serão CRIADAS. Se None, aplica no próprio df_fit.
+    - cat_cols: Lista de features categóricas que sobreviveram. Se None, detecta automaticamente.
+    
+    Retorna:
+    - df_out: DataFrame com as novas colunas de Lift criadas.
+    - lift_maps: Dicionário contendo os mapas (salve isso para o deploy/inferência).
+    """
+    # Se não passou base de transformação, aplica na própria base de treino
+    if df_transform is None:
+        df_transform = df_fit.copy()
+    else:
+        df_transform = df_transform.copy()
+        
+    # Auto-detecta colunas se não for passado (foca nas não-binárias)
+    if cat_cols is None:
+        cat_cols = [c for c in df_fit.select_dtypes(include=["object", "category"]).columns if c != target_col]
+        cat_cols = [c for c in cat_cols if df_fit[c].nunique(dropna=True) > 2]
+        
+    if not cat_cols:
+        print("Nenhuma coluna categórica elegível encontrada.")
+        return df_transform, {}
+
+    # 1. Calcula a taxa geral na base de referência (df_fit)
+    y_series = df_fit[target_col]
+    y_num = y_series if pd.api.types.is_numeric_dtype(y_series) else y_series.astype('category').cat.codes
+    
+    taxa_geral = y_num.mean()
+    if taxa_geral == 0: 
+        taxa_geral = 1e-9 # Evita divisão por zero
+        
+    lift_maps = {}
+    
+    # 2. Calcula e aplica o Lift
+    for col in cat_cols:
+        if col not in df_transform.columns:
+            continue
+            
+        feat_name = f"pf__{col}__lift"
+        
+        # APRENDE (Fit): Calcula o lift olhando apenas para o df_fit
+        lift_series = y_num.groupby(df_fit[col]).mean() / taxa_geral
+        lift_map = lift_series.to_dict()
+        lift_maps[feat_name] = lift_map
+        
+        # APLICA (Transform): Mapeia os valores na base de destino
+        # fillna(1.0) garante que categorias inéditas tenham peso neutro (Lift de 1.0 = risco igual à média)
+        df_transform[feat_name] = df_transform[col].map(lift_map).fillna(1.0)
+        
+    print(f"✅ {len(lift_maps)} colunas de Lift criadas com sucesso!")
+    return df_transform, lift_maps
