@@ -456,61 +456,68 @@ FIM DO DOCUMENTO v6
 ================================================================================
 
 import pandas as pd
+import numpy as np
 
-def add_lift_features(df_fit: pd.DataFrame, target_col: str, df_transform: pd.DataFrame = None, cat_cols: list = None):
+def fit_lift_features(df_train: pd.DataFrame, target_col: str, cat_cols: list = None):
     """
-    Gera as colunas pf__{col}__lift para uso fora do framework (ex: Databricks AutoML).
-    
-    Parâmetros:
-    - df_fit: DataFrame usado para APRENDER as regras de Lift (idealmente seu conjunto de treino).
-    - target_col: Nome da variável resposta.
-    - df_transform: DataFrame onde as colunas serão CRIADAS. Se None, aplica no próprio df_fit.
-    - cat_cols: Lista de features categóricas que sobreviveram. Se None, detecta automaticamente.
-    
-    Retorna:
-    - df_out: DataFrame com as novas colunas de Lift criadas.
-    - lift_maps: Dicionário contendo os mapas (salve isso para o deploy/inferência).
+    APRENDE as regras de Lift apenas no Treino e retorna o DF transformado e o mapa de regras.
     """
-    # Se não passou base de transformação, aplica na própria base de treino
-    if df_transform is None:
-        df_transform = df_fit.copy()
-    else:
-        df_transform = df_transform.copy()
-        
-    # Auto-detecta colunas se não for passado (foca nas não-binárias)
+    df_out = df_train.copy()
+    
+    # Se não passar a lista, ele auto-detecta as categóricas (ignorando binárias)
     if cat_cols is None:
-        cat_cols = [c for c in df_fit.select_dtypes(include=["object", "category"]).columns if c != target_col]
-        cat_cols = [c for c in cat_cols if df_fit[c].nunique(dropna=True) > 2]
+        cat_cols = [c for c in df_train.select_dtypes(include=["object", "category"]).columns if c != target_col]
+        cat_cols = [c for c in cat_cols if df_train[c].nunique(dropna=True) > 2]
         
-    if not cat_cols:
-        print("Nenhuma coluna categórica elegível encontrada.")
-        return df_transform, {}
-
-    # 1. Calcula a taxa geral na base de referência (df_fit)
-    y_series = df_fit[target_col]
+    # Garante que o target é numérico para a matemática
+    y_series = df_train[target_col]
     y_num = y_series if pd.api.types.is_numeric_dtype(y_series) else y_series.astype('category').cat.codes
     
     taxa_geral = y_num.mean()
     if taxa_geral == 0: 
-        taxa_geral = 1e-9 # Evita divisão por zero
+        taxa_geral = 1e-9
         
     lift_maps = {}
     
-    # 2. Calcula e aplica o Lift
     for col in cat_cols:
-        if col not in df_transform.columns:
+        if col not in df_out.columns: 
             continue
             
         feat_name = f"pf__{col}__lift"
         
-        # APRENDE (Fit): Calcula o lift olhando apenas para o df_fit
-        lift_series = y_num.groupby(df_fit[col]).mean() / taxa_geral
+        # 1. APRENDE: Média do target por categoria / Média geral
+        lift_series = y_num.groupby(df_train[col]).mean() / taxa_geral
         lift_map = lift_series.to_dict()
-        lift_maps[feat_name] = lift_map
         
-        # APLICA (Transform): Mapeia os valores na base de destino
-        # fillna(1.0) garante que categorias inéditas tenham peso neutro (Lift de 1.0 = risco igual à média)
-        df_transform[feat_name] = df_transform[col].map(lift_map).fillna(1.0)
+        # Salva a regra de forma estruturada
+        lift_maps[feat_name] = {
+            "coluna_original": col, 
+            "mapa": lift_map
+        }
         
-    print(f"✅ {len(lift_maps)} colunas de Lift criadas com sucesso!")
-    return df_transform, lift_maps
+        # 2. APLICA NO TREINO
+        df_out[feat_name] = df_out[col].map(lift_map).fillna(1.0)
+        
+    print(f"✅ {len(lift_maps)} regras de Lift aprendidas no Treino!")
+    return df_out, lift_maps
+
+
+def transform_lift_features(df_alvo: pd.DataFrame, lift_maps: dict):
+    """
+    APLICA as regras (aprendidas no Treino) em qualquer outra base (Teste, OOT, Produção).
+    """
+    df_out = df_alvo.copy()
+    
+    for feat_name, info in lift_maps.items():
+        col = info["coluna_original"]
+        mapa = info["mapa"]
+        
+        if col in df_out.columns:
+            # fillna(1.0) é o pulo do gato: se no OOT aparecer uma categoria 
+            # que não existia no treino, ela ganha Lift 1.0 (Risco Neutro/Média)
+            df_out[feat_name] = df_out[col].map(mapa).fillna(1.0)
+        else:
+            # Se a coluna inteira sumir por algum motivo, fica neutro
+            df_out[feat_name] = 1.0 
+            
+    return df_out
