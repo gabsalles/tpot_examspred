@@ -521,3 +521,20 @@ def transform_lift_features(df_alvo: pd.DataFrame, lift_maps: dict):
             df_out[feat_name] = 1.0 
             
     return df_out
+
+
+# Supondo que você já tem suas listas de colunas que o Boruta mandou manter
+colunas_sobreviventes = ['estado_civil', 'profissao', 'cidade', 'segmento']
+
+# PASSO 1: Aprende as regras no df_treino e já cria as colunas nele
+df_treino_automl, regras_de_lift = fit_lift_features(
+    df_train=df_treino, 
+    target_col='target', 
+    cat_cols=colunas_sobreviventes
+)
+
+# PASSO 2: Usa o dicionário (regras_de_lift) para aplicar a MESMA régua no Teste
+df_teste_automl = transform_lift_features(df_teste, regras_de_lift)
+
+# PASSO 3: Usa o dicionário para aplicar a MESMA régua no OOT
+df_oot_automl = transform_lift_features(df_oot, regras_de_lift)
