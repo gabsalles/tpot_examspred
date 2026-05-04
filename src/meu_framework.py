@@ -1,3 +1,35 @@
+# v0.2.8 Gemini
+#   [v0.2.8] CHANGE: _compute_profile_features abandona a criação de N tokens binários
+#                    por categoria (sparse arrays) e passa a utilizar um único vetor
+#                    contínuo de Lift (Target Encoding) por variável categórica.
+#   [v0.2.8] CHANGE: TransformPipeline e _apply_profile_features atualizados para a nova
+#                    lógica de mapeamento de lift, mantendo retrocompatibilidade total
+#                    com bundles (.pkl) exportados em versões anteriores (fallback binário).
+#   [v0.2.8] TUNE: Redução drástica da dimensionalidade gerada pela engenharia de features,
+#                  acelerando significativamente o tempo de processamento do Boruta e AutoGluon.
+# v0.2.7 Claude
+#   [v0.2.7] FIX: _get_decile_stats — bordas ±inf ao aplicar cut_edges do treino
+#                 no teste/OOT. Sem isso, scores fora do range do treino viravam
+#                 NaN silenciosos e sumiam da agregação dos decis (bug visual sutil
+#                 no gráfico de estabilidade).
+#   [v0.2.7] CHANGE: Removida a visão "Cada dataset usa seus próprios percentis"
+#                    do relatório (gráfico de decil de performance). Mantido apenas
+#                    o gráfico de estabilidade (treino e teste seguindo as mesmas
+#                    bordas do treino), que é o que importa pra monitoramento.
+# v0.2.6 Claude
+#   [v0.2.6] CHANGE: oot_psi_filter agora usa method="traditional" (linspace +
+#                    1e-10) por DEFAULT — alinhado com calculate_csi e padrão
+#                    indústria de credit scoring. Threshold 0.25 agora é
+#                    consistente entre filtro e auditoria pós-modelo.
+#   [v0.2.6] NEW: param oot_psi_method aceita "traditional" ou "modern"
+#                 (quantis + epsilon, comportamento anterior do v0.2.4).
+# v0.2.5 Claude
+#   [v0.2.5] NEW: calculate_csi() — auditoria pós-modelo com metodologia
+#                 linspace + 1e-10 (estilo credit scoring tradicional). Independente
+#                 do _compute_psi do filtro (quantis + 1e-6 somado). Usar em sequência
+#                 dá validação cruzada — divergência indica skew/cauda problemática.
+#   [v0.2.5] NEW: get_feature_types() — separa selected_features em contínuas e
+#                 categóricas usando o _train_schema, pronto pra alimentar calculate_csi.
 # v0.2.4 Claude
 #   [v0.2.4] NEW: oot_psi_filter — filtro de estabilidade vs Out-of-Time.
 #                 Aplica FE no OOT, faz split interno do treino, calcula PSI por
@@ -132,7 +164,7 @@ try:
 except ImportError:
     _HAS_TARGET_ENCODER = False
 
-_FRAMEWORK_VERSION = "0.2.4"
+_FRAMEWORK_VERSION = "0.2.8"
 
 # Cores canônicas para treino/teste — alta distinção visual e para daltônicos
 _COLOR_TRAIN = "#F06000"  # laranja-forte
@@ -1009,16 +1041,28 @@ class TransformPipeline:
     def _step_profile_features(self, df: pd.DataFrame) -> pd.DataFrame:
         if not self._profile_features:
             return df
+
         df = df.copy()
         for spec in self._profile_features:
             col = spec["col"]
-            val_token = spec["val_token"]
             feat_name = spec["feat_name"]
-            if col not in df.columns:
-                df[feat_name] = 0
-                continue
-            col_tokenized = self._to_token(df[col].astype("object"))
-            df[feat_name] = (col_tokenized == val_token).astype(int)
+            lift_map = spec.get("lift_map")
+
+            if lift_map is not None:
+                # Nova lógica de Lift Contínuo
+                if col not in df.columns:
+                    df[feat_name] = 1.0
+                    continue
+                df[feat_name] = df[col].map(lift_map).fillna(1.0)
+            else:
+                # Fallback legado para .pkl exportados em versões anteriores
+                val_token = spec.get("val_token", "")
+                if col not in df.columns:
+                    df[feat_name] = 0
+                    continue
+                col_tokenized = self._to_token(df[col].astype("object"))
+                df[feat_name] = (col_tokenized == val_token).astype(int)
+
         return df
 
     def _step_select_and_warn(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -1526,25 +1570,73 @@ class AutoClassificationEngine:
         actual: pd.Series,
         n_bins: int = 10,
         eps: float = 1e-6,
+        method: str = "traditional",
     ) -> float:
         """
         PSI = Σ (actual% - expected%) * ln(actual% / expected%)
 
-        - Numéricas: bins por quantis do `expected`, aplicados em ambos.
-        - Categóricas (object/category/bool): cada categoria é um bin.
-        - NaN tratado como bin separado em ambos os casos.
+        Parâmetros
+        ----------
+        method : "traditional" ou "modern"
+            - "traditional" (default): linspace(min, max) + 1e-10 em bins zerados
+              para numéricas; outer-join + fillna(1e-10) para categóricas. Mesma
+              metodologia do calculate_csi. Threshold 0.25 = padrão indústria.
+            - "modern": quantis para numéricas + epsilon somado em todos os bins.
+              Mais robusto a skew, mas mais permissivo (PSI menor para a mesma
+              divergência real).
+
+        Comum aos dois métodos:
+        - NaN é dropado em numéricas, vira bin "__NaN__" em categóricas.
         - Retorna 0.0 se a coluna for constante ou tiver dados insuficientes.
         """
         expected_clean = expected.dropna()
         if len(expected_clean) == 0 or expected_clean.nunique() < 2:
             return 0.0
 
-        # Detecção robusta: numérica = numeric & not bool. Resto = categórica.
         is_numeric = pd.api.types.is_numeric_dtype(
             expected
         ) and not pd.api.types.is_bool_dtype(expected)
         is_categorical = not is_numeric
 
+        # ===== TRADITIONAL: linspace + 1e-10 em bins zerados =====
+        if method == "traditional":
+            if is_categorical:
+                e = expected.fillna("__NaN__").astype(str)
+                a = actual.fillna("__NaN__").astype(str)
+                tr = e.value_counts().reset_index()
+                tr.columns = ["cat", "ref_freq"]
+                tr["ref_freq"] = tr["ref_freq"] / tr["ref_freq"].sum()
+                te = a.value_counts().reset_index()
+                te.columns = ["cat", "cur_freq"]
+                te["cur_freq"] = te["cur_freq"] / te["cur_freq"].sum()
+                df_join = pd.merge(tr, te, on="cat", how="outer").fillna(1e-10)
+                psi = (
+                    (df_join["cur_freq"] - df_join["ref_freq"])
+                    * np.log(df_join["cur_freq"] / df_join["ref_freq"])
+                ).sum()
+                return float(psi)
+
+            # Numérica
+            ref_arr = expected_clean.values
+            cur_arr = actual.dropna().values
+            if len(cur_arr) == 0:
+                return 0.0
+
+            try:
+                bin_edges = np.linspace(ref_arr.min(), ref_arr.max(), n_bins + 1)
+                ref_counts, _ = np.histogram(ref_arr, bins=bin_edges)
+                cur_counts, _ = np.histogram(cur_arr, bins=bin_edges)
+            except Exception:
+                return 0.0
+
+            ref_freq = ref_counts / len(ref_arr)
+            cur_freq = cur_counts / len(cur_arr)
+            ref_freq = np.where(ref_freq == 0, 1e-10, ref_freq)
+            cur_freq = np.where(cur_freq == 0, 1e-10, cur_freq)
+            psi = np.sum((cur_freq - ref_freq) * np.log(cur_freq / ref_freq))
+            return float(psi)
+
+        # ===== MODERN: quantis + epsilon somado =====
         if is_categorical:
             e = expected.fillna("__NaN__").astype(str)
             a = actual.fillna("__NaN__").astype(str)
@@ -1557,7 +1649,6 @@ class AutoClassificationEngine:
                 cutoffs = np.unique(expected_clean.quantile(qs).values)
                 if len(cutoffs) < 2:
                     return 0.0
-                # Bordas amplas pra capturar outliers do OOT
                 cutoffs[0] = -np.inf
                 cutoffs[-1] = np.inf
             except Exception:
@@ -1585,6 +1676,7 @@ class AutoClassificationEngine:
         n_bins: int = 10,
         train_size: float = 0.7,
         random_state: int = 42,
+        method: str = "traditional",
     ) -> tuple:
         """
         Calcula PSI feature a feature comparando split interno do treino vs OOT.
@@ -1595,7 +1687,9 @@ class AutoClassificationEngine:
         """
         from sklearn.model_selection import train_test_split
 
-        print(f"\n📐 --- OOT PSI FILTER (threshold={threshold}, bins={n_bins}) ---")
+        print(
+            f"\n📐 --- OOT PSI FILTER (method={method}, threshold={threshold}, bins={n_bins}) ---"
+        )
 
         # 1. Carrega OOT
         df_oot = self._load_oot_data(df_oot_raw)
@@ -1636,7 +1730,10 @@ class AutoClassificationEngine:
         for col in sorted(common_feats):
             try:
                 psi = self._compute_psi(
-                    df_baseline[col], df_oot_proc[col], n_bins=n_bins
+                    df_baseline[col],
+                    df_oot_proc[col],
+                    n_bins=n_bins,
+                    method=method,
                 )
                 psi_dict[col] = psi
             except Exception as e:
@@ -1714,6 +1811,207 @@ class AutoClassificationEngine:
             df_rep = df_rep.head(top_n).reset_index(drop=True)
 
         return df_rep
+
+    # -----------------------------------------------------------------------
+    # 1.c CSI AUDIT — Auditoria pós-modelo (metodologia tradicional) [NEW v0.2.5]
+    # -----------------------------------------------------------------------
+
+    def get_feature_types(self) -> dict:
+        """
+        Separa self.selected_features em contínuas e categóricas usando o
+        _train_schema (capturado no fim do fit_selection).
+
+        Pronto pra alimentar calculate_csi:
+
+            ft = engine.get_feature_types()
+            engine.calculate_csi(
+                reference_df=train_df,
+                current_df=oot_df,
+                cols_cont=ft['continuas'],
+                cols_cat=ft['categoricas'],
+            )
+
+        Retorna
+        -------
+        dict com chaves 'continuas' e 'categoricas'.
+        """
+        if not self._train_schema:
+            raise RuntimeError("_train_schema vazio. Execute fit_selection() antes.")
+
+        continuas, categoricas = [], []
+        for feat in self.selected_features:
+            dtype = self._train_schema.get(feat, "")
+            # Numéricas: int*, float*, bool é tratado como categórica binária
+            if dtype.startswith(("int", "float", "uint")) and not dtype.startswith(
+                "bool"
+            ):
+                continuas.append(feat)
+            else:
+                categoricas.append(feat)
+
+        return {"continuas": continuas, "categoricas": categoricas}
+
+    def calculate_csi(
+        self,
+        reference_df: pd.DataFrame,
+        current_df: pd.DataFrame,
+        bins: int = 10,
+        cols_cont: Optional[list] = None,
+        cols_cat: Optional[list] = None,
+        styled: bool = False,
+        apply_pre_selection_transformations: bool = False,
+    ):
+        """
+        Auditoria de CSI com metodologia tradicional (linspace + 1e-10).
+
+        Independente do _compute_psi usado no oot_psi_filter (quantis + 1e-6).
+        Usar em sequência dá validação cruzada:
+        - PSI baixo no filtro + CSI alto aqui → skew/cauda amplifica linspace
+        - Ambos altos → instabilidade real
+        - Ambos baixos → feature genuinamente estável
+
+        Parâmetros
+        ----------
+        reference_df : DataFrame de referência (ex: treino)
+        current_df : DataFrame atual (ex: OOT/teste)
+        bins : número de bins de largura igual para contínuas (default 10)
+        cols_cont, cols_cat : listas de features. Se None, usa
+            get_feature_types() automaticamente sobre selected_features.
+        styled : se True, retorna Styler com gradiente de cor
+        apply_pre_selection_transformations : se True, aplica todo o FE em
+            ambos os DataFrames antes de calcular (útil quando os dfs estão
+            crus, sem nenhuma transformação aplicada).
+
+        Retorna
+        -------
+        pd.DataFrame com colunas [variavel, csi, tipo], ordenado desc por csi.
+        Se styled=True, retorna pd.io.formats.style.Styler.
+        """
+        # 1. Features default = sobreviventes do fit_selection
+        if cols_cont is None and cols_cat is None:
+            ft = self.get_feature_types()
+            cols_cont = ft["continuas"]
+            cols_cat = ft["categoricas"]
+        else:
+            cols_cont = cols_cont or []
+            cols_cat = cols_cat or []
+
+        # 2. Aplica FE se solicitado (tipicamente quando se passa df cru)
+        if apply_pre_selection_transformations:
+            ref = self._apply_pre_selection_transformations(reference_df)
+            cur = self._apply_pre_selection_transformations(current_df)
+        else:
+            ref = reference_df
+            cur = current_df
+
+        # 3. Contínuas — linspace(min, max) + 1e-10 em bins zerados
+        df_continuas = pd.DataFrame()
+        for col in cols_cont:
+            try:
+                if col not in ref.columns or col not in cur.columns:
+                    warnings.warn(
+                        f"[calculate_csi] '{col}' ausente em ref ou cur. Pulada."
+                    )
+                    continue
+
+                reference = ref[col].dropna().values
+                current = cur[col].dropna().values
+
+                if len(reference) == 0 or len(current) == 0:
+                    warnings.warn(f"Variável contínua '{col}' sem dados suficientes.")
+                    continue
+
+                bin_edges = np.linspace(reference.min(), reference.max(), bins + 1)
+                # --- FIX PARA NÃO DELETAR OUTLIERS DO OOT ---
+                bin_edges[0] = -np.inf
+                bin_edges[-1] = np.inf
+                # --------------------------------------------
+
+                ref_counts, _ = np.histogram(reference, bins=bin_edges)
+                cur_counts, _ = np.histogram(current, bins=bin_edges)
+
+                ref_freq = ref_counts / len(reference)
+                cur_freq = cur_counts / len(current)
+
+                ref_freq = np.where(ref_freq == 0, 1e-10, ref_freq)
+                cur_freq = np.where(cur_freq == 0, 1e-10, cur_freq)
+
+                csi_value = np.sum((cur_freq - ref_freq) * np.log(cur_freq / ref_freq))
+
+                df_continuas = pd.concat(
+                    [
+                        df_continuas,
+                        pd.DataFrame({"variavel": [col], "csi": [csi_value]}),
+                    ],
+                    ignore_index=True,
+                )
+            except Exception as e:
+                warnings.warn(
+                    f"Erro ao calcular CSI para variável contínua '{col}': {e}"
+                )
+
+        if not df_continuas.empty:
+            df_continuas["tipo"] = "contínua"
+        else:
+            df_continuas = pd.DataFrame(columns=["variavel", "csi", "tipo"])
+
+        # 4. Categóricas — outer join + fillna(1e-10) sem epsilon adicional
+        df_categoricas = pd.DataFrame()
+        ref_cat = ref[cols_cat].copy() if cols_cat else pd.DataFrame()
+        cur_cat = cur[cols_cat].copy() if cols_cat else pd.DataFrame()
+
+        if cols_cat:
+            ref_cat = ref_cat.astype(str)
+            cur_cat = cur_cat.astype(str)
+
+            for col in cols_cat:
+                try:
+                    if col not in ref_cat.columns or col not in cur_cat.columns:
+                        warnings.warn(
+                            f"[calculate_csi] '{col}' ausente em ref ou cur. Pulada."
+                        )
+                        continue
+
+                    tr = ref_cat.groupby(col).size().reset_index(name="ref_freq")
+                    tr["ref_freq"] = tr["ref_freq"] / tr["ref_freq"].sum()
+
+                    te = cur_cat.groupby(col).size().reset_index(name="cur_freq")
+                    te["cur_freq"] = te["cur_freq"] / te["cur_freq"].sum()
+
+                    df_join = pd.merge(tr, te, on=col, how="outer").fillna(1e-10)
+                    df_join["csi"] = (
+                        df_join["cur_freq"] - df_join["ref_freq"]
+                    ) * np.log(df_join["cur_freq"] / df_join["ref_freq"])
+
+                    csi_value = df_join["csi"].sum()
+
+                    df_categoricas = pd.concat(
+                        [
+                            df_categoricas,
+                            pd.DataFrame({"variavel": [col], "csi": [csi_value]}),
+                        ],
+                        ignore_index=True,
+                    )
+                except Exception as e:
+                    warnings.warn(
+                        f"Erro ao calcular CSI para variável categórica '{col}': {e}"
+                    )
+
+        if not df_categoricas.empty:
+            df_categoricas["tipo"] = "categórica"
+        else:
+            df_categoricas = pd.DataFrame(columns=["variavel", "csi", "tipo"])
+
+        # 5. Concat + ordena
+        csi = pd.concat([df_continuas, df_categoricas], ignore_index=True)
+        csi = csi.sort_values(by="csi", ascending=False).reset_index(drop=True)
+
+        if styled:
+            return csi.style.format({"csi": "{:.6f}"}).background_gradient(
+                subset=["csi"], cmap="Reds"
+            )
+
+        return csi
 
     def _run_boruta_selection(
         self,
@@ -2419,108 +2717,54 @@ class AutoClassificationEngine:
 
     def _compute_profile_features(self, df_with_target: pd.DataFrame) -> list:
         """
-        Roda ProfileAnalyzer agrupado pelo target e extrai tokens de maior lift
-        por classe. Retorna lista de specs de features binárias a criar.
-
-        Restringe análise a colunas categóricas/object — comparações de
-        igualdade exata em numéricas contínuas não fazem sentido.
-
-        Colunas binárias (<=2 valores únicos) são ignoradas — criar pf__ de uma
-        coluna binária seria redundante pois a coluna original já carrega a info.
-
-        Parâmetros consumidos de self.params
-        ------------------------------------
-        profile_min_lift         : float = 2.0
-        profile_topn_per_group   : int   = 5
-        profile_min_support_pct  : float = 0.05
-        profile_one_per_col      : bool  = True
-        profile_max_features     : int   = 20
+        Cria features contínuas de lift (Target Encoding) por variável categórica.
+        Substitui a lógica antiga de N tokens binários por uma única coluna contínua de Lift.
         """
-        min_lift = self.params.get("profile_min_lift", 2.0)
-        topn = self.params.get("profile_topn_per_group", 5)
-        min_sup = self.params.get("profile_min_support_pct", 0.05)
-        one_per_col = self.params.get("profile_one_per_col", True)
-        max_feats = self.params.get("profile_max_features", 20)
-
         cat_cols = df_with_target.select_dtypes(
             include=["object", "category"]
         ).columns.tolist()
         cat_cols = [c for c in cat_cols if c != self.target]
 
-        # [v0.2.1] Ignora colunas binárias — criar pf__ seria redundante
+        # Ignora colunas binárias para evitar redundância
         cat_cols = [c for c in cat_cols if df_with_target[c].nunique(dropna=True) > 2]
 
         if not cat_cols:
-            warnings.warn(
-                "[ProfileFeatures] Nenhuma coluna categórica não-binária encontrada. "
-                "Nenhuma feature de perfil será criada.",
-                UserWarning,
-            )
             return []
 
-        non_cat = [
-            c for c in df_with_target.columns if c not in cat_cols and c != self.target
-        ]
+        # Garante que o target seja numérico para o cálculo da média (taxa_geral)
+        y_series = df_with_target[self.target]
+        if pd.api.types.is_numeric_dtype(y_series):
+            y_num = y_series
+        else:
+            y_num = y_series.astype("category").cat.codes
 
-        pa = ProfileAnalyzer(
-            df=df_with_target,
-            group_mode="existing",
-            group_col=self.target,
-            label_col=self.target,
-            exclude_cols=non_cat,
-            binarize=False,
-            max_unique_ratio=0.5,
-        )
-        pa.fit(verbose=False)
+        taxa_geral = y_num.mean()
+        if taxa_geral == 0:
+            taxa_geral = 1e-9  # Evita divisão por zero silenciosa
 
-        seen_tokens = set()
+        # Prepara df temporário para o agrupamento seguro
+        df_calc = df_with_target[cat_cols].copy()
+        df_calc["__target__"] = y_num.values
+
         feature_specs = []
+        for col in cat_cols:
+            feat_name = f"pf__{col}__lift"
 
-        for g in sorted(pa.groups_, key=str):
-            if len(feature_specs) >= max_feats:
-                break
+            # Lógica central: Lift = Média do Target no grupo / Taxa Geral
+            lift_series = df_calc.groupby(col)["__target__"].mean() / taxa_geral
+            lift_map = lift_series.to_dict()
 
-            df_p = pa.profile_group(
-                g,
-                topn=topn,
-                min_lift=min_lift,
-                min_support_pct=min_sup,
-                one_per_col=one_per_col,
-                include_raw=True,
+            feature_specs.append(
+                {
+                    "col": col,
+                    "feat_name": feat_name,
+                    "lift_map": lift_map,  # Novo core da lógica
+                    "val_token": "Lift Encoding",  # Mock para não quebrar o get_profile_features_report()
+                    "group": "all",
+                    "lift": float(lift_series.max()) if not lift_series.empty else 1.0,
+                    "pct_in": 1.0,
+                }
             )
-            if df_p.empty:
-                continue
-
-            df_p = df_p.sort_values("Lift", ascending=False)
-
-            for _, row in df_p.iterrows():
-                if len(feature_specs) >= max_feats:
-                    break
-
-                raw = row.get("Token_raw", "")
-                if not raw or raw in seen_tokens:
-                    continue
-                seen_tokens.add(raw)
-
-                parts = raw.split("___", 1)
-                if len(parts) != 2:
-                    continue
-                col, val_token = parts[0], parts[1]
-
-                if col not in df_with_target.columns:
-                    continue
-
-                feat_name = _make_profile_feat_name(col, val_token)
-                feature_specs.append(
-                    {
-                        "col": col,
-                        "val_token": val_token,
-                        "feat_name": feat_name,
-                        "group": g,
-                        "lift": round(float(row["Lift"]), 4),
-                        "pct_in": round(float(row["Pct_in"]), 4),
-                    }
-                )
 
         return feature_specs
 
@@ -2529,25 +2773,29 @@ class AutoClassificationEngine:
         df: pd.DataFrame,
         feature_specs: list,
     ) -> pd.DataFrame:
-        """
-        Cria colunas binárias {0,1} no df para cada spec de feature de perfil.
-        Seguro tanto em treino quanto em inferência — não usa target.
-        """
         if not feature_specs:
             return df
 
         df = df.copy()
         for spec in feature_specs:
             col = spec["col"]
-            val_token = spec["val_token"]
             feat_name = spec["feat_name"]
+            lift_map = spec.get("lift_map")
 
-            if col not in df.columns:
-                df[feat_name] = 0
-                continue
-
-            col_tokenized = _to_token(df[col].astype("object"))
-            df[feat_name] = (col_tokenized == val_token).astype(int)
+            if lift_map is not None:
+                # Nova lógica (V0.2.8+): Feature contínua baseada no mapa de Lift
+                if col not in df.columns:
+                    df[feat_name] = 1.0
+                else:
+                    df[feat_name] = df[col].map(lift_map).fillna(1.0)
+            else:
+                # Fallback de retrocompatibilidade: permite carregar bundles (modelos salvos) de versões antigas
+                val_token = spec.get("val_token", "")
+                if col not in df.columns:
+                    df[feat_name] = 0
+                else:
+                    col_tokenized = _to_token(df[col].astype("object"))
+                    df[feat_name] = (col_tokenized == val_token).astype(int)
 
         return df
 
@@ -2764,12 +3012,14 @@ class AutoClassificationEngine:
                 n_bins=self.params.get("oot_psi_n_bins", 10),
                 train_size=self.params.get("oot_psi_train_size", 0.7),
                 random_state=self.params.get("oot_psi_random_state", 42),
+                method=self.params.get("oot_psi_method", "traditional"),
             )
             self.oot_psi_report_ = {
                 "psi_per_feature": psi_dict,
                 "threshold": self.params.get("oot_psi_threshold", 0.25),
                 "n_bins": self.params.get("oot_psi_n_bins", 10),
                 "train_size": self.params.get("oot_psi_train_size", 0.7),
+                "method": self.params.get("oot_psi_method", "traditional"),
                 "dropped_features": psi_dropped,
             }
             if psi_dropped:
@@ -3798,7 +4048,12 @@ class AutoClassificationEngine:
             cut_edges[0] -= 1e-6
             cut_edges[-1] += 1e-6
         else:
-            cut_edges = np.unique(cut_edges)
+            # [v0.2.7] Bordas extremas como ±inf — pega scores do OOT/teste fora
+            # do range do treino (mais altos que o max ou mais baixos que o min)
+            # e atribui à faixa extrema correta. Sem isso, viram NaN silencioso.
+            cut_edges = np.unique(cut_edges).astype(float)
+            cut_edges[0] = -np.inf
+            cut_edges[-1] = np.inf
             n_labels = len(cut_edges) - 1
             df["decile"] = pd.cut(
                 df["prob"],
@@ -3806,6 +4061,11 @@ class AutoClassificationEngine:
                 include_lowest=True,
                 labels=range(1, n_labels + 1),
                 ordered=True,
+            )
+            # Rede de segurança: nenhum caso pode virar NaN com bordas ±inf
+            assert df["decile"].notna().all(), (
+                "Casos viraram NaN ao aplicar cut_edges do treino — não deveria "
+                "acontecer com bordas ±inf. Verifique se há scores NaN no input."
             )
 
         stats = (
@@ -4090,8 +4350,8 @@ class AutoClassificationEngine:
 
         ref_for_overfit = ref_name if ref_name in results else None
 
-        fig = plt.figure(figsize=(24, 26), constrained_layout=True)
-        gs = fig.add_gridspec(5, 4)
+        fig = plt.figure(figsize=(24, 22), constrained_layout=True)
+        gs = fig.add_gridspec(4, 4)
 
         ax_metrics = fig.add_subplot(gs[0, :2])
         self._plot_scorecard(ax_metrics, results)
@@ -4235,17 +4495,7 @@ class AutoClassificationEngine:
                 fontsize=10,
             )
 
-        ax_decil_perf = fig.add_subplot(gs[3, :])
-        self._plot_decil(
-            ax=ax_decil_perf,
-            decile_data=decile_indep,
-            results=results,
-            colors=colors,
-            bins=bins,
-            title_mode="performance",
-        )
-
-        ax_decil_stab = fig.add_subplot(gs[4, :3])
+        ax_decil_stab = fig.add_subplot(gs[3, :3])
         self._plot_decil(
             ax=ax_decil_stab,
             decile_data=decile_fixed,
@@ -4255,7 +4505,7 @@ class AutoClassificationEngine:
             title_mode="estabilidade",
         )
 
-        ax_ks = fig.add_subplot(gs[4, 3])
+        ax_ks = fig.add_subplot(gs[3, 3])
         self._plot_ks_curve(ax_ks, results["Teste"])
 
         oof_tag = " | Treino = OOF" if use_oof else ""
