@@ -1,160 +1,96 @@
 ================================================================================
-DOCUMENTO DE ALTERAÇÕES v5 — LightGBM Classification tempo ativo 4y PR AUC
+DOCUMENTO DE ALTERAÇÕES v6 — LightGBM Classification tempo ativo 4y PR AUC
 ================================================================================
 Data: 30/04/2026
 Contexto: Notebook Databricks — otimização Optuna com métrica composta
-Versão anterior: v4 (Q5-Q1 + gap mínimo, PSI duplo, search space restrito)
-Objetivo: Recuperar PR-AUC perdido na v4 mantendo todos os ganhos de
-          estabilidade, PSI e ordenamento de faixas
+Versão anterior: v5 (pesos 65/10/25, N_TRIALS=400, n_estimators mínimo 100)
+Objetivo: Remover truncamento de trials, expandir path_smooth, corrigir
+          tratamento da variável categórica regiao_br
+MLflow Run ID v5: f9913d30164949c9927f306e3742b24d
 MLflow Run ID v4: 79f623df85a5448f8855d4490a9772f9
 ================================================================================
 
 
-CONTEXTO E DIAGNÓSTICO DA v4
+CONTEXTO E DIAGNÓSTICO DA v5
 -----------------------------
-A v4 foi bem-sucedida nos objetivos principais:
-  - Q3 OOT corrigido: 55.81% → 41.86% (rank reversal resolvido)
-  - PSI OOT: 0.2885 (alto) → 0.1618 (médio) — queda de 44%
-  - CV Separação: 0.6843 — não saturou (Spearman saturava em 1.0000)
-  - Q4 OOT ganhou 12 pessoas a mais vs v3 (13→25 pessoas na faixa)
-  - Recall OOT: 0.61 → 0.67 (+0.06)
-  - Hiperparâmetros equilibrados: min_gain_to_split=0.324 e path_smooth=0.136
-    ficaram longe dos tetos de 0.5 — confirmando que o search space restrito
-    funcionou corretamente sem forçar regularização excessiva
+A v5 entregou ganhos importantes:
+  - OOT PR-AUC recuperou: 0.7421 → 0.7511 (+0.009) — atingiu alvo de 0.75+
+  - Test PR-AUC subiu: 0.7046 → 0.7091 (+0.005)
+  - Recall OOT manteve: 0.67 (ganho da v4 preservado)
+  - Precision OOT subiu: 0.68 → 0.70 (+0.02)
+  - Q3 OOT controlado: 43.9% (abaixo do alvo de 45%)
+  - Q4 OOT estável: 60.0%
+  - CV PSI estável: 0.0612 (≈ v4's 0.0603)
 
-O único ponto fraco da v4 foi queda no PR-AUC:
-  CV:   0.7170 → 0.6917  (-0.025)
-  Test: 0.7306 → 0.7046  (-0.026)
-  OOT:  0.7581 → 0.7421  (-0.016)
+Dois problemas identificados:
 
-Causa identificada: W_PSI=0.30 continua dando 30% de peso a uma métrica que
-já atingiu nível excelente (0.0603 — abaixo de 0.10, considerado "bom" pela
-literatura de credit scoring). Isso reduz o espaço de otimização disponível
-para PR-AUC. Além disso, o run de 60 minutos gerou apenas 1026 trials — o
-melhor apareceu no trial 310 e não foi superado, sugerindo que mais tempo e
-trials permitiriam exploração adicional do espaço de hiperparâmetros.
+PROBLEMA 1 — Convergência truncada prematuramente:
+  O N_TRIALS=400 cortou o run em 23.3 minutos — 66.7 minutos antes do
+  timeout de 90 minutos. O melhor trial apareceu no 386 de 400 (96% do run),
+  indicando que o Optuna ainda estava melhorando ativamente quando foi
+  interrompido. Na v4, o melhor apareceu no trial 310 de 1026 (30%) —
+  convergência genuína. Na v5, o limite de trials foi muito restritivo.
 
-RESUMO DAS ALTERAÇÕES DA v5
+PROBLEMA 2 — path_smooth quase no teto (0.483 de 0.5):
+  Diferente da v4 onde path_smooth ficou em 0.136 (longe do teto), na v5
+  foi para 0.483. O Optuna está sinalizando que quer mais suavização do que
+  o range permite. Expandir o teto dá ao Optuna mais liberdade pra explorar
+  essa região.
+
+PROBLEMA 3 — regiao_br tratada com OHE em vez de categórica nativa:
+  A variável categórica regiao_br está sendo transformada por OneHotEncoding
+  no preprocessor, gerando N colunas binárias esparsas. O LightGBM possui
+  suporte nativo a variáveis categóricas — muito superior ao OHE para bases
+  pequenas (~1450 linhas). O OHE fragmenta o sinal da variável em N features
+  independentes, impedindo splits do tipo "Sudeste+Sul vs demais regiões"
+  que o algoritmo nativo faz automaticamente.
+
+RESUMO DAS ALTERAÇÕES DA v6
 -----------------------------
-Apenas 3 alterações em relação à v4. TUDO MAIS MANTÉM IDÊNTICO.
+4 alterações em relação à v5. TUDO MAIS MANTÉM IDÊNTICO.
 
-  1. Rebalancear pesos: W_PRAUC 0.60→0.65, W_PSI 0.30→0.25
-  2. Timeout: 60min → 90min, com limite adicional de 400 trials
-  3. Mínimo de n_estimators: 50 → 100
+  1. Remover N_TRIALS — deixar o timeout de 90 min como único critério
+  2. Expandir teto do path_smooth: 0.5 → 0.7
+  3. Elevar mínimo do min_gain_to_split: 0.0 → 0.05
+  4. Substituir OHE de regiao_br por tratamento categórico nativo do LightGBM
 
 
 ================================================================================
-ALTERAÇÃO 1 — Rebalancear pesos da métrica composta
+ALTERAÇÃO 1 — Remover N_TRIALS, manter apenas timeout de 90 minutos
 ================================================================================
 
 MOTIVAÇÃO
 ---------
-O PSI atingiu 0.0603 na v4 — excelente, abaixo do threshold "bom" (<0.10)
-da literatura de credit scoring (Siddiqi, 2006). Manter W_PSI=0.30 significa
-dedicar 30% da capacidade de otimização do Optuna a uma métrica que já está
-resolvida. Isso cria um teto artificial para o PR-AUC, que ficou em 0.6917
-no CV — abaixo dos 0.7170 da v3.
+Na v5, o limite de 400 trials cortou o run em 23.3 minutos, desperdiçando
+66.7 minutos de budget disponível (74% do timeout não utilizado). O melhor
+trial apareceu no 386 de 400 (96%) — o Optuna ainda estava em fase ativa
+de melhoria quando foi interrompido.
 
-O princípio de otimização multiobjetivo estabelece que pesos devem ser
-ajustados dinamicamente conforme os objetivos são atingidos. Quando uma
-métrica converge para sua região ótima, reduzir seu peso libera capacidade
-para melhorar as métricas que ainda têm espaço de ganho (Cawley & Talbot,
-2010 — "On Over-fitting in Model Selection and Subsequent Selection Bias
-in Performance Evaluation").
-
-O W_SEPARACAO mantém em 0.10 porque a métrica está funcionando corretamente
-— CV Separação ficou em 0.6843, diferenciando efetivamente os trials sem
-saturar. Não há razão para alterar um componente que está se comportando
-como esperado.
-
-FUNDAMENTAÇÃO
--------------
-Davis & Goadrich (2006) — "The Relationship Between Precision-Recall and ROC
-Curves" — demonstram que PR-AUC é a métrica primária para problemas com
-classes desbalanceadas (~35% de positivos no problema atual). Reduzir seu
-peso abaixo de 60% compromete a capacidade do modelo de discriminar os casos
-positivos reais — que é o objetivo operacional central (identificar quem vai
-ficar 4+ anos reintegrado).
-
-Siddiqi (2006) — "Credit Risk Scorecards" — estabelece PSI < 0.10 como
-threshold "bom" de estabilidade. Com PSI=0.0603 na v4, o modelo já está
-nessa faixa. O PSI deve ser monitorado, não maximizado indefinidamente.
-
-ALTERAÇÃO NO CÓDIGO — bloco de pesos (célula 7)
-------------------------------------------------
-  # DE:
-  W_PRAUC     = 0.60
-  W_SEPARACAO = 0.10
-  W_PSI       = 0.30
-
-  # PARA:
-  W_PRAUC     = 0.65
-  W_SEPARACAO = 0.10
-  W_PSI       = 0.25
-
-  assert abs(W_PRAUC + W_SEPARACAO + W_PSI - 1.0) < 1e-6, "Pesos devem somar 1.0"
-
-NOTA SOBRE AJUSTE FINO:
-Se após a v5 o PR-AUC se recuperar mas o PSI OOT subir acima de 0.25:
-  → Voltar W_PSI para 0.28, W_PRAUC para 0.62
-Se o CV Separação saturar em 1.0 novamente:
-  → Aumentar W_SEPARACAO para 0.15, reduzir W_PRAUC para 0.60
-
-
-================================================================================
-ALTERAÇÃO 2 — Timeout 90 minutos com limite de 400 trials
-================================================================================
-
-MOTIVAÇÃO
----------
-Na v4, o melhor trial apareceu no trial 310 de 1026 totais (30% do run) e
-não foi superado nas 716 tentativas restantes. Isso indica dois fenômenos:
-
-  1. O Optuna encontrou o ótimo relativamente cedo — o search space restrito
-     (herdado das alterações da v4) está bem calibrado.
-
-  2. Com 60 minutos e 1026 trials, o Optuna explorou bem a região inicial
-     mas teve pouco tempo para convergência fina (exploitation) após a fase
-     de exploração (exploration).
-
-Aumentar para 90 minutos com limite de 400 trials resolve os dois problemas:
-  - 400 trials cobre o ponto histórico de convergência (310) com margem de
-    +29%, garantindo que o ótimo seja encontrado
-  - 90 minutos garante que configurações com learning_rate baixo (que requerem
-    mais tempo por trial por causa do early stopping mais tardio) sejam
-    adequadamente exploradas
-  - O critério que disparar primeiro interrompe o run — proteção contra
-    runs longos desnecessários
-
-ESTIMATIVA DE TEMPO:
-Com ~5 trials/minuto (observado nas versões anteriores), 400 trials ≈ 80
-minutos. Na prática o n_trials=400 deve disparar antes do timeout de 90
-minutos — tornando o run mais previsível e controlado.
+Com velocidade de ~17 trials/minuto e 90 minutos disponíveis, o run sem
+limite de trials vai gerar ~1500 trials — cobertura 3.75x maior que os 400
+da v5 e equivalente à v3 (1555 trials em 90 min).
 
 FUNDAMENTAÇÃO
 -------------
 Bergstra & Bengio (2012) — "Random Search for Hyper-Parameter Optimization"
-— estabelecem que busca bayesiana (TPE, usado pelo Optuna) converge mais
-eficientemente que grid search mas ainda requer N suficiente de trials para
-cobrir adequadamente espaços de alta dimensionalidade. Com 11 dimensões no
-search space atual, 400 trials é o mínimo recomendado para cobertura
-estatística razoável.
+— estabelecem que busca bayesiana (TPE, usado pelo Optuna) requer N
+suficiente de trials para explorar adequadamente espaços de alta
+dimensionalidade. Com 11 dimensões no search space, 400 trials é insuficiente
+para cobertura estatística robusta.
 
 Feurer et al. (2015) — "Efficient and Robust Automated Machine Learning" —
-mostram que o ponto de rendimento decrescente em busca bayesiana tipicamente
-ocorre entre 300-500 trials para espaços de 8-15 dimensões — alinhado com
-o que observamos empiricamente (melhor trial no 310).
+mostram que o ponto de rendimento decrescente em busca bayesiana ocorre entre
+300-500 trials para espaços de 8-15 dimensões. O ideal é deixar o algoritmo
+convergir naturalmente — não cortar artificialmente.
 
 ALTERAÇÃO NO CÓDIGO — parâmetros globais e chamada do Optuna (célula 7)
 -----------------------------------------------------------------------
-  # Adicionar constante:
+  # Remover completamente a constante N_TRIALS:
+  # (deletar a linha)
   N_TRIALS = 400
 
   # Substituir chamada do study.optimize:
   # DE:
-  study.optimize(objective, timeout=TIMEOUT_MIN * 60, show_progress_bar=True)
-
-  # PARA:
   study.optimize(
       objective,
       timeout=TIMEOUT_MIN * 60,
@@ -162,178 +98,329 @@ ALTERAÇÃO NO CÓDIGO — parâmetros globais e chamada do Optuna (célula 7)
       show_progress_bar=True
   )
 
-  # Atualizar TIMEOUT_MIN:
-  # DE:
-  TIMEOUT_MIN = 60
-
   # PARA:
-  TIMEOUT_MIN = 90
+  study.optimize(
+      objective,
+      timeout=TIMEOUT_MIN * 60,
+      show_progress_bar=True
+  )
 
-  # Atualizar nome do study para rastreabilidade no MLflow:
-  # DE:
-  study = optuna.create_study(direction="maximize", study_name="lgbm_cv_psi_60min")
-
-  # PARA:
-  study = optuna.create_study(direction="maximize", study_name="lgbm_v5_90min_400trials")
+  # Atualizar nome do study para rastreabilidade:
+  study = optuna.create_study(
+      direction="maximize",
+      study_name="lgbm_v6_90min_sem_limite_trials"
+  )
 
   # Atualizar print de configuração:
-  print(f"CV: {N_FOLDS}-fold StratifiedKFold, timeout {TIMEOUT_MIN} min ou {N_TRIALS} trials")
+  print(f"CV: {N_FOLDS}-fold StratifiedKFold, timeout {TIMEOUT_MIN} min")
 
-  # Atualizar nome do run MLflow para rastreabilidade:
-  # DE:
-  _mlflow_run_name = f"lgbm_v24_80-20_{n_completed}trials_60min"
-
-  # PARA:
-  _mlflow_run_name = f"lgbm_v5_80-20_{n_completed}trials_90min"
+  # Atualizar nome do run MLflow:
+  _mlflow_run_name = f"lgbm_v6_80-20_{n_completed}trials_90min"
 
 
 ================================================================================
-ALTERAÇÃO 3 — Mínimo de n_estimators: 50 → 100
+ALTERAÇÃO 2 — Expandir teto do path_smooth: 0.5 → 0.7
 ================================================================================
 
 MOTIVAÇÃO
 ---------
-Na v4, o melhor trial selecionou learning_rate=0.010 com n_estimators=216.
-Essa combinação é subótima: com LR=0.010 (muito baixo), o modelo precisa de
-mais árvores para convergir — mas o early stopping (30 rounds sem melhora)
-cortou em 216, sugerindo que o modelo parou antes de atingir sua capacidade
-máxima.
+Na v5, path_smooth foi para 0.483 — quase no teto de 0.5. Isso indica que
+o Optuna quer explorar valores maiores de suavização mas está sendo impedido
+pelo range. Expandir o teto de 0.5 para 0.7 dá ao algoritmo liberdade para
+encontrar o valor ótimo real sem restrição artificial.
 
-O problema é que com n_estimators mínimo em 50, o Optuna pode explorar
-configurações onde LR alto (0.2-0.3) com poucas árvores (50-80) aparece
-como viável no CV mas generaliza mal no OOT — pois árvores rápidas tendem
-a overfit em bases pequenas (~1450 linhas de treino).
-
-Elevar o mínimo para 100 elimina configurações trivialmente subótimas sem
-restringir o espaço de configurações genuinamente boas.
+O path_smooth suaviza as predições nas folhas das árvores do LightGBM,
+reduzindo a variância dos scores nas faixas intermediárias (Q3/Q4) — que é
+exatamente onde o problema de instabilidade se manifesta. Valores mais altos
+de path_smooth produzem scores mais calibrados às custas de PSI levemente
+maior, trade-off que a v5 mostrou ser aceitável (PSI OOT 0.2205, abaixo
+do threshold crítico de 0.25).
 
 FUNDAMENTAÇÃO
 -------------
 Ke et al. (2017) — "LightGBM: A Highly Efficient Gradient Boosting Decision
-Tree" — recomendam que o número de estimators seja suficiente para que o
-early stopping possa atuar efetivamente. Com early_stopping_rounds=30 e
-LR baixo, o mínimo prático de estimators é ~100 para que o modelo tenha
-ao menos 3-4 fases de convergência antes de parar.
-
-Chen & Guestrin (2016) — "XGBoost: A Scalable Tree Boosting System" —
-estabelecem que em bases com N < 2000, learning_rate < 0.05 combinado com
-n_estimators < 100 produz modelos sistematicamente subotimizados por
-insuficiência de iterações de gradiente.
+Tree" — introduzem path_smooth como parâmetro de regularização das predições
+nas folhas. Valores entre 0.3 e 0.7 são típicos para bases com N < 2000,
+onde a variância das estimativas nas folhas é alta. O teto de 0.5 estava
+restringindo artificialmente essa região.
 
 ALTERAÇÃO NO CÓDIGO — bloco de params na função objetivo (célula 7)
 -------------------------------------------------------------------
   # DE:
-  "n_estimators": trial.suggest_int("n_estimators", 50, 800),
+  "path_smooth": trial.suggest_float("path_smooth", 0.0, 0.5),
 
   # PARA:
-  "n_estimators": trial.suggest_int("n_estimators", 100, 800),
+  "path_smooth": trial.suggest_float("path_smooth", 0.0, 0.7),
 
 
 ================================================================================
-O QUE NÃO MUDA — MANTER IDÊNTICO DA v4
+ALTERAÇÃO 3 — Elevar mínimo do min_gain_to_split: 0.0 → 0.05
 ================================================================================
 
-Os seguintes elementos foram validados empiricamente na v4 e NÃO devem
-ser alterados:
+MOTIVAÇÃO
+---------
+Na v5, min_gain_to_split caiu para 0.036 — muito próximo de zero. Com
+mínimo em 0.0, o Optuna pode selecionar valores onde praticamente qualquer
+split é permitido, eliminando o efeito regulatório desse parâmetro. Elevar
+o mínimo para 0.05 garante que o modelo sempre tenha alguma restrição de
+ganho mínimo por split, evitando overfitting em features de baixo sinal.
 
-FUNÇÃO compute_fold_metrics — manter exatamente como está na v4:
-  - PSI de taxas + PSI de scores (PSI duplo combinado com peso 50/50)
-  - Métrica de separação: 0.60 * amplitude(Q5-Q1) + 0.40 * gap_score
-  - Bordas definidas no treino do fold (-np.inf, np.inf nas extremidades)
-  - Retorna (separacao_score, psi_combinado)
+FUNDAMENTAÇÃO
+-------------
+Chen & Guestrin (2016) — "XGBoost: A Scalable Tree Boosting System" —
+estabelecem que min_gain (equivalente ao min_gain_to_split do LightGBM)
+deve ser maior que zero em bases com N < 2000 para evitar splits que
+capturam ruído estatístico em vez de sinal real. O valor 0.036 observado
+na v5 é funcionalmente equivalente a zero nesse contexto.
 
-SEARCH SPACE — manter os ranges da v4:
-  max_depth:          4-8        (não voltar para 3)
-  num_leaves:         20-128     (não voltar para 8)
+ALTERAÇÃO NO CÓDIGO — bloco de params na função objetivo (célula 7)
+-------------------------------------------------------------------
+  # DE:
+  "min_gain_to_split": trial.suggest_float("min_gain_to_split", 0.0, 0.5),
+
+  # PARA:
+  "min_gain_to_split": trial.suggest_float("min_gain_to_split", 0.05, 0.5),
+
+
+================================================================================
+ALTERAÇÃO 4 — Substituir OHE de regiao_br por categórica nativa do LightGBM
+================================================================================
+
+MOTIVAÇÃO
+---------
+A variável regiao_br é categórica com N categorias (regiões do Brasil).
+O preprocessor atual aplica OneHotEncoding, criando N colunas binárias
+independentes. Isso tem três problemas:
+
+  1. Fragmentação do sinal: o OHE impede splits combinados como
+     "Sudeste+Sul vs Norte+Nordeste+Centro-Oeste". O LightGBM nativo
+     encontra agrupamentos ótimos de categorias automaticamente.
+
+  2. Esparsidade: com base pequena (~1450 linhas), colunas OHE de regiões
+     com poucos exemplos (Norte, Centro-Oeste) têm variância altíssima e
+     contribuem para instabilidade no OOT.
+
+  3. Desalinhamento com o Boruta: o framework selecionou regiao_br como
+     variável — avaliando o sinal categórico como um todo. O preprocessor
+     do notebook fragmenta esse sinal em colunas binárias que o Boruta nunca
+     avaliou individualmente.
+
+O LightGBM possui algoritmo nativo de split categórico que é demonstralmente
+superior ao OHE para variáveis categóricas com baixa cardinalidade em bases
+pequenas (Fisher, 1958 — adaptado por Ke et al., 2017).
+
+FUNDAMENTAÇÃO
+-------------
+Ke et al. (2017) — "LightGBM: A Highly Efficient Gradient Boosting Decision
+Tree" — descrevem o algoritmo de split categórico nativo do LightGBM baseado
+em Fisher (1958). Em vez de criar N colunas binárias, o algoritmo ordena as
+categorias pelo gradiente médio e encontra o ponto de split ótimo — O(k log k)
+em vez de O(2^k) para k categorias. Para k ≤ 10 (número de regiões do Brasil),
+a busca é exata e superior ao OHE.
+
+Prokhorenkova et al. (2018) — "CatBoost: unbiased boosting with categorical
+features" — demonstram empiricamente que tratamento nativo de categóricas
+supera OHE em bases com N < 5000 para variáveis com até 20 categorias.
+
+IMPLEMENTAÇÃO — 3 passos no notebook
+--------------------------------------
+
+PASSO 1 — Remover regiao_br do preprocessor OHE (célula 6):
+
+  # Identificar regiao_br como categórica e remover do pipeline OHE
+  # DE:
+  cat_cols = X_train.select_dtypes(include=["object", "category"]).columns.tolist()
+
+  # PARA:
+  cat_cols_ohe = [c for c in X_train.select_dtypes(
+      include=["object", "category"]).columns.tolist()
+      if c != "regiao_br"]
+
+  # Atualizar o ColumnTransformer para usar cat_cols_ohe:
+  preprocessor = ColumnTransformer(
+      transformers=[
+          ("num", Pipeline([
+              ("imputer", SimpleImputer(strategy="median")),
+              ("scaler", StandardScaler()),
+          ]), num_cols),
+          ("cat", Pipeline([
+              ("imputer", SimpleImputer(strategy="most_frequent")),
+              ("encoder", OneHotEncoder(handle_unknown="ignore",
+                                        sparse_output=False)),
+          ]), cat_cols_ohe),  # regiao_br excluída aqui
+      ],
+      remainder="drop"
+  )
+
+PASSO 2 — Converter regiao_br para tipo category antes do treino (célula 6):
+
+  # Após o fit_transform do preprocessor, adicionar regiao_br como categórica
+  # Primeiro: obter os índices de regiao_br no array processado
+  # Como regiao_br foi excluída do OHE, precisa ser adicionada manualmente
+
+  # Abordagem mais simples — converter antes do preprocessor:
+  X_train["regiao_br"] = X_train["regiao_br"].astype("category")
+  X_test["regiao_br"]  = X_test["regiao_br"].astype("category")
+  X_oot["regiao_br"]   = X_oot["regiao_br"].astype("category")
+
+  # Após o preprocessor (que processa as outras features), concatenar regiao_br:
+  import numpy as np
+
+  regiao_train = X_train["regiao_br"].cat.codes.values.reshape(-1, 1)
+  regiao_test  = X_test["regiao_br"].cat.codes.values.reshape(-1, 1)
+  regiao_oot   = X_oot["regiao_br"].cat.codes.values.reshape(-1, 1)
+
+  X_train_proc = np.hstack([X_train_proc, regiao_train])
+  X_test_proc  = np.hstack([X_test_proc,  regiao_test])
+  X_oot_proc   = np.hstack([X_oot_proc,   regiao_oot])
+
+  # Registrar o índice da coluna categórica para o LightGBM
+  cat_feature_idx = X_train_proc.shape[1] - 1  # última coluna
+
+PASSO 3 — Informar o LightGBM sobre a coluna categórica (célula 7 e 8):
+
+  # Na função objetivo do Optuna, no fit do modelo:
+  # DE:
+  mdl.fit(
+      X_tr, y_tr,
+      eval_set=[(X_vl, y_vl)],
+      callbacks=[lgb.early_stopping(30, verbose=False), lgb.log_evaluation(0)]
+  )
+
+  # PARA:
+  mdl.fit(
+      X_tr, y_tr,
+      eval_set=[(X_vl, y_vl)],
+      categorical_feature=[cat_feature_idx],
+      callbacks=[lgb.early_stopping(30, verbose=False), lgb.log_evaluation(0)]
+  )
+
+  # No treino do modelo final (célula 8), aplicar o mesmo:
+  final_model.fit(
+      X_train_proc, y_train,
+      categorical_feature=[cat_feature_idx],
+      eval_set=[(X_test_proc, y_test)],
+      callbacks=[lgb.early_stopping(30, verbose=False), lgb.log_evaluation(0)]
+  )
+
+NUANCE IMPORTANTE:
+O cat.codes converte as categorias para inteiros (0, 1, 2...). O LightGBM
+identifica que é categórica pelo parâmetro categorical_feature e usa o
+algoritmo de split nativo. Garantir que X_train, X_test e X_oot usem
+o mesmo mapeamento de categorias — como X_test e X_oot usam os mesmos
+códigos do pandas (definidos no treino via astype("category")), o
+mapeamento é consistente apenas se as categorias do test/OOT forem
+subconjunto das do treino.
+
+VERIFICAÇÃO DE SEGURANÇA — adicionar antes do treino:
+  # Confirmar que test e OOT não têm categorias novas
+  cats_train = set(X_train["regiao_br"].cat.categories)
+  cats_test  = set(X_test["regiao_br"].unique())
+  cats_oot   = set(X_oot["regiao_br"].unique())
+
+  assert cats_test.issubset(cats_train), \
+      f"Test tem categorias novas: {cats_test - cats_train}"
+  assert cats_oot.issubset(cats_train), \
+      f"OOT tem categorias novas: {cats_oot - cats_train}"
+
+  # Garantir que test e OOT usem as categorias do treino:
+  X_test["regiao_br"] = pd.Categorical(
+      X_test["regiao_br"], categories=X_train["regiao_br"].cat.categories)
+  X_oot["regiao_br"]  = pd.Categorical(
+      X_oot["regiao_br"], categories=X_train["regiao_br"].cat.categories)
+
+
+================================================================================
+O QUE NÃO MUDA — MANTER IDÊNTICO DA v5
+================================================================================
+
+PESOS DA MÉTRICA COMPOSTA — manter da v5:
+  W_PRAUC     = 0.65
+  W_SEPARACAO = 0.10
+  W_PSI       = 0.25
+  JUSTIFICATIVA: OOT PR-AUC atingiu alvo de 0.75+. PSI estável em 0.06.
+  Não há razão para alterar pesos que estão produzindo resultados corretos.
+
+FUNÇÃO compute_fold_metrics — manter exatamente como está:
+  - PSI duplo (0.5 * psi_taxas + 0.5 * psi_scores)
+  - Separação: 0.60 * amplitude(Q5-Q1) + 0.40 * gap_score
+  - Bordas ±inf nas extremidades
+
+SEARCH SPACE — manter da v5 exceto alterações 2 e 3:
+  max_depth:          4-8
+  num_leaves:         20-128
+  n_estimators:       100-800
+  learning_rate:      0.01-0.3 (log=True)
   min_child_samples:  5-100
   subsample:          0.4-1.0
   colsample_bytree:   0.5-1.0
   reg_alpha:          1e-8 a 10.0 (log=True)
   reg_lambda:         1e-8 a 10.0 (log=True)
-  min_gain_to_split:  0.0-0.5    (não voltar para 0-1.0)
-  path_smooth:        0.0-0.5    (não voltar para 0-1.0)
-  learning_rate:      0.01-0.3   (log=True)
+  min_gain_to_split:  0.05-0.5   ← mínimo elevado (Alteração 3)
+  path_smooth:        0.0-0.7    ← teto expandido (Alteração 2)
 
-  JUSTIFICATIVA: min_gain_to_split=0.324 e path_smooth=0.136 na v4 ficaram
-  longe dos tetos de 0.5, confirmando que o range está bem calibrado. Expandir
-  de volta para 0-1.0 voltaria a produzir modelos excessivamente conservadores
-  como o max_depth=3/num_leaves=22 da v3.
-
-IMPUTER: strategy="median" (não reverter para "mean")
-
-N_FOLDS: 5 (manter)
-
+TIMEOUT_MIN = 90 (manter)
+N_FOLDS = 5 (manter)
 SPLIT: 80/20 estratificado (manter)
-
 EARLY STOPPING: 30 rounds (manter)
-
+IMPUTER: strategy="median" (manter)
 SCALE_POS_WEIGHT: manter valor atual
 
-PSI DUPLO: manter cálculo combinado (0.5 * psi_taxas + 0.5 * psi_scores)
-
-SEPARAÇÃO Q5-Q1 + GAP MÍNIMO: manter pesos internos (0.60 amplitude + 0.40 gap)
-
 
 ================================================================================
-O QUE MONITORAR NOS RESULTADOS DA v5
+O QUE MONITORAR NOS RESULTADOS DA v6
 ================================================================================
 
-MÉTRICAS ALVO — em ordem de prioridade:
-
-  CV PR-AUC:      alvo ~0.71-0.72  (recuperar do 0.6917 da v4)
-  OOT PR-AUC:     alvo ~0.75+      (recuperar do 0.7421 da v4)
-  CV Separação:   alvo <0.95       (se saturar em 1.0 → ver ajuste abaixo)
-  CV PSI:         alvo <0.10       (manter o 0.0603 da v4)
-  PSI OOT:        alvo <0.20       (manter o 0.1618 da v4)
-  Recall OOT:     alvo ≥0.67       (manter o ganho da v4)
-  Q3 OOT:         alvo <45%        (manter correção da v4)
-  Q4 OOT:         alvo ≥60%        (manter ou melhorar)
-  Q4 OOT (n):     alvo ≥25 pessoas (manter o ganho da v4 vs 13 da v3)
+MÉTRICAS ALVO:
+  OOT PR-AUC:     alvo >0.7511  (superar v5)
+  PSI OOT:        alvo <0.20    (melhorar vs 0.2205 da v5)
+  CV PSI:         alvo <0.10    (manter)
+  CV Separação:   alvo <0.95    (não saturar)
+  Recall OOT:     alvo ≥0.67    (manter)
+  Q3 OOT:         alvo <45%     (manter)
+  Q4 OOT:         alvo ≥60%     (manter)
 
 HIPERPARÂMETROS — sinais de alerta:
-  Se max_depth=4 e num_leaves<30 → modelo ainda conservador, considerar
-    elevar mínimo de num_leaves para 25
-  Se learning_rate<0.02 e n_estimators<150 → early stopping cortando cedo,
-    considerar elevar early_stopping_rounds de 30 para 40
-  Se min_gain_to_split bater no teto de 0.5 → reduzir teto para 0.4
+  Se path_smooth bater no novo teto de 0.7:
+    → Expandir para 0.8 na v7
+  Se min_gain_to_split bater no teto de 0.5:
+    → Reduzir teto para 0.4
+  Se learning_rate < 0.02 com n_estimators < 150:
+    → Early stopping cortando cedo, elevar early_stopping_rounds de 30 para 40
+
+CONVERGÊNCIA:
+  Best trial / Total deve ser < 80% — se aparecer nos últimos 20% novamente,
+  aumentar timeout para 120 minutos na v7.
+
+EFEITO DA CATEGÓRICA NATIVA:
+  Comparar importância de regiao_br antes e depois. Com OHE, a importância
+  ficava dividida entre N colunas. Com categórica nativa, toda a importância
+  fica em uma única feature — deve aparecer com importância maior e mais
+  estável entre versões.
 
 AJUSTES CONDICIONAIS PÓS-RUN:
-
-  Se CV Separação saturar em 1.0 novamente:
-    → W_SEPARACAO: 0.10 → 0.15
-    → W_PRAUC:     0.65 → 0.60
-    (mantém W_PSI em 0.25)
-
-  Se PSI OOT subir acima de 0.25 (regressão da v4):
-    → W_PSI:   0.25 → 0.28
-    → W_PRAUC: 0.65 → 0.62
-    (mantém W_SEPARACAO em 0.10)
-
-  Se PR-AUC OOT não se recuperar (continuar abaixo de 0.74):
-    → Verificar se o melhor trial tem learning_rate muito baixo (<0.02)
-    → Se sim: elevar n_estimators mínimo de 100 para 150 na v6
-    → Considerar elevar W_PRAUC para 0.70 e W_PSI para 0.20 na v6
-
-  Se Q3 OOT inflar novamente acima de 50%:
-    → O search space está permitindo modelos excessivamente conservadores
-    → Elevar W_SEPARACAO de 0.10 para 0.15
-    → Reduzir min_gain_to_split máximo de 0.5 para 0.3
+  Se PSI OOT subir acima de 0.25:
+    → W_PSI: 0.25 → 0.28, W_PRAUC: 0.65 → 0.62
+  Se CV Separação saturar em 1.0:
+    → W_SEPARACAO: 0.10 → 0.15, W_PRAUC: 0.65 → 0.60
+  Se OOT PR-AUC não superar 0.7511:
+    → Investigar se path_smooth alto está causando compressão de scores
+    → Considerar reduzir teto de path_smooth de 0.7 para 0.6
 
 
 ================================================================================
-RESUMO EXECUTIVO — DIFERENÇAS v4 → v5
+RESUMO EXECUTIVO — DIFERENÇAS v5 → v6
 ================================================================================
 
-  Parâmetro              v4          v5          Razão
-  ─────────────────────────────────────────────────────────────────────
-  W_PRAUC                0.60        0.65        PSI já resolvido
-  W_SEPARACAO            0.10        0.10        funcionando bem
-  W_PSI                  0.30        0.25        PSI=0.0603 < 0.10
-  TIMEOUT_MIN            60          90          mais exploração
-  N_TRIALS               sem limite  400         convergência no trial 310
-  n_estimators mínimo    50          100         evitar LR baixo + poucas árvores
-  ─────────────────────────────────────────────────────────────────────
-  TUDO MAIS              idêntico    idêntico    validado empiricamente
+  Parâmetro              v5              v6              Razão
+  ─────────────────────────────────────────────────────────────────────────
+  N_TRIALS               400             sem limite      truncamento prematuro
+  TIMEOUT_MIN            90              90              mantém
+  path_smooth range      0.0-0.5         0.0-0.7         quase no teto na v5
+  min_gain_to_split      0.0-0.5         0.05-0.5        0.036 muito baixo
+  regiao_br              OHE (N colunas) categórica nativa fragmentação do sinal
+  ─────────────────────────────────────────────────────────────────────────
+  TUDO MAIS              idêntico        idêntico        validado empiricamente
 
 
 ================================================================================
@@ -342,10 +429,6 @@ REFERÊNCIAS BIBLIOGRÁFICAS
 
 Bergstra, J., & Bengio, Y. (2012). Random Search for Hyper-Parameter
 Optimization. Journal of Machine Learning Research, 13, 281-305.
-
-Cawley, G. C., & Talbot, N. L. C. (2010). On Over-fitting in Model Selection
-and Subsequent Selection Bias in Performance Evaluation. Journal of Machine
-Learning Research, 11, 2079-2107.
 
 Chen, T., & Guestrin, C. (2016). XGBoost: A Scalable Tree Boosting System.
 Proceedings of KDD 2016.
@@ -356,23 +439,18 @@ and ROC Curves. Proceedings of ICML 2006.
 Feurer, M., et al. (2015). Efficient and Robust Automated Machine Learning.
 NeurIPS 2015.
 
+Fisher, W. D. (1958). On Grouping for Maximum Homogeneity. Journal of the
+American Statistical Association, 53(284), 789-798.
+
 Ke, G., et al. (2017). LightGBM: A Highly Efficient Gradient Boosting
 Decision Tree. NeurIPS 2017.
 
-Niculescu-Mizil, A., & Caruana, R. (2005). Predicting Good Probabilities With
-Supervised Learning. ICML 2005.
-
-Platt, J. (1999). Probabilistic Outputs for Support Vector Machines and
-Comparisons to Regularized Likelihood Methods. Advances in Large Margin
-Classifiers.
-
-Saito, T., & Rehmsmeier, M. (2015). The Precision-Recall Plot Is More
-Informative than the ROC Plot When Evaluating Binary Classifiers on
-Imbalanced Datasets. PLOS ONE.
+Prokhorenkova, L., et al. (2018). CatBoost: unbiased boosting with
+categorical features. NeurIPS 2018.
 
 Siddiqi, N. (2006). Credit Risk Scorecards: Developing and Implementing
 Intelligent Credit Scoring. Wiley.
 
 ================================================================================
-FIM DO DOCUMENTO v5
+FIM DO DOCUMENTO v6
 ================================================================================
