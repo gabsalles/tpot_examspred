@@ -1,0 +1,128 @@
+================================================================================
+INSTRUÇÕES v9b — LightGBM Classification tempo ativo 4y PR AUC
+================================================================================
+Base: copiar notebook v6 e aplicar as alterações abaixo
+Diferença em relação à v9a: pf__regiao_br_Sudeste REMOVIDA
+Data: 04/05/2026
+================================================================================
+
+
+ALTERAÇÃO 1 — FEATURES
+================================================================================
+
+Manter regiao_br no preprocessor OHE normalmente (como estava na v6).
+Remover pf__regiao_br_Sudeste das features antes de passar pro modelo:
+
+  # Após montar X_train, X_test, X_oot — remover a coluna pf__
+  X_train = X_train.drop(columns=["pf__regiao_br_Sudeste"], errors="ignore")
+  X_test  = X_test.drop(columns=["pf__regiao_br_Sudeste"],  errors="ignore")
+  X_oot   = X_oot.drop(columns=["pf__regiao_br_Sudeste"],   errors="ignore")
+
+  TRAIN_FEATURES = [c for c in TRAIN_FEATURES if c != "pf__regiao_br_Sudeste"]
+
+
+ALTERAÇÃO 2 — N_TRIALS E TIMEOUT
+================================================================================
+
+  N_TRIALS    = 400
+  TIMEOUT_MIN = 90
+
+  study.optimize(
+      objective,
+      timeout=TIMEOUT_MIN * 60,
+      n_trials=N_TRIALS,
+      show_progress_bar=True
+  )
+
+
+ALTERAÇÃO 3 — COMPOSITES PARALELOS
+================================================================================
+
+Idêntica à v8 e v9a — copiar exatamente o mesmo bloco.
+
+  psi_2c = 0.5 * mean_psi_taxas + 0.5 * mean_psi_scores
+  psi_3c = 0.33 * mean_psi_taxas + 0.33 * mean_psi_scores + 0.33 * mean_psi_faixas
+
+  psi_linear_2c = float(np.clip(1 - psi_2c, 0, 1))
+  psi_exp_2c    = float(np.clip(np.exp(-3 * psi_2c), 0, 1))
+  psi_linear_3c = float(np.clip(1 - psi_3c, 0, 1))
+  psi_exp_3c    = float(np.clip(np.exp(-3 * psi_3c), 0, 1))
+
+  gaps = np.diff(r_vl)
+  pesos_gaps = np.array([0.15, 0.25, 0.35, 0.25])
+  gap_pond_score = max(0.0, min(1.0,
+      float(np.sum(gaps * pesos_gaps)) / (1.0 / n_bins)))
+  sep_pond = 0.60 * amplitude + 0.40 * gap_pond_score
+
+  comp_A = 0.60*mean_pr + 0.12*mean_sep  + 0.28*psi_linear_2c
+  comp_B = 0.65*mean_pr + 0.10*mean_sep  + 0.25*psi_linear_2c
+  comp_C = 0.60*mean_pr + 0.15*mean_sep  + 0.25*psi_linear_2c
+  comp_D = 0.60*mean_pr + 0.10*mean_sep  + 0.30*psi_linear_2c
+  comp_E = 0.60*mean_pr + 0.10*mean_sep  + 0.30*psi_exp_2c
+  comp_F = 0.60*mean_pr + 0.10*mean_sep  + 0.30*psi_linear_3c
+  comp_G = 0.60*mean_pr + 0.10*mean_sep  + 0.30*psi_exp_3c
+  comp_H = 0.60*mean_pr + 0.12*sep_pond  + 0.28*psi_linear_2c
+
+  trial.set_user_attr("comp_A", round(comp_A, 4))
+  trial.set_user_attr("comp_B", round(comp_B, 4))
+  trial.set_user_attr("comp_C", round(comp_C, 4))
+  trial.set_user_attr("comp_D", round(comp_D, 4))
+  trial.set_user_attr("comp_E", round(comp_E, 4))
+  trial.set_user_attr("comp_F", round(comp_F, 4))
+  trial.set_user_attr("comp_G", round(comp_G, 4))
+  trial.set_user_attr("comp_H", round(comp_H, 4))
+  trial.set_user_attr("cv_pr_auc", round(mean_pr,  4))
+  trial.set_user_attr("cv_sep",    round(mean_sep, 4))
+  trial.set_user_attr("cv_psi",    round(mean_psi, 4))
+
+  # Composite que guia o Optuna nesta versão
+  return comp_D
+
+
+ALTERAÇÃO 4 — NOME DO STUDY E MLFLOW
+================================================================================
+
+  study = optuna.create_study(
+      direction="maximize",
+      study_name="lgbm_v9b_ohe_sem_pf_multi_composite"
+  )
+
+  _mlflow_run_name = f"lgbm_v9b_{n_completed}trials_90min"
+
+
+ALTERAÇÃO 5 — RELATÓRIO FINAL (nova célula após avaliação)
+================================================================================
+
+Idêntica às anteriores — copiar o mesmo bloco, apenas mudar o título:
+
+  print("COMPARATIVO DE COMPOSITES — v9b")
+
+
+ALTERAÇÃO 6 — LOOP DE AVALIAÇÃO POR TRIAL DISTINTO
+================================================================================
+
+Idêntica à v8 — copiar exatamente o mesmo bloco da Alteração 6 do arquivo
+instrucoes_v8_genie.txt.
+
+IMPORTANTE: NÃO criar gráficos novos. Reutilizar EXATAMENTE os gráficos e
+células de avaliação que já existem no notebook. O loop envolve as células
+existentes e as executa uma vez por trial distinto, identificando no título
+de cada bloco qual trial e quais composites estão sendo avaliados.
+
+
+================================================================================
+REFERÊNCIA PARA COMPARAÇÃO NO RELATÓRIO
+================================================================================
+
+  v4:  PSI OOT=0.1618, OOT PR-AUC=0.7421, Q3=41.9%, Q4=60.0%, Recall=0.67
+  v5:  PSI OOT=0.2205, OOT PR-AUC=0.7511, Q3=43.9%, Q4=60.0%, Recall=0.67
+  v8*: PSI OOT=0.1677, OOT PR-AUC=0.7590, Q3=44.7%, Q4=59.3%, Recall=0.67
+       (* 100 trials apenas — resultado preliminar)
+
+CRITÉRIO DE PARADA:
+  PSI OOT < 0.20 | OOT PR-AUC > 0.74 | Q3 < 45% | Q4 > 58% | Recall ≥ 0.67
+  Se qualquer composite atingir os 5 → candidato a produção.
+
+================================================================================
+FIM — v9b
+================================================================================

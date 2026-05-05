@@ -1,0 +1,220 @@
+================================================================================
+INSTRUÇÕES v8 — LightGBM Classification tempo ativo 4y PR AUC
+================================================================================
+Base: copiar notebook v6 e aplicar as alterações abaixo
+Data: 04/05/2026
+================================================================================
+
+
+ALTERAÇÃO 1 — FEATURES
+================================================================================
+
+Remover regiao_br do preprocessor OHE:
+
+  # Identificar colunas categóricas excluindo regiao_br
+  cat_cols_ohe = [c for c in X_train.select_dtypes(
+      include=["object","category"]).columns.tolist()
+      if c != "regiao_br"]
+
+  # Usar cat_cols_ohe no ColumnTransformer em vez de cat_cols
+
+Manter pf__regiao_br_Sudeste normalmente (0 ou 1) — não mexer.
+
+
+ALTERAÇÃO 2 — N_TRIALS E TIMEOUT
+================================================================================
+
+  N_TRIALS    = 400
+  TIMEOUT_MIN = 90
+
+  study.optimize(
+      objective,
+      timeout=TIMEOUT_MIN * 60,
+      n_trials=N_TRIALS,
+      show_progress_bar=True
+  )
+
+
+ALTERAÇÃO 3 — COMPOSITES PARALELOS
+================================================================================
+
+Adicionar no início da função objetivo, antes do return, após calcular
+mean_pr, mean_sep, mean_psi:
+
+  # Componentes PSI
+  psi_taxas  = (resultado do PSI de taxas já calculado no fold)
+  psi_scores = (resultado do PSI de scores já calculado no fold)
+
+  psi_2c = 0.5 * mean_psi_taxas + 0.5 * mean_psi_scores
+  psi_3c = 0.33 * mean_psi_taxas + 0.33 * mean_psi_scores + 0.33 * mean_psi_faixas
+
+  # psi_faixas = soma de (r_vl[i] - r_tr[i]) * log(clip(r_vl[i]/r_tr[i]))
+  # para cada faixa i — com eps=1e-4
+
+  # Penalidades PSI
+  psi_linear_2c = float(np.clip(1 - psi_2c, 0, 1))
+  psi_exp_2c    = float(np.clip(np.exp(-3 * psi_2c), 0, 1))
+  psi_linear_3c = float(np.clip(1 - psi_3c, 0, 1))
+  psi_exp_3c    = float(np.clip(np.exp(-3 * psi_3c), 0, 1))
+
+  # Separação ponderada (Q3→Q4 peso maior)
+  gaps = np.diff(r_vl)  # médias dos folds
+  pesos_gaps = np.array([0.15, 0.25, 0.35, 0.25])
+  gap_pond_score = max(0.0, min(1.0,
+      float(np.sum(gaps * pesos_gaps)) / (1.0 / n_bins)))
+  sep_pond = 0.60 * amplitude + 0.40 * gap_pond_score
+
+  # 8 composites
+  comp_A = 0.60*mean_pr + 0.12*mean_sep  + 0.28*psi_linear_2c
+  comp_B = 0.65*mean_pr + 0.10*mean_sep  + 0.25*psi_linear_2c
+  comp_C = 0.60*mean_pr + 0.15*mean_sep  + 0.25*psi_linear_2c
+  comp_D = 0.60*mean_pr + 0.10*mean_sep  + 0.30*psi_linear_2c
+  comp_E = 0.60*mean_pr + 0.10*mean_sep  + 0.30*psi_exp_2c
+  comp_F = 0.60*mean_pr + 0.10*mean_sep  + 0.30*psi_linear_3c
+  comp_G = 0.60*mean_pr + 0.10*mean_sep  + 0.30*psi_exp_3c
+  comp_H = 0.60*mean_pr + 0.12*sep_pond  + 0.28*psi_linear_2c
+
+  trial.set_user_attr("comp_A", round(comp_A, 4))
+  trial.set_user_attr("comp_B", round(comp_B, 4))
+  trial.set_user_attr("comp_C", round(comp_C, 4))
+  trial.set_user_attr("comp_D", round(comp_D, 4))
+  trial.set_user_attr("comp_E", round(comp_E, 4))
+  trial.set_user_attr("comp_F", round(comp_F, 4))
+  trial.set_user_attr("comp_G", round(comp_G, 4))
+  trial.set_user_attr("comp_H", round(comp_H, 4))
+  trial.set_user_attr("cv_pr_auc", round(mean_pr,  4))
+  trial.set_user_attr("cv_sep",    round(mean_sep, 4))
+  trial.set_user_attr("cv_psi",    round(mean_psi, 4))
+
+  # Composite que guia o Optuna nesta versão
+  return comp_A
+
+
+ALTERAÇÃO 4 — NOME DO STUDY E MLFLOW
+================================================================================
+
+  study = optuna.create_study(
+      direction="maximize",
+      study_name="lgbm_v8_sem_ohe_multi_composite"
+  )
+
+  _mlflow_run_name = f"lgbm_v8_{n_completed}trials_90min"
+
+
+ALTERAÇÃO 5 — RELATÓRIO FINAL (nova célula após avaliação)
+================================================================================
+
+Adicionar célula após as células de avaliação existentes:
+
+  composites = ["comp_A","comp_B","comp_C","comp_D",
+                "comp_E","comp_F","comp_G","comp_H"]
+
+  descricao = {
+      "comp_A": "60/12/28 | linear | 2c | sep padrão",
+      "comp_B": "65/10/25 | linear | 2c | sep padrão",
+      "comp_C": "60/15/25 | linear | 2c | sep padrão",
+      "comp_D": "60/10/30 | linear | 2c | sep padrão",
+      "comp_E": "60/10/30 | exp    | 2c | sep padrão",
+      "comp_F": "60/10/30 | linear | 3c | sep padrão",
+      "comp_G": "60/10/30 | exp    | 3c | sep padrão",
+      "comp_H": "60/12/28 | linear | 2c | sep ponderada",
+  }
+
+  print("=" * 70)
+  print("COMPARATIVO DE COMPOSITES — v8")
+  print("=" * 70)
+
+  trials_usados = {}
+  for comp in composites:
+      best = max(
+          [t for t in study.trials if comp in t.user_attrs],
+          key=lambda t: t.user_attrs[comp]
+      )
+      trials_usados[comp] = best
+      print(f"\n{comp} | {descricao[comp]}")
+      print(f"  Best trial: #{best.number} ({best.number/len(study.trials)*100:.0f}% do run)")
+      print(f"  Composite:  {best.user_attrs[comp]:.4f}")
+      print(f"  CV PR-AUC:  {best.user_attrs['cv_pr_auc']:.4f}")
+      print(f"  CV Sep:     {best.user_attrs['cv_sep']:.4f}")
+      print(f"  CV PSI:     {best.user_attrs['cv_psi']:.4f}")
+
+  # Identificar trials distintos
+  trials_distintos = list({t.number: t for t in trials_usados.values()}.values())
+  print(f"\nTrials distintos entre os 8 composites: {len(trials_distintos)}")
+  for t in trials_distintos:
+      composites_deste = [c for c, tr in trials_usados.items() if tr.number == t.number]
+      print(f"  Trial #{t.number} → composites: {composites_deste}")
+
+
+ALTERAÇÃO 6 — LOOP DE AVALIAÇÃO POR TRIAL DISTINTO
+================================================================================
+
+IMPORTANTE: NÃO criar gráficos novos. Reutilizar EXATAMENTE os gráficos e
+células de avaliação que já existem no notebook (faixas Train/Test/OOT,
+PSI OOT, PR curve, classification report, KS curve, feature importance, etc.).
+
+O que muda: envolver todas as células de avaliação existentes num loop que
+itera sobre os trials distintos. Cada iteração recria o modelo com os params
+daquele trial e roda toda a avaliação — gerando um conjunto completo de
+gráficos por trial.
+
+Estrutura do loop — adicionar ANTES das células de avaliação existentes:
+
+  # Mapeamento de composites por trial
+  composites_por_trial = {}
+  for comp, trial in trials_usados.items():
+      composites_por_trial.setdefault(trial.number, []).append(comp)
+
+  for trial in trials_distintos:
+      comp_ids = composites_por_trial[trial.number]
+      desc_ids = [descricao[c] for c in comp_ids]
+
+      print("\n" + "=" * 70)
+      print(f"AVALIAÇÃO — Trial #{trial.number}")
+      print(f"Composites: {comp_ids}")
+      print(f"Descrições: {desc_ids}")
+      print(f"Params: {trial.params}")
+      print("=" * 70)
+
+      # Recriar modelo final com params deste trial
+      final_model = LGBMClassifier(
+          **trial.params,
+          random_state=42,
+          verbose=-1,
+      )
+      final_model.fit(
+          X_train_proc, y_train,
+          eval_set=[(X_test_proc, y_test)],
+          categorical_feature=categorical_feature,
+          callbacks=[lgb.early_stopping(30, verbose=False),
+                     lgb.log_evaluation(0)]
+      )
+
+      # Recriar scores — substituir as variáveis que as células de avaliação
+      # já usam (y_train_proba, y_test_proba, y_oot_proba)
+      y_train_proba = final_model.predict_proba(X_train_proc)[:, 1]
+      y_test_proba  = final_model.predict_proba(X_test_proc)[:,  1]
+      y_oot_proba   = final_model.predict_proba(X_oot_proc)[:,   1]
+
+      # ---------------------------------------------------------------
+      # CÉLULAS DE AVALIAÇÃO EXISTENTES RODAM AQUI — SEM ALTERAR NADA
+      # (faixas, PSI OOT, PR curve, classification report, KS, etc.)
+      # ---------------------------------------------------------------
+
+
+================================================================================
+REFERÊNCIA PARA COMPARAÇÃO NO RELATÓRIO
+================================================================================
+
+  v4:  PSI OOT=0.1618, OOT PR-AUC=0.7421, Q3=41.9%, Q4=60.0%, Recall=0.67
+  v5:  PSI OOT=0.2205, OOT PR-AUC=0.7511, Q3=43.9%, Q4=60.0%, Recall=0.67
+  v8*: PSI OOT=0.1677, OOT PR-AUC=0.7590, Q3=44.7%, Q4=59.3%, Recall=0.67
+       (* 100 trials apenas — resultado preliminar)
+
+CRITÉRIO DE PARADA:
+  PSI OOT < 0.20 | OOT PR-AUC > 0.74 | Q3 < 45% | Q4 > 58% | Recall ≥ 0.67
+  Se qualquer composite atingir os 5 → candidato a produção.
+
+================================================================================
+FIM — v8
+================================================================================
