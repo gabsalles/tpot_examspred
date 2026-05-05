@@ -1,0 +1,85 @@
+def extrair_pesos_profile_analyzer(
+    df_profile: pd.DataFrame,
+    lift_neutro: float = 1.0,
+    lift_max_clip: float = 5.0,
+) -> dict:
+    """
+    Converte o output do ProfileAnalyzer em configuração de bins
+    pronta para usar na calcular_score_final.
+
+    Parâmetros
+    ----------
+    df_profile   : DataFrame retornado pelo profile_group() ou profile_all()
+                   precisa ter colunas: Atributo, Lift, cnt_in
+    lift_neutro  : lift considerado neutro (default 1.0)
+    lift_max_clip: clip no lift máximo para evitar outliers (default 5.0)
+
+    Retorna
+    -------
+    dict com a configuração de bins pronta para VARIAVEIS_RECEPTIVIDADE
+    """
+    config = {}
+
+    for _, row in df_profile.iterrows():
+        atributo = row["Atributo"]  # ex: "meses_ativo_bin: 19.0-35.0"
+        lift     = min(float(row["Lift"]), lift_max_clip)
+
+        # Normaliza lift para score entre 0 e 1
+        # lift=1 → score=0.5 (neutro)
+        # lift>1 → score>0.5 (receptivo)
+        # lift<1 → score<0.5 (resistente)
+        score = min(1.0, max(0.0, lift / (lift_max_clip * 2)))
+
+        # Extrai nome da coluna e range do bin
+        # formato esperado: "nome_coluna_bin: de-ate"
+        if ": " not in atributo:
+            continue
+
+        coluna_raw, valor = atributo.split(": ", 1)
+
+        # Remove sufixo _bin se presente
+        coluna = coluna_raw.replace("_bin", "")
+
+        if coluna not in config:
+            config[coluna] = {
+                "tipo":    "bin",
+                "peso":    0.0,  # será preenchido depois
+                "bins":    [],
+                "default": 0.5,
+            }
+
+        # Extrai de/ate do range "19.0-35.0"
+        try:
+            partes = valor.split("-")
+            de  = float(partes[0])
+            ate = float(partes[1])
+            config[coluna]["bins"].append({
+                "de":    de,
+                "ate":   ate,
+                "score": round(score, 4),
+                "lift":  round(lift, 4),  # mantém para referência
+            })
+        except (ValueError, IndexError):
+            # Valor categórico — ignora por enquanto
+            continue
+
+    return config
+
+
+
+# 4. Definir pesos entre variáveis manualmente
+# (o Lift define o score DENTRO de cada bin,
+#  o peso define a importância ENTRE variáveis)
+config_bins["meses_ativo"]["peso"] = 0.35
+config_bins["salario"]["peso"]     = 0.35
+config_bins["tempo_de_casa"]["peso"] = 0.30
+
+# 5. Aplicar
+df_resultado = calcular_score_final(
+    df=df_oot,
+    coluna_prob="prob_reintegracao_longa",
+    coluna_faixa="faixa_quantil",
+    variaveis_receptividade=config_bins,
+    peso_modelo=0.7,
+    peso_receptividade=0.3,
+)
