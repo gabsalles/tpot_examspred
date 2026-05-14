@@ -1,0 +1,28 @@
+Preciso de uma análise de sensibilidade comparando duas estratégias de oferta (Flat vs V2b) para acordos trabalhistas.
+
+Dados de entrada (hardcoded, não precisa de tabela):
+
+| Banda | n_total | aceite_real | cobertura_v2b | cobertura_flat | saving_flat | saving_v2b |
+|-------|---------|-------------|---------------|----------------|-------------|------------|
+| ALTA  | 176     | 0.398       | 0.486         | 0.486          | 1.20        | 1.20       |
+| MÉDIA | 168     | 0.030       | 0.603         | 0.444          | 1.20        | 0.54       |
+| BAIXA | 162     | 0.000       | 0.611         | 0.381          | 1.20        | 0.54       |
+
+A fórmula de conversão projetada é:
+conv_proj = aceite_real + k * (cobertura - aceite_real)
+
+Onde k varia de 0 a 1 em incrementos de 0.05.
+
+Para cada valor de k, calcule por banda:
+- conv_flat = aceite_real + k * (cobertura_flat - aceite_real)
+- conv_v2b = aceite_real + k * (cobertura_v2b - aceite_real)
+- saving_total_flat = n_total * conv_flat * saving_flat
+- saving_total_v2b = n_total * conv_v2b * saving_v2b
+- delta = saving_total_flat - saving_total_v2b
+
+Gere duas saídas:
+
+1. Uma tabela com colunas: k, banda, conv_flat, conv_v2b, saving_flat, saving_v2b, delta
+2. Um gráfico de linhas mostrando saving_total_flat e saving_total_v2b (somados across bandas) no eixo Y, k no eixo X. Marque o ponto onde delta cruza zero (se existir).
+
+Identifique o valor de k a partir do qual o V2b supera o Flat (breakeven).
