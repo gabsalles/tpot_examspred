@@ -1,0 +1,31 @@
+🗣️ Roteiro de Apresentação
+[SLIDE 1: Desempenho, Eficiência e Estabilidade]
+"Bom dia/Boa tarde a todos. Vou passar pelos três pilares que garantem que este modelo está pronto para gerar valor para o negócio: Performance, Eficiência Prática e Estabilidade.
+
+Começando pela Performance Global, na primeira tabela à direita, temos indicadores muito fortes. O nosso ROC-AUC fica acima de 0,72 e o KS próximo a 0,39 na validação. É um poder de separação estatística excelente para um modelo comportamental.
+
+Mas traduzindo essa estatística para a nossa Eficiência Prática, o grande objetivo do modelo era prever quem permanece mais de 48 meses na instituição. E nós cumprimos isso com maestria focando na nossa Faixa Prioritária (Q4), de mais alto risco:
+
+Olhando para a tabela inferior direita, atingimos uma Precisão de 59% na validação. Ou seja, de cada 10 casos apontados pelo modelo no Q4, cerca de 6 se confirmam.
+
+Além disso, temos um Recall de quase 44%. Isso significa que atuando apenas nesse grupo restrito do Q4, a área já consegue capturar e tratar quase metade de todos os casos de interesse de toda a base. É um ganho enorme de foco operacional.
+
+Para coroar esse resultado, medimos a mediana de permanência no teste. Na faixa de baixo risco (Q1), a permanência média é de apenas 17 meses. Conforme o score do modelo sobe, a mediana acompanha perfeitamente, saltando para 28 meses no Q2, 38 no Q3 e batendo incríveis 56 meses na faixa Q4. Ou seja, o grupo que isolamos supera a nossa meta de 48 meses com folga.
+
+Por fim, o pilar de Estabilidade e Governança, destacado no rodapé. Um modelo bom precisa ser seguro para ir para produção.
+A monotonia das faixas é perfeita nos 3 conjuntos (Treino, Teste e Validação), confirmando a coerência lógica. E o nosso PSI (Population Stability Index) na transição de treino para validação é de apenas 0,0011. No mercado, tudo abaixo de 0,1 é excelente. Isso prova que não houve degradação populacional: o modelo aprendeu um padrão sólido e vai continuar performando com segurança no dia a dia."
+
+[SLIDE 2: Interpretabilidade e Origem dos Dados]
+"Passando para este slide, entramos em um pilar fundamental da nossa governança: garantir que o modelo não seja uma caixa-preta e que a decisão faça sentido para o negócio.
+
+Para construir essa inteligência, nós fizemos uma varredura ampla no nosso ecossistema de dados. Partimos de aproximadamente 300 variáveis candidatas, navegando por 7 grandes blocos de origens: desde dados cadastrais, informações de dependentes, até o histórico de absenteísmo, horas extras e o histórico de pedidos jurídicos.
+
+O rigor técnico da nossa modelagem reduziu esse universo gigante para apenas 9 variáveis finais. Isso significa um pipeline de dados leve, barato de manter e com risco baixíssimo de falha sistêmica. E quando olhamos na tabela o impacto SHAP de cada variável, a conexão com o mundo real fica muito clara:
+
+O Cadastro e a Estrutura Organizacional aparecem com forte influência. Por exemplo, a Região Sudeste atua reduzindo o risco e o tempo de permanência, assim como a Dependência Específica (Agência RJ) e o perfil do Supervisor Imediato.
+
+O ecossistema de Dependentes se provou crucial: a Quantidade de Dependentes e a Renda Per Capita (relação do salário pelos dependentes) ditam uma forte tendência de comportamento.
+
+E a inteligência capturou muito bem os sinais do bloco de Pedidos Jurídicos e Saúde, onde a Taxa de reintegração por faixa etária, Processos de acidente de trabalho e Reintegrações por motivo de saúde aparecem como balizadores fundamentais para a previsão de longo prazo.
+
+Em resumo: nós conectamos os principais mundos de dados da instituição em um modelo enxuto, de altíssima performance, totalmente auditável e preparado para suportar a tomada de decisão."
